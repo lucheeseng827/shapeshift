@@ -10,6 +10,12 @@ Everything here is local filesystem only, no network, no telemetry, no row cap �
 this is the OSS engine (Apache-2.0), the same code whether you self-host it free
 or run it under the commercial control plane.
 
+> **Wiring shapeshift into a lakehouse?** See
+> [`catalog-demos/`](./catalog-demos/README.md) for end-to-end recipes that put a
+> **data catalog** (Iceberg REST / AWS Glue / Nessie / Polaris) in the middle, with
+> **streaming systems** (Kafka/Redpanda) and **databases** (Postgres) as source *and*
+> sink — plus a local `docker compose` stack to run them on your laptop.
+
 ## The fixtures
 
 ### `events.jsonl` — 5 lines, one deliberately broken

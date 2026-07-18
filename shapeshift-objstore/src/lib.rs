@@ -192,13 +192,25 @@ async fn stream_parts(
     let mut buf = vec![0u8; PART_SIZE];
     let mut total = 0u64;
     loop {
-        let n = file.read(&mut buf).await.map_err(sink_err)?;
-        if n == 0 {
+        // Fill the buffer to PART_SIZE before emitting a part. A single `File::read` may
+        // return short — for a regular file it often yields far less than the buffer — and
+        // any non-final part below S3's 5 MiB minimum is rejected with EntityTooSmall. So
+        // loop until the buffer is full or EOF; every part but the last is a full
+        // PART_SIZE (8 MiB), which is what makes the upload valid on S3/MinIO/GCS/Azure.
+        let mut filled = 0usize;
+        while filled < PART_SIZE {
+            let n = file.read(&mut buf[filled..]).await.map_err(sink_err)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
             break;
         }
-        let payload: object_store::PutPayload = buf[..n].to_vec().into();
+        let payload: object_store::PutPayload = buf[..filled].to_vec().into();
         upload.put_part(payload).await.map_err(sink_err)?;
-        total += n as u64;
+        total += filled as u64;
     }
     upload.complete().await.map_err(sink_err)?;
     Ok(total)

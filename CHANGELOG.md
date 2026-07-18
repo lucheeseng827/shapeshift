@@ -10,6 +10,26 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-18
+
+### Fixed
+
+- **Object-store multipart uploads no longer fail with `EntityTooSmall`.** The S3
+  writer sized each multipart part by a single `read()` — which returns short for a
+  regular file — instead of filling the 8 MiB buffer, so any `-o s3://…` (or
+  `gs://` / `az://`) table larger than a few MB emitted non-final parts below S3's
+  5 MiB minimum and the upload was rejected (400). Parts are now filled to
+  `PART_SIZE` before upload, so every part but the last is a full 8 MiB.
+
+### Added
+
+- **`examples/catalog-demos/` — wiring shapeshift into a lakehouse.** Five
+  copy-pasteable demos (streaming and databases → Iceberg → REST catalog; Iceberg →
+  database sink; parallel multi-writer) with a fully local Redpanda + Postgres +
+  Nessie + MinIO stack and reusable glue scripts (`stream_drain`, `pg_to_jsonl`,
+  `register_catalog`, `parallel_write`, `read_back`). Validated end-to-end on EC2 —
+  see [`examples/catalog-demos/VALIDATION.md`](./examples/catalog-demos/VALIDATION.md).
+
 ## [0.1.1] - 2026-07-18
 
 ### Added
@@ -335,6 +355,7 @@ build musl-static and ships as a single binary.
 - **Not in the OSS core:** no incremental / CDC, no scheduling, and no connectors — those
   are hosted / commercial features.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lucheeseng827/shapeshift/releases/tag/v0.1.0
