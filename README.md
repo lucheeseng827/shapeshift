@@ -351,7 +351,7 @@ sequenceDiagram
     participant SK as Sink (parquet / iceberg)
     participant OUT as Parquet file / Iceberg table
 
-    Note over CLI: load/synthesize DatasetSpec;<br/>if schema=infer, sample first N records → infer columns
+    Note over CLI: load/synthesize DatasetSpec —<br/>if schema=infer, sample first N records → infer columns
     CLI->>SH: Shaper::from_spec(spec, inferred) → Arrow schema
     CLI->>SK: create(path, schema, compression)
     loop each source record (streamed — one line in RAM)
