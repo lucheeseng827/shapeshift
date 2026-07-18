@@ -1,0 +1,28 @@
+[package]
+name = "shapeshift-parquet"
+description = "shapeshift Parquet sink — streams Arrow RecordBatches to a Parquet file one row group at a time (bounded RAM), Snappy by default so the build stays musl-static. Implements shapeshift-core's Sink trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Opt-in "fat build": links the zstd C codec so `--compression zstd` works.
+# OFF by default — the lean musl-static binary stays Snappy-only (pure Rust).
+zstd = ["parquet/zstd"]
+
+[dependencies]
+shapeshift-core = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+shapeshift-core = { workspace = true }
+serde_json = { workspace = true }
+arrow-array = { workspace = true }
+parquet = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "shapeshift-objstore"
+description = "shapeshift object-store sink — writes shapeshift's Parquet output to S3 / GCS / Azure (or file:// / memory://) via the object_store crate. A local row-group-bounded temp Parquet is streamed to the store with a multipart upload, so RAM stays bounded. Implements shapeshift-core's Sink trait; the cloud SDKs live only here (behind the CLI's off-by-default `object_store` feature)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+shapeshift-parquet = { workspace = true }
+shapeshift-iceberg = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+parquet = { workspace = true }
+arrow-array = { workspace = true }

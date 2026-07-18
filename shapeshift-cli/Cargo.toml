@@ -1,0 +1,43 @@
+[package]
+name = "shapeshift-cli"
+description = "shapeshift CLI — the single `shapeshift` binary: infer a spec from sample JSON, shape JSONL/JSON into Parquet or Iceberg, inspect the output, and price a run against Fivetran-style MAR (Monthly Active Rows)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "shapeshift"
+path = "src/main.rs"
+
+[features]
+default = []
+# Object-store output (S3/GCS/Azure) via `--output <url>`. OFF by default so the
+# lean musl-static `shapeshift` binary never links the cloud SDKs; CI asserts their
+# absence from the default build.
+object_store = ["dep:shapeshift-objstore"]
+# Opt-in "fat build": links the zstd C codec so `--compression zstd` works for both
+# Parquet output and the Iceberg data files. OFF by default — the lean binary stays
+# Snappy-only (pure Rust, musl-static with no C codecs).
+zstd = ["shapeshift-parquet/zstd", "shapeshift-iceberg/zstd"]
+# Opt-in local web console (`shapeshift serve`). Pulls in shapeshift-serve, whose
+# HTTP server is hand-rolled on std::net — NO async runtime, NO web framework, NO C
+# code — so the fat build is still one relocatable static binary. OFF by default so
+# the lean `shapeshift` binary is byte-for-byte unchanged.
+serve = ["dep:shapeshift-serve"]
+
+[dependencies]
+shapeshift-core = { workspace = true }
+shapeshift-json = { workspace = true }
+shapeshift-parquet = { workspace = true }
+shapeshift-iceberg = { workspace = true }
+shapeshift-objstore = { workspace = true, optional = true }
+shapeshift-serve = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

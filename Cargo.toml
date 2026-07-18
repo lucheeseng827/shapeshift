@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "shapeshift-core",
+    "shapeshift-json",
+    "shapeshift-parquet",
+    "shapeshift-iceberg",
+    "shapeshift-objstore",
+    "shapeshift-serve",
+    "shapeshift-cli",
+]
+
+# shapeshift is its OWN standalone workspace with its own Cargo.lock — the member
+# list above is the complete, closed set of crates it ships. Build it standalone:
+# `cargo test --workspace`. It is excluded from the repo-root `module_*` glob for
+# the same reason its heavy arrow /
+# parquet / simd-json / avro stack resolves independently of the shared workspace.
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/shapeshift"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# intra-workspace
+shapeshift-core = { path = "shapeshift-core" }
+shapeshift-json = { path = "shapeshift-json" }
+shapeshift-parquet = { path = "shapeshift-parquet" }
+shapeshift-iceberg = { path = "shapeshift-iceberg" }
+shapeshift-objstore = { path = "shapeshift-objstore" }
+shapeshift-serve = { path = "shapeshift-serve" }
+
+# external — pinned conservatively; this workspace owns its own lock.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+# SIMD JSON parse — the fast-path lexer. We drive it through simd-json's serde
+# bridge to land straight in a `serde_json::Value`, so downstream code stays on
+# the ubiquitous value model while the hot lexing stays SIMD.
+simd-json = "0.14"
+# Columnar core. arrow 54 to match the lab's proven musl-static Snappy build
+# (parquet default-features=false + snap avoids the zstd/brotli C codecs). The
+# arrow-array/arrow-schema major MUST match parquet's arrow-rs major.
+arrow-array = "54"
+arrow-schema = "54"
+arrow-select = "54"
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+uuid = { version = "1", features = ["v4"] }
+# Date/time coercions (to_date / to_timestamp / epoch_*). No `clock` feature —
+# the engine never reads the wall clock; all time is derived from the data.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Object-store output (S3/GCS/Azure) — lives only in shapeshift-objstore, which the
+# CLI pulls in behind an OFF-BY-DEFAULT `object_store` feature so the lean musl-static
+# `shapeshift` binary never links the cloud SDKs. tokio bridges the async object_store
+# API to the sync Sink trait at finalize time only.
+object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure", "fs"] }
+tokio = { version = "1", default-features = false, features = ["rt", "io-util", "fs", "net", "time"] }
+url = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

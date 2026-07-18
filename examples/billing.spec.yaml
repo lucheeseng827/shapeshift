@@ -1,0 +1,45 @@
+# A hand-written strict spec for examples/events.jsonl.
+#
+# Strict mode writes ONLY these columns and rejects a row missing a required one
+# (in lenient/infer mode a required miss is a soft reject; a bad optional value
+# becomes null). Run it:
+#
+#   shapeshift shape --spec examples/billing.spec.yaml --input examples/events.jsonl
+#
+# `from` selects a (possibly nested, dotted) source path; `transform` rewrites the
+# value before it is coerced to `type`.
+dataset: billing
+source:
+  format: jsonl
+output:
+  format: parquet          # switch to `iceberg` to write an Iceberg v2 table dir
+  path: ./out/billing.parquet
+  compression: snappy
+schema: strict
+columns:
+  - name: id
+    from: id
+    type: int64
+    required: true         # a row without an integer id is rejected
+  - name: plan
+    from: user.plan        # nested selection
+    type: string
+    transform: uppercase
+  - name: customer
+    from: user.name
+    type: string
+  - name: amount_cents
+    from: amount
+    type: int64
+    transform: dollars_to_cents   # 12.50 → 1250
+  - name: day
+    from: day
+    type: date             # "2026-07-13" → a DATE column
+  - name: event_at
+    from: event_at
+    type: timestamp        # RFC3339 → a TIMESTAMP column
+  - name: active
+    from: active
+    type: bool
+options:
+  row_group_rows: 50000

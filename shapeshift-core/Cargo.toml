@@ -1,0 +1,18 @@
+[package]
+name = "shapeshift-core"
+description = "shapeshift JSON→columnar shaper — the engine: the declarative dataset transform spec, JSON schema inference, the named transform library, and the record shaper that turns JSON values into Arrow RecordBatches. The brain; no source/sink I/O backend deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+chrono = { workspace = true }

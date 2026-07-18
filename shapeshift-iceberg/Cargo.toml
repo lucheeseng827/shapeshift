@@ -1,0 +1,30 @@
+[package]
+name = "shapeshift-iceberg"
+description = "shapeshift Iceberg sink — writes an Apache Iceberg v2 table (Parquet data files carrying field-ids + Avro manifest / manifest-list + JSON table metadata + version-hint) around the Parquet writer, with an atomic-append snapshot per run. Self-contained: no catalog server required."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Opt-in "fat build": links the zstd C codec so `--compression zstd` works for the
+# table's data Parquet. OFF by default — the lean musl-static binary stays Snappy-only.
+zstd = ["parquet/zstd"]
+
+[dependencies]
+shapeshift-core = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+parquet = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+shapeshift-core = { workspace = true }
+serde_json = { workspace = true }
+parquet = { workspace = true }
+arrow-array = { workspace = true }

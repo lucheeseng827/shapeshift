@@ -1,0 +1,5 @@
+{"id": 1, "user": {"name": "Ada", "plan": "pro"}, "amount": 12.50, "event_at": "2026-07-13T09:15:00Z", "day": "2026-07-13", "tags": ["a","b"], "active": true}
+{"id": 2, "user": {"name": "Grace", "plan": "free"}, "amount": 3, "event_at": "2026-07-13T10:00:00Z", "day": "2026-07-13", "tags": [], "active": false}
+{"id": 3, "user": {"name": "Linus"}, "amount": 99.99, "event_at": "2026-07-12T23:59:59Z", "day": "2026-07-12", "tags": ["x"], "active": true}
+not-json-a-bad-line
+{"id": 4, "user": {"name": "Edsger", "plan": "pro"}, "amount": 0, "event_at": "2026-07-11T08:00:00Z", "day": "2026-07-11", "active": true}

@@ -1,0 +1,32 @@
+# shapeshift-serve — a tiny, dependency-light HTTP server that puts a local web
+# console in front of the OSS shaper (infer · shape · inspect · cost).
+#
+# Deliberately in the single-static-binary ethos: the HTTP server is hand-rolled
+# on `std::net` (thread-per-connection over a shared listener) — NO async runtime,
+# NO web framework, NO cloud SDK, NO extra C code. The UI is three static files
+# embedded into the binary at compile time (`include_str!`), so `shapeshift serve`
+# stays one relocatable musl-static binary with no Node/JVM/Python at runtime.
+#
+# This crate is Apache-2.0 OSS: it only ever makes the engine a better *shaper*
+# (a UI over the existing CLI verbs). It has no scheduler, run queue, catalog
+# server, metering, connectors, or multi-tenant auth — those stay in the commercial-edition
+# control plane by design (see ../ARCHITECTURE.md §14).
+[package]
+name = "shapeshift-serve"
+description = "shapeshift serve — a local web console (a single hand-rolled HTTP server, no async runtime) over the OSS shaper: infer a spec, shape JSON into Parquet/Iceberg, inspect the output, and price a run against MAR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+shapeshift-json = { workspace = true }
+shapeshift-parquet = { workspace = true }
+shapeshift-iceberg = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

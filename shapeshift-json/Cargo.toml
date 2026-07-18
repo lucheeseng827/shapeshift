@@ -1,0 +1,15 @@
+[package]
+name = "shapeshift-json"
+description = "shapeshift streaming JSON source — bounded-RAM JSONL (one object per line) and JSON-array readers built on the simd-json SIMD lexer, yielding serde_json::Value records so a 100M-line file never enters RAM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
