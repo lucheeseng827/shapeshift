@@ -6,6 +6,7 @@
 //! `row_group_rows`, then `flush` emits a RecordBatch and the builders reset,
 //! bounding RAM regardless of input size.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -14,43 +15,76 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
+use crate::drift::{DriftPolicy, DriftReport, DriftSpec, DriftTracker};
 use crate::error::{Result, ShapeError};
+use crate::record::{Kind, Record};
 use crate::sink::Sink;
 use crate::spec::{ColumnSpec, DatasetSpec, SchemaMode};
 use crate::transform::Transform;
 use crate::types::ColumnType;
-use crate::value::select;
+use crate::value::{compile_path, select_compiled, Segment};
 
 /// A column compiled from a [`ColumnSpec`] into the exact work the hot loop does.
 #[derive(Debug, Clone)]
 struct Compiled {
     name: String,
     path: String,
+    /// `path`, split once at build time. The hot loop selects through this, so a run
+    /// never re-splits (or re-allocates) the path per row.
+    segs: Vec<Segment>,
     ty: ColumnType,
     transform: Option<Transform>,
     required: bool,
 }
 
 /// One typed cell, produced by coercion, ready to append to the matching builder.
-enum Cell {
+///
+/// `Str` holds a [`Cow`] so the common case — a string/date/timestamp/json column read
+/// straight out of the record — **borrows** the record's own bytes instead of cloning
+/// them. Only a value the engine had to synthesize (a transform's output, a number
+/// stringified, a nested value serialized) owns its storage.
+enum Cell<'a> {
     Null,
     Bool(bool),
     I64(i64),
     F64(f64),
     Date(i32),
     Ts(i64),
-    Str(String),
+    Str(Cow<'a, str>),
 }
 
 /// The result of coercing one selected value.
-enum Coerced {
-    Cell(Cell),
+enum Coerced<'a> {
+    Cell(Cell<'a>),
     /// The value was absent or JSON null.
     Null,
-    /// The value was present but not coercible to the target type.
-    Fail(String),
+    /// The value was present but not coercible to the target type. Carries the reason
+    /// *and* the value back, so a lenient run can report (and rescue) what it dropped
+    /// without the hot loop cloning every value on the off-chance it fails. The value is
+    /// only materialized where it is actually reported.
+    Fail(String, Value),
+}
+
+impl Coerced<'_> {
+    /// Detach from the borrowed source. Used only on the transform path, where the
+    /// coerced value points into a temporary the transform produced.
+    fn into_owned(self) -> Coerced<'static> {
+        match self {
+            Coerced::Cell(c) => Coerced::Cell(match c {
+                Cell::Str(s) => Cell::Str(Cow::Owned(s.into_owned())),
+                Cell::Null => Cell::Null,
+                Cell::Bool(v) => Cell::Bool(v),
+                Cell::I64(v) => Cell::I64(v),
+                Cell::F64(v) => Cell::F64(v),
+                Cell::Date(v) => Cell::Date(v),
+                Cell::Ts(v) => Cell::Ts(v),
+            }),
+            Coerced::Null => Coerced::Null,
+            Coerced::Fail(why, raw) => Coerced::Fail(why, raw),
+        }
+    }
 }
 
 /// A per-column Arrow builder.
@@ -75,7 +109,7 @@ impl ColBuilder {
         }
     }
 
-    fn append(&mut self, cell: Cell) {
+    fn append(&mut self, cell: Cell<'_>) {
         match (self, cell) {
             (ColBuilder::Bool(b), Cell::Bool(v)) => b.append_value(v),
             (ColBuilder::Bool(b), _) => b.append_null(),
@@ -83,7 +117,7 @@ impl ColBuilder {
             (ColBuilder::Int(b), _) => b.append_null(),
             (ColBuilder::Float(b), Cell::F64(v)) => b.append_value(v),
             (ColBuilder::Float(b), _) => b.append_null(),
-            (ColBuilder::Str(b), Cell::Str(v)) => b.append_value(v),
+            (ColBuilder::Str(b), Cell::Str(v)) => b.append_value(&*v),
             (ColBuilder::Str(b), _) => b.append_null(),
             (ColBuilder::Date(b), Cell::Date(v)) => b.append_value(v),
             (ColBuilder::Date(b), _) => b.append_null(),
@@ -120,11 +154,44 @@ pub struct Shaper {
     builders: Vec<ColBuilder>,
     pending: usize,
     strict: bool,
+    /// Drift detection, when the policy is anything but `ignore`. `None` is the
+    /// zero-cost path: the hot loop does no drift work at all.
+    drift: Option<DriftTracker>,
+    /// Index of the rescue builder (always last in `builders`) under `policy: rescue`.
+    rescue: Option<usize>,
 }
 
 impl Shaper {
-    /// Build a shaper for the given effective columns and schema mode.
+    /// Build a shaper for the given effective columns and schema mode, with **no drift
+    /// detection** — the low-level constructor. Use [`Shaper::with_drift`] (or
+    /// [`Shaper::from_spec`], which reads the spec's `drift` block) to detect what the
+    /// schema drops.
     pub fn new(columns: Vec<ColumnSpec>, strict: bool) -> Result<Self> {
+        let off = DriftSpec {
+            policy: DriftPolicy::Ignore,
+            ..Default::default()
+        };
+        Shaper::build(columns, strict, &off, true)
+    }
+
+    /// Build a shaper that also watches for schema drift. `flatten` should match the
+    /// spec's `options.flatten`, so an uncovered path is named the way inference would
+    /// have named the column.
+    pub fn with_drift(
+        columns: Vec<ColumnSpec>,
+        strict: bool,
+        drift: &DriftSpec,
+        flatten: bool,
+    ) -> Result<Self> {
+        Shaper::build(columns, strict, drift, flatten)
+    }
+
+    fn build(
+        columns: Vec<ColumnSpec>,
+        strict: bool,
+        drift: &DriftSpec,
+        flatten: bool,
+    ) -> Result<Self> {
         if columns.is_empty() {
             return Err(ShapeError::Schema("no output columns".into()));
         }
@@ -133,30 +200,69 @@ impl Shaper {
             .map(|c| Compiled {
                 name: c.name.clone(),
                 path: c.source_path().to_string(),
+                segs: compile_path(c.source_path()),
                 ty: c.ty,
                 transform: c.transform,
                 required: c.required,
             })
             .collect();
-        let fields: Vec<Field> = columns
+        let mut fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.ty.arrow_type(), !c.required))
             .collect();
-        let builders = columns.iter().map(|c| ColBuilder::for_type(c.ty)).collect();
+        let mut builders: Vec<ColBuilder> =
+            columns.iter().map(|c| ColBuilder::for_type(c.ty)).collect();
+
+        // The rescue column is appended *after* every real column, so turning rescue on
+        // is an additive schema change (an Iceberg `--append` accepts it as a new
+        // optional column) and column order is otherwise untouched.
+        let rescue = if drift.policy == DriftPolicy::Rescue {
+            let name = drift.rescue_column.trim();
+            if name.is_empty() {
+                return Err(ShapeError::Schema(
+                    "`drift.rescue_column` must not be empty under `policy: rescue`".into(),
+                ));
+            }
+            if columns.iter().any(|c| c.name == name) {
+                return Err(ShapeError::Schema(format!(
+                    "`drift.rescue_column` `{name}` collides with an output column \
+                     (pick another name)"
+                )));
+            }
+            fields.push(Field::new(name, ColumnType::Json.arrow_type(), true));
+            builders.push(ColBuilder::for_type(ColumnType::Json));
+            Some(builders.len() - 1)
+        } else {
+            None
+        };
+
+        let tracker = drift
+            .policy
+            .detects()
+            .then(|| DriftTracker::new(drift, flatten, compiled.iter().map(|c| c.path.as_str())));
+
         Ok(Shaper {
             columns: compiled,
             schema: Arc::new(Schema::new(fields)),
             builders,
             pending: 0,
             strict,
+            drift: tracker,
+            rescue,
         })
     }
 
     /// Build a shaper directly from a spec plus an inferred column list (empty in
-    /// strict mode). Declared columns win over inferred ones of the same name.
+    /// strict mode). Declared columns win over inferred ones of the same name, and the
+    /// spec's `drift` block decides what happens to whatever the schema misses.
     pub fn from_spec(spec: &DatasetSpec, inferred: &[ColumnSpec]) -> Result<Self> {
         let cols = effective_columns(spec, inferred);
-        Shaper::new(cols, spec.schema == SchemaMode::Strict)
+        Shaper::with_drift(
+            cols,
+            spec.schema == SchemaMode::Strict,
+            &spec.drift,
+            spec.options.flatten,
+        )
     }
 
     /// The Arrow schema every emitted batch carries.
@@ -169,24 +275,45 @@ impl Shaper {
         self.pending
     }
 
+    /// What the run has seen drift so far — `None` under `policy: ignore`.
+    pub fn drift_report(&self) -> Option<&DriftReport> {
+        self.drift.as_ref().map(|d| d.report())
+    }
+
+    /// Take the drift report at the end of a run.
+    pub fn into_drift_report(self) -> Option<DriftReport> {
+        self.drift.map(|d| d.into_report())
+    }
+
     /// Shape one record into the current batch.
-    pub fn push(&mut self, record: &Value) -> Result<PushOutcome> {
+    pub fn push<'a, R: Record<'a>>(&mut self, record: R) -> Result<PushOutcome> {
+        // Phase 0: find source paths no column reaches. Done before anything is
+        // appended, so an `error` policy fails with the builders still aligned.
+        let mut rescued: Option<Map<String, Value>> = self.rescue.map(|_| Map::new());
+        let mut drift_reason: Option<String> = None;
+        if let Some(d) = self.drift.as_mut() {
+            drift_reason = d.scan_record(record, rescued.as_mut());
+        }
+
         // Phase 1: compute every cell, bailing before any append if a required cell
         // is absent / a strict coercion fails. This keeps the builders aligned.
         let mut cells: Vec<Cell> = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
-            let selected = select(record, &col.path).cloned();
+            let selected = select_compiled(record, &col.segs);
             let coerced = match selected {
-                None | Some(Value::Null) => Coerced::Null,
+                None => Coerced::Null,
+                Some(v) if v.kind() == Kind::Null => Coerced::Null,
+                // No transform: coerce straight off the record, so a string / date /
+                // timestamp / json column never copies the source bytes.
+                Some(v) if col.transform.is_none() => coerce(v, col.ty),
+                // A transform synthesizes a new value, so its result owns its storage.
                 Some(v) => {
-                    let v = match col.transform {
-                        Some(t) => t.apply(v),
-                        None => v,
-                    };
-                    if matches!(v, Value::Null) {
+                    let t = col.transform.expect("matched Some above");
+                    let produced = t.apply(v.to_owned_value());
+                    if matches!(produced, Value::Null) {
                         Coerced::Null
                     } else {
-                        coerce(v, col.ty)
+                        coerce(&produced, col.ty).into_owned()
                     }
                 }
             };
@@ -202,7 +329,7 @@ impl Shaper {
                     }
                     cells.push(Cell::Null);
                 }
-                Coerced::Fail(why) => {
+                Coerced::Fail(why, raw) => {
                     let reason = format!("column `{}`: {why}", col.name);
                     if self.strict {
                         return Err(ShapeError::Record(reason));
@@ -210,14 +337,56 @@ impl Shaper {
                     if col.required {
                         return Ok(PushOutcome::Rejected(reason));
                     }
-                    // Lenient, optional column: a bad value is written as null.
+                    // Lenient, optional column: the value is dropped and written as
+                    // null. Nothing downstream would ever show it — so it is drift.
+                    if let Some(d) = self.drift.as_mut() {
+                        d.note_type_mismatch(&col.name, col.ty, &why, &raw);
+                        if drift_reason.is_none() {
+                            drift_reason = Some(reason);
+                        }
+                        if let Some(m) = rescued.as_mut() {
+                            m.insert(col.name.clone(), raw);
+                        }
+                    }
                     cells.push(Cell::Null);
                 }
             }
         }
+
+        // Phase 1b: every event for this row is known — apply the policy.
+        if let (Some(reason), Some(d)) = (drift_reason, self.drift.as_mut()) {
+            d.note_row_drifted();
+            match d.policy {
+                DriftPolicy::Error => {
+                    return Err(ShapeError::Drift(format!(
+                        "record {}: {reason} (drift.policy = error)",
+                        d.rows_scanned()
+                    )));
+                }
+                DriftPolicy::Quarantine => {
+                    d.note_row_quarantined();
+                    return Ok(PushOutcome::Rejected(format!("schema drift: {reason}")));
+                }
+                _ => {}
+            }
+        }
+
         // Phase 2: commit.
         for (builder, cell) in self.builders.iter_mut().zip(cells) {
             builder.append(cell);
+        }
+        if let Some(i) = self.rescue {
+            // `rescued` is Some whenever `self.rescue` is.
+            let cell = match rescued {
+                Some(m) if !m.is_empty() => {
+                    if let Some(d) = self.drift.as_mut() {
+                        d.note_row_rescued();
+                    }
+                    Cell::Str(Cow::Owned(Value::Object(m).to_string()))
+                }
+                _ => Cell::Null,
+            };
+            self.builders[i].append(cell);
         }
         self.pending += 1;
         Ok(PushOutcome::Appended)
@@ -257,16 +426,19 @@ pub fn effective_columns(spec: &DatasetSpec, inferred: &[ColumnSpec]) -> Vec<Col
 }
 
 /// Aggregate result of a full pipeline run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunReport {
     /// Records read from the source (excluding source parse errors handled upstream).
     pub rows_in: u64,
     /// Rows written to the sink.
     pub rows_out: u64,
-    /// Rows dropped by a lenient reject.
+    /// Rows dropped by a lenient reject — including rows quarantined for drift.
     pub rows_rejected: u64,
     /// RecordBatches (row groups) flushed.
     pub batches: u64,
+    /// What the source did that the schema does not cover — `None` under
+    /// `drift.policy: ignore`.
+    pub drift: Option<DriftReport>,
 }
 
 /// Drive a whole shape end to end: pull records, shape them, flush at row-group
@@ -303,6 +475,7 @@ where
         report.batches += 1;
     }
     let summary = sink.finish()?;
+    report.drift = shaper.into_drift_report();
     Ok((report, summary))
 }
 
@@ -310,108 +483,121 @@ where
 // Coercion
 // ---------------------------------------------------------------------------
 
-fn coerce(v: Value, ty: ColumnType) -> Coerced {
+/// Coerce one value to a column's logical type, **reading it in place**. A string that
+/// survives as a string (or is only parsed, as for date/timestamp) never leaves the
+/// record: the cell borrows it, whether that is a `serde_json::String`'s buffer or a
+/// slice of the reader's input. Only a synthesized value — a stringified number, a
+/// serialized nested value — allocates.
+///
+/// On failure the value is materialized into [`Coerced::Fail`] for the report. That is
+/// the one place a copy is made, and only on the path that is going to print it anyway.
+fn coerce<'a, R: Record<'a>>(v: R, ty: ColumnType) -> Coerced<'a> {
+    let k = v.kind();
+    let fail = |why: String| Coerced::Fail(why, v.to_owned_value());
     match ty {
-        ColumnType::Bool => match v {
-            Value::Bool(b) => Coerced::Cell(Cell::Bool(b)),
-            other => Coerced::Fail(format!("expected bool, got {}", kind(&other))),
+        ColumnType::Bool => match v.as_bool() {
+            Some(b) => Coerced::Cell(Cell::Bool(b)),
+            None => fail(format!("expected bool, got {}", k.name())),
         },
-        ColumnType::Int64 => match &v {
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Coerced::Cell(Cell::I64(i))
-                } else if let Some(f) = n.as_f64() {
-                    // `f as i64` saturates silently on overflow, so bound-check first.
-                    // `i64::MIN as f64` is exactly -2^63; its negation is exactly 2^63
-                    // (= i64::MAX + 1), the first value that would saturate.
+        ColumnType::Int64 => match k {
+            Kind::Int => match v.as_i64() {
+                Some(i) => Coerced::Cell(Cell::I64(i)),
+                None => fail("number out of i64 range".into()),
+            },
+            Kind::Float => match v.as_f64() {
+                // `f as i64` saturates silently on overflow, so bound-check first.
+                // `i64::MIN as f64` is exactly -2^63; its negation is exactly 2^63
+                // (= i64::MAX + 1), the first value that would saturate.
+                Some(f) => {
                     const MIN: f64 = i64::MIN as f64;
                     const MAX: f64 = -(i64::MIN as f64);
                     if f.fract() != 0.0 || !f.is_finite() {
-                        Coerced::Fail(format!("non-integer number {f} for int64"))
+                        fail(format!("non-integer number {f} for int64"))
                     } else if (MIN..MAX).contains(&f) {
                         Coerced::Cell(Cell::I64(f as i64))
                     } else {
-                        Coerced::Fail(format!("number {f} out of i64 range"))
+                        fail(format!("number {f} out of i64 range"))
                     }
-                } else {
-                    Coerced::Fail("number out of i64 range".into())
+                }
+                None => fail("number out of i64 range".into()),
+            },
+            Kind::Str => {
+                let s = v.as_str().expect("Kind::Str has a string body");
+                match s.parse::<i64>() {
+                    Ok(i) => Coerced::Cell(Cell::I64(i)),
+                    Err(_) => fail(format!("string {s:?} is not an int64")),
                 }
             }
-            Value::String(s) => match s.parse::<i64>() {
-                Ok(i) => Coerced::Cell(Cell::I64(i)),
-                Err(_) => Coerced::Fail(format!("string {s:?} is not an int64")),
-            },
-            other => Coerced::Fail(format!("expected int64, got {}", kind(other))),
+            _ => fail(format!("expected int64, got {}", k.name())),
         },
-        ColumnType::Float64 => match &v {
-            Value::Number(n) => match n.as_f64() {
+        ColumnType::Float64 => match k {
+            Kind::Int | Kind::Float => match v.as_f64() {
                 Some(f) => Coerced::Cell(Cell::F64(f)),
-                None => Coerced::Fail("number not representable as f64".into()),
+                None => fail("number not representable as f64".into()),
             },
-            Value::String(s) => match s.parse::<f64>() {
-                Ok(f) => Coerced::Cell(Cell::F64(f)),
-                Err(_) => Coerced::Fail(format!("string {s:?} is not a float64")),
-            },
-            other => Coerced::Fail(format!("expected float64, got {}", kind(other))),
+            Kind::Str => {
+                let s = v.as_str().expect("Kind::Str has a string body");
+                match s.parse::<f64>() {
+                    Ok(f) => Coerced::Cell(Cell::F64(f)),
+                    Err(_) => fail(format!("string {s:?} is not a float64")),
+                }
+            }
+            _ => fail(format!("expected float64, got {}", k.name())),
         },
-        ColumnType::String => match v {
-            Value::String(s) => Coerced::Cell(Cell::Str(s)),
-            Value::Bool(b) => Coerced::Cell(Cell::Str(b.to_string())),
-            Value::Number(n) => Coerced::Cell(Cell::Str(n.to_string())),
-            other => Coerced::Fail(format!(
+        ColumnType::String => match k {
+            Kind::Str => Coerced::Cell(Cell::Str(Cow::Borrowed(
+                v.as_str().expect("Kind::Str has a string body"),
+            ))),
+            Kind::Bool | Kind::Int | Kind::Float => {
+                Coerced::Cell(Cell::Str(Cow::Owned(v.to_json_text())))
+            }
+            _ => fail(format!(
                 "expected string scalar, got {} (use type `json` to keep it)",
-                kind(&other)
+                k.name()
             )),
         },
-        ColumnType::Json => match v {
-            Value::String(s) => Coerced::Cell(Cell::Str(s)),
-            other => Coerced::Cell(Cell::Str(other.to_string())),
+        ColumnType::Json => match k {
+            Kind::Str => Coerced::Cell(Cell::Str(Cow::Borrowed(
+                v.as_str().expect("Kind::Str has a string body"),
+            ))),
+            _ => Coerced::Cell(Cell::Str(Cow::Owned(v.to_json_text()))),
         },
-        ColumnType::Date => match &v {
-            Value::String(s) => match parse_date_days(s) {
-                Some(d) => Coerced::Cell(Cell::Date(d)),
-                None => Coerced::Fail(format!("string {s:?} is not a YYYY-MM-DD / RFC3339 date")),
-            },
+        ColumnType::Date => match k {
+            Kind::Str => {
+                let s = v.as_str().expect("Kind::Str has a string body");
+                match parse_date_days(s) {
+                    Some(d) => Coerced::Cell(Cell::Date(d)),
+                    None => fail(format!("string {s:?} is not a YYYY-MM-DD / RFC3339 date")),
+                }
+            }
             // A bare integer is read as epoch-days (Arrow Date32 semantics).
-            Value::Number(n) => match n.as_i64() {
+            Kind::Int => match v.as_i64() {
                 Some(i) if i >= i32::MIN as i64 && i <= i32::MAX as i64 => {
                     Coerced::Cell(Cell::Date(i as i32))
                 }
-                _ => Coerced::Fail("integer out of Date32 (epoch-day) range".into()),
+                _ => fail("integer out of Date32 (epoch-day) range".into()),
             },
-            other => Coerced::Fail(format!("expected date, got {}", kind(other))),
+            _ => fail(format!("expected date, got {}", k.name())),
         },
-        ColumnType::Timestamp => match &v {
-            Value::String(s) => match parse_ts_micros(s) {
-                Some(t) => Coerced::Cell(Cell::Ts(t)),
-                None => Coerced::Fail(format!("string {s:?} is not an RFC3339 timestamp")),
-            },
+        ColumnType::Timestamp => match k {
+            Kind::Str => {
+                let s = v.as_str().expect("Kind::Str has a string body");
+                match parse_ts_micros(s) {
+                    Some(t) => Coerced::Cell(Cell::Ts(t)),
+                    None => fail(format!("string {s:?} is not an RFC3339 timestamp")),
+                }
+            }
             // A bare integer is read as epoch-milliseconds → microseconds.
-            Value::Number(n) => match n.as_i64() {
-                Some(ms) => match ms.checked_mul(1000) {
-                    Some(us) => Coerced::Cell(Cell::Ts(us)),
-                    None => Coerced::Fail("epoch-ms overflows i64 microseconds".into()),
-                },
-                None => Coerced::Fail("timestamp number not an integer epoch-ms".into()),
+            Kind::Int => match v.as_i64().and_then(|ms| ms.checked_mul(1000)) {
+                Some(us) => Coerced::Cell(Cell::Ts(us)),
+                None => fail("epoch-ms overflows i64 microseconds".into()),
             },
-            other => Coerced::Fail(format!("expected timestamp, got {}", kind(other))),
+            Kind::Float => fail("timestamp number not an integer epoch-ms".into()),
+            _ => fail(format!("expected timestamp, got {}", k.name())),
         },
     }
 }
 
-fn kind(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
-/// Parse a `YYYY-MM-DD` (or the date part of an RFC3339 string) into days since the
-/// Unix epoch.
 fn parse_date_days(s: &str) -> Option<i32> {
     let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         d

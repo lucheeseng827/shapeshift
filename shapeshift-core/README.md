@@ -52,6 +52,13 @@ flowchart LR
   transactional `push`** (compute + validate every cell before committing any, so a
   rejected row never misaligns the columns), and `flush` → `RecordBatch`. `PushOutcome`
   reports `Appended` vs a lenient `Rejected`; `run_pipeline` drives a whole shape.
+- **Schema drift** — `DriftSpec` / `DriftPolicy` / `DriftReport`: what the schema does not
+  cover, found per record and reported per path (count, first record, examples, and the type
+  inference would give it). `Shaper::from_spec` honours the spec's `drift` block;
+  `Shaper::drift_report()` / `RunReport.drift` return the result. `ignore` costs nothing (no
+  tracker is built); `warn` (the default) reports without changing what is written; `rescue`
+  appends a `json` catch-all column holding what would have been lost; `quarantine` turns a
+  drifted row into a `Rejected` outcome; `error` fails the push.
 - **The sink seam** — the `Sink` trait (`write_batch` / `finish` → `SinkSummary`), the
   only surface the engine depends on for output.
 - **MAR arithmetic** — `estimate_mar`, `MarInputs`, `MarReport`: the honest

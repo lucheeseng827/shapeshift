@@ -2,9 +2,7 @@
 
 Thanks for your interest in shapeshift — the streaming JSON/JSONL → Parquet/Iceberg
 shaper. The OSS engine is **Apache-2.0** and fully self-hostable: no row cap, no
-telemetry, single static binary. It is the same engine that runs under shapeshift
-Cloud and the self-hosted commercial control plane — those add a
-managed layer on top; they do not fork the core. Contributions land in the OSS core.
+telemetry, single static binary. Contributions land in this repository.
 
 ## Developer Certificate of Origin (DCO)
 

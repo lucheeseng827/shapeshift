@@ -1,19 +1,19 @@
 # shapeshift — Roadmap
 
 Phase-based, forward-looking, and honest. This is a plan, **not a schedule** — there are no
-dates and none are implied. Sizes and ordering are engineering judgement, revisable as the OSS
-funnel tells us what matters. Anything marked *(roadmap)* is not built yet; anything checked is
+dates and none are implied. Sizes and ordering are engineering judgement, revisable as users
+tell us what matters. Anything marked *(roadmap)* is not built yet; anything checked is
 in the v0.1 tree and, where the brief says so, verified. The design these phases extend is fixed
-in [`./ARCHITECTURE.md`](./ARCHITECTURE.md) (the v0.1 limits are §13; the open-core boundary is
+in [`./ARCHITECTURE.md`](./ARCHITECTURE.md) (the v0.1 limits are §13; the engine/orchestrator boundary is
 §14).
 
 Two rules govern everything below:
 
 - **The OSS engine (Apache-2.0) stays a shaper, not an orchestrator.** It has no row cap and no
   telemetry, and it never will. Scheduling, run history, connectors, metering, and CDC are the
-  orchestration layer's job — they are hosted / commercial features, kept out of the core on purpose
-  ([ARCHITECTURE §14](./ARCHITECTURE.md)). The OSS-core phases (2–3) only ever make the engine a
-  better *shaper*; the hosted / commercial roadmap is a separate section, drawn with a hard line.
+  orchestration layer's job, kept out of the engine on purpose
+  ([ARCHITECTURE §14](./ARCHITECTURE.md)). The phases below only ever make the engine a
+  better *shaper*; what stays out is listed in its own section at the end.
 - **Additive, not a rewrite.** The six-crate split (I/O-free `core`, driver crates behind the
   `Sink` trait) was chosen so each roadmap item is a new driver, a new spec field, or a new
   manifest column — never a change to the engine's contract. New physical outputs are new crates
@@ -26,17 +26,16 @@ presented as a promise for another; run the harness yourself to compare.
 
 ## Milestone summary
 
-| Phase | Headline | Plane | Status |
-|---|---|---|---|
-| **0 — Foundation** | Standalone Cargo workspace, musl-static single binary, Snappy-only dep floor, hand-rolled Avro | OSS | ✅ **shipped (v0.1)** |
-| **1 — v0.1 engine** | Dataset transform Spec → Arrow → Parquet **and** self-contained Iceberg v2, both read end-to-end by DuckDB | OSS | ✅ **shipped (v0.1)** |
-| **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | OSS | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; the hosted REST catalog is the commercial plane |
-| **3 — Reach & format coverage** | Object-store output, optional zstd fat build, streaming json-array, a real benchmark suite | OSS | ✅ **shipped** — object-store output (Parquet _and_ Iceberg), the zstd fat build (`--features zstd`), streaming json-array, and the measured benchmark suite ([`benchmarks/`](./benchmarks/)) |
-| **Hosted / commercial** | shapeshift Cloud (freemium) + commercial self-host: scheduling, connectors, CDC, MAR reporting *around* the unchanged engine | Hosted / commercial | ⏳ planned |
+| Phase | Headline | Status |
+|---|---|---|
+| **0 — Foundation** | Standalone Cargo workspace, musl-static single binary, Snappy-only dep floor, hand-rolled Avro | ✅ **shipped (v0.1)** |
+| **1 — v0.1 engine** | Dataset transform Spec → Arrow → Parquet **and** self-contained Iceberg v2, both read end-to-end by DuckDB | ✅ **shipped (v0.1)** |
+| **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; a REST catalog is out of scope |
+| **3 — Reach & format coverage** | Object-store output, optional zstd fat build, streaming json-array, a real benchmark suite | ✅ **shipped** — object-store output (Parquet _and_ Iceberg), the zstd fat build (`--features zstd`), streaming json-array, and the measured benchmark suite ([`benchmarks/`](./benchmarks/)) |
+| **4 — Trustworthy against a moving source** | Schema drift detection and mitigation: what the schema silently dropped, and five policies for what to do about it | ✅ **shipped** — `drift.policy` (`ignore`/`warn`/`rescue`/`quarantine`/`error`), a per-path report with the columns to add, measured at ~6% on a clean run |
 
-Phases 2 and 3 are independent of each other and can interleave — both only depend on the v0.1
-core. The hosted / commercial plane is the business; it is a thin control plane *around* the engine and
-can start whenever the OSS funnel justifies it, without blocking engine work.
+Phases 2, 3, and 4 are independent of each other and can interleave — each only depends on the v0.1
+core.
 
 ---
 
@@ -130,7 +129,7 @@ it back with an independent engine.
 ## OSS-core phases (Apache-2.0)
 
 Everything below keeps the engine a self-hostable shaper with **no row cap and no telemetry**. These
-phases closed the honest v0.1 limits — both are now **shipped** — and none of them added a
+phases closed the honest v0.1 limits — all three are now **shipped** — and none of them added a
 scheduler, a connector, or a metering path (that boundary is the next section).
 
 ## Phase 2 — Iceberg write-path maturity *(shipped)*
@@ -191,9 +190,9 @@ This phase makes the table a first-class, evolvable Iceberg v2 dataset.
       rewrite, no catalog. Writer-embedded *relative* paths are deliberately **not** pursued: they
       are non-standard in Iceberg and not resolved by default across engines, so they would trade a
       verifiable table for an unreadable one.
-- [ ] **REST catalog + catalog-managed relocation + multi-writer append** — a commercial-edition feature: a
-      hosted catalog re-anchors a moved table's paths (so *any* engine reads it with no reader flag)
-      and serialises concurrent appends.
+- **Out of scope: REST catalog + catalog-managed relocation + multi-writer append.** An external
+      Iceberg REST catalog re-anchors a moved table's paths (so *any* engine reads it with no reader
+      flag) and serialises concurrent appends; the engine does not implement one.
 
 ## Phase 3 — Reach & format coverage *(shipped)*
 
@@ -234,31 +233,62 @@ Widen where output can land and where input can come from — without breaking t
       allocator trade (glibc ~1.6× faster but retains freed buffers; not a leak, tunable via
       `MALLOC_MMAP_THRESHOLD_`).
 
+## Phase 4 — Trustworthy against a moving source *(shipped)*
+
+A spec is written once per source *shape*, which is the whole economic argument — and the whole
+risk. Phase 4 closes the gap between "the spec you wrote" and "the source you have today", without
+the engine growing any state.
+
+- [x] **Schema drift detection** — the two losses that used to leave *no trace* are now found and
+      counted per record: an **undeclared field** (in `schema: infer`, one that showed up after the
+      `infer_sample` window; in `schema: strict`, one the spec never declared — either way its
+      values were never selected) and a **type mismatch** in an optional column under the lenient
+      policy (present, uncoercible, written as null, uncounted). Both used to report
+      `rows_in == rows_out` and look like a clean run. The effective columns' source paths compile
+      into a trie once; each record is walked against it, and the dotted path string is only built
+      on a miss.
+- [x] **A report that tells you what to change** — per drifted path: rows carrying it, the record it
+      first appeared in, example values, and **the type inference would give it**, emitted as a
+      ready-to-paste `columns:` block. `shape` prints a summary and writes
+      `<output>.drift.json`; `serve` returns and renders it; embedders read `RunReport.drift`.
+- [x] **Five mitigations, chosen per run** (`drift.policy`, or `--on-drift`): `ignore` (the v0.1 hot
+      loop, no detection), **`warn`** (the default — report; rows written are identical to
+      `ignore`), `rescue` (a `json` catch-all column, appended after every real column so enabling
+      it is an *additive* Iceberg schema change, holding whatever the row would have lost),
+      `quarantine` (a drifted row is rejected into the existing sidecar, so the table holds only
+      exactly-on-schema rows), and `error` (fail at the first event — and a failed run never
+      finalizes its sink, so there is no half-written table to consume).
+- [x] **Bounded and measured, like the rest of the engine** — at most 1,000 distinct paths and
+      `drift.max_examples` values per path (then the report says `truncated`), and the default costs
+      **~6% of wall time on a clean 1M-row run with peak RSS unchanged**
+      ([BENCHMARKS.md §7](./BENCHMARKS.md)).
+- [ ] **Cross-run schema management** — propagating a new column into the destination on the next
+      run, drift history, and alerting are **deliberately not here**. They are stateful and
+      scheduled: an orchestrator's job ([ARCHITECTURE §14](./ARCHITECTURE.md)), listed in the
+      out-of-scope section below.
+
 ---
 
-## Hosted / commercial roadmap (shapeshift Cloud + commercial license)
+## Out of scope (by design)
 
-A hard line sits here. Everything above is the Apache-2.0 engine. Everything below is the paid open-core
-plane, and it is built **around** the unchanged engine — the engine's only contract to it is the CLI
-surface and the `SinkSummary` it prints ([ARCHITECTURE §14](./ARCHITECTURE.md)). Incremental/CDC,
-connectors, and scheduling are **deliberately not in the OSS core**; they live here so the paid planes
-add capability at the orchestration layer without ever needing to change — or cap — the engine.
+Everything above is the engine. The items below are deliberately **not** in it: each needs state,
+a schedule, or a network surface the engine does not have. They belong to an orchestrator that runs
+shapeshift as a step, and the engine's only contract to one is the CLI surface and the `SinkSummary`
+it prints ([ARCHITECTURE §14](./ARCHITECTURE.md)).
 
-- [ ] **shapeshift Cloud (hosted, freemium)** — a managed control plane to try shapeshift with zero
-      setup: a hosted place to drop a source, keep a spec, and run it, with the same engine underneath.
-- [ ] **Commercial license (paid self-host)** — the same managed control plane deployed
-      **inside a team's own perimeter**, for teams who need the control plane but cannot use a hosted
-      service. One-way dependency on the OSS crates; removing the commercial plane leaves a fully functional OSS engine.
-- [ ] **Scheduling** — run a spec on a cadence / trigger. Composes shapeshift as a step under the lab's
-      orchestrator (**dagron**) rather than growing a scheduler inside the engine.
-- [ ] **Incremental / CDC shaping** — shape only the changed rows since the last run (watermarks,
-      change feeds). This is the direct MAR counter-play at the control-plane layer; the OSS engine
-      stays a stateless, whole-source shaper.
-- [ ] **Connectors** — managed source/sink connectors (databases, SaaS APIs, object stores) feeding the
-      engine, so users are not hand-wiring inputs. Kept out of the OSS core's dependency graph entirely.
-- [ ] **Run history + MAR reporting** — retained run summaries and the "rows touched vs. what a MAR
-      vendor would have billed" dashboard, built from the same honest cost arithmetic the OSS `cost`
-      command already computes.
+- **Scheduling** — run a spec on a cadence or trigger. Compose shapeshift as a step under an
+  orchestrator (such as **dagron**) rather than growing a scheduler inside the engine.
+- **Incremental / CDC shaping** — shape only the rows changed since the last run (watermarks, change
+  feeds). The engine stays a stateless, whole-source shaper; the
+  [catalog demos](./examples/catalog-demos/README.md) show watermark and CDC patterns built around it.
+- **Connectors** — source/sink connectors (databases, SaaS APIs) feeding the engine. Kept out of its
+  dependency graph entirely.
+- **Schema management across runs** — the stateful half of drift: remember each dataset's shape
+  between runs, propagate an added column on the next run, keep the drift history, and alert on it.
+  The engine already detects and reports drift per run
+  ([Phase 4](#phase-4--trustworthy-against-a-moving-source-shipped)).
+- **Run history** — retained run summaries. The `cost` command's arithmetic is available to anything
+  that keeps them.
 
 ---
 

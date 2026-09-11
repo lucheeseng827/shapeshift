@@ -183,9 +183,9 @@ CREATE OR REPLACE TABLE pg.public.orders AS SELECT * FROM analytics.orders_curre
 | Serve | Snowflake / Postgres | **database as sink** (current state via MERGE) |
 
 shapeshift owns exactly one box — *shape JSON → Iceberg, append-only, bounded RAM* — and the
-open Iceberg format makes every neighbouring box swappable. Managed CDC connectors, in-table
-`MERGE`/upsert, exactly-once delivery, and multi-writer catalog commits are the commercial
-control plane's job; this demo shows how far the Apache-2.0 core alone gets you.
+open Iceberg format makes every neighbouring box swappable. CDC connectors, in-table
+`MERGE`/upsert, exactly-once delivery, and multi-writer catalog commits are out of scope;
+this demo shows how far shapeshift alone gets you.
 
 ---
 

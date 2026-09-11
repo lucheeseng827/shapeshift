@@ -1,10 +1,8 @@
 /* shapeshift serve — console styles.
  *
- * The visual language is the eggrd dark-first "console" theme, the same tokens the
- * ee operator dashboards use, ported down to a single hand-written stylesheet (no
+ * A dark-first "console" theme in a single hand-written stylesheet (no
  * framework, no CSS build, no web fonts — everything falls back to the platform UI
- * font so the page fetches nothing off-box). This is the deliberately-lean OSS
- * cousin of the full ee console. */
+ * font so the page fetches nothing off-box). */
 
 :root {
   /* Surfaces */

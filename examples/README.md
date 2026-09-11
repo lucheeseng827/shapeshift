@@ -7,8 +7,7 @@ from-paths and transforms, inspect every output, and price the run against a
 managed vendor's MAR (Monthly Active Rows) rate.
 
 Everything here is local filesystem only, no network, no telemetry, no row cap —
-this is the OSS engine (Apache-2.0), the same code whether you self-host it free
-or run it under the commercial control plane.
+this is the engine (Apache-2.0), running entirely on your own machine.
 
 > **Wiring shapeshift into a lakehouse?** See
 > [`catalog-demos/`](./catalog-demos/README.md) for end-to-end recipes that put a
@@ -198,10 +197,39 @@ shapeshift shape -s examples/billing.spec.yaml -i examples/events.jsonl
 shaped `billing` → out/billing.parquet (Parquet)
 rows_in=4 rows_out=4 rejected=0 parse_errors=1 row_groups=1 bytes=2292
 malformed / rejected rows → out/billing.parquet.rejects.jsonl (1 parse, 0 shaped-out)
+schema drift (policy: warn): 1 undeclared field(s) in 3 of 4 rows
+  new field `tags` — 3 row(s), first at record 1, suggest type json, e.g. ["a","b"]
+  every row was written as-is; nothing was dropped for drift
+  to keep the new fields, add to the spec's `columns:`
+    - name: tags
+      type: json
+      required: false
+full drift report → out/billing.parquet.drift.json
 ```
 
 Same 4-in / 1-parse-error, but the columns, names, types and transforms are exactly
 the ones you declared — `plan` uppercased, `amount_cents` in integer cents.
+
+**And the spec's own blind spot, said out loud.** `billing.spec.yaml` never declares
+`tags`, so `strict` mode does what it promises and writes only the columns you asked
+for — three rows' worth of `tags` values do not reach the table. That is correct, and
+it used to be *invisible*: `rows_in=4 rows_out=4`, nothing counted, nothing sidecarred.
+The drift report is the difference between "I meant to drop that" and "I did not know".
+Paste the suggested block under `columns:` to keep it, or leave the spec as-is — the
+report is information, not a complaint. To silence it for a spec you know is
+deliberate, run with `--on-drift ignore`.
+
+The same run, refusing to lose anything instead:
+
+```sh
+shapeshift shape -s examples/billing.spec.yaml -i examples/events.jsonl --on-drift rescue
+shapeshift inspect out/billing.parquet | tail -3
+```
+
+```text
+    active: Boolean
+    _rescued: Utf8      # {"tags":["a","b"]} on the rows that carried it, null elsewhere
+```
 
 ## (e) Inspect each output
 

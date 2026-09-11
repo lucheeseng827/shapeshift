@@ -904,7 +904,8 @@ fn reanchor(table_dir: &Path, base: &str, path: &str) -> std::path::PathBuf {
 /// this unpartitioned-manifest reader doesn't decode, so we never silently drop rows.
 pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
     let table_dir = table_dir.as_ref();
-    let hint = std::fs::read_to_string(table_dir.join("metadata/version-hint.text")).map_err(sink_err)?;
+    let hint =
+        std::fs::read_to_string(table_dir.join("metadata/version-hint.text")).map_err(sink_err)?;
     let meta_key = current_metadata_key(&hint)?;
     let text = std::fs::read_to_string(table_dir.join(&meta_key)).map_err(sink_err)?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;

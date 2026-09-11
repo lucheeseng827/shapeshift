@@ -13,9 +13,11 @@ use crate::spec::ColumnSpec;
 use crate::types::ColumnType;
 use crate::value::flatten_leaves;
 
-/// Per-path accumulator of observed JSON shapes.
-#[derive(Default, Clone)]
-struct Acc {
+/// Per-path accumulator of observed JSON shapes. Shared with [`crate::drift`], which
+/// runs the same widening rules over the values a *drifted* path carried, so the
+/// suggested type in a drift report is exactly the type `infer` would have chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Acc {
     has_bool: bool,
     has_int: bool,
     has_float: bool,
@@ -26,16 +28,27 @@ struct Acc {
     all_ts: bool,
 }
 
+impl Default for Acc {
+    fn default() -> Self {
+        Acc::new()
+    }
+}
+
 impl Acc {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Acc {
+            has_bool: false,
+            has_int: false,
+            has_float: false,
+            has_string: false,
+            has_json: false,
+            any_string: false,
             all_date: true,
             all_ts: true,
-            ..Default::default()
         }
     }
 
-    fn observe(&mut self, v: &Value) {
+    pub(crate) fn observe(&mut self, v: &Value) {
         match v {
             Value::Null => {}
             Value::Bool(_) => self.has_bool = true,
@@ -56,7 +69,7 @@ impl Acc {
         }
     }
 
-    fn decide(&self) -> ColumnType {
+    pub(crate) fn decide(&self) -> ColumnType {
         if self.has_json {
             return ColumnType::Json;
         }

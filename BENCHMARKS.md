@@ -262,32 +262,242 @@ yours; the harness exists so you never have to extrapolate.
 
 | bench | rows | input | wall | rows/s | input MB/s | peak RSS |
 |---|---|---|---|---|---|---|
-| jsonl→parquet | 10,000 | 1.5 MB | 0.08s | 118,013 | 18.1 | 9.8 MiB |
-| jsonl→iceberg | 10,000 | 1.5 MB | 0.09s | 114,526 | 17.6 | 9.8 MiB |
-| jsonl→parquet | 1,000,000 | 157 MB | 7.01s | 142,736 | 22.3 | 11.5 MiB |
-| jsonl→iceberg | 1,000,000 | 157 MB | 7.03s | 142,204 | 22.3 | 11.6 MiB |
-| jsonl→parquet | 8,000,000 | 1,260 MB | 56.2s | 142,318 | 22.4 | **13.3 MiB** |
-| jsonl→iceberg | 8,000,000 | 1,260 MB | 56.9s | 140,563 | 22.1 | **13.4 MiB** |
-| json-array→parquet | 1,000,000 | 157 MB | 7.25s | 138,017 | 21.6 | 11.5 MiB |
+| jsonl→parquet | 10,000 | 1.5 MB | 0.06s | 157,980 | 24.3 | 9.9 MiB |
+| jsonl→iceberg | 10,000 | 1.5 MB | 0.06s | 163,567 | 25.1 | 9.9 MiB |
+| jsonl→parquet | 1,000,000 | 157 MB | 3.85s | 259,769 | 40.7 | 12.3 MiB |
+| jsonl→iceberg | 1,000,000 | 157 MB | 3.84s | 260,646 | 40.8 | 12.4 MiB |
+| jsonl→parquet | 8,000,000 | 1,260 MB | 29.3s | 273,495 | 43.1 | **14.1 MiB** |
+| jsonl→iceberg | 8,000,000 | 1,260 MB | 29.7s | 269,506 | 42.4 | **14.1 MiB** |
+| json-array→parquet | 1,000,000 | 157 MB | 8.15s | 122,752 | 19.2 | 12.0 MiB |
 
-- **Bounded RAM: verified.** Peak RSS goes 9.8 → 11.5 → 13.3 MiB while the input grows
+> The `json-array` row above is **pre-tape** and is kept for the record. That path now
+> parses onto a tape as well — see [json-array on the tape too](#json-array-on-the-tape-too),
+> measured separately because it was measured on a different machine.
+
+- **Bounded RAM: verified.** Peak RSS goes 9.9 → 12.3 → 14.1 MiB while the input grows
   1.54 MB → 157 MB → 1,260 MB (**~820×**, exact byte counts from the harness's JSON output) —
   the flat curve the row-group==batch design promises, and the streamed json-array path sits on
   the same line. (Row-group == batch: the Shaper flushes a `RecordBatch` every `row_group_rows`,
   default 50,000, and the sink closes that row group immediately.)
-- **Throughput: ~140k rows/s (~22 MB/s of input) on this machine**, steady from 1M to 8M rows,
-  Parquet and Iceberg within ~1% of each other — the Iceberg path costs almost nothing over
-  Parquet because it *is* the Parquet writer plus a metadata tail.
+- **Throughput: ~260–275k rows/s (~43 MB/s of input) on this machine**, steady from 1M to 8M
+  rows, Parquet and Iceberg within a couple of percent of each other — the Iceberg path costs
+  almost nothing over Parquet because it *is* the Parquet writer plus a metadata tail.
+- **`json-array` input used to be the exception**, at ~123k rows/s in this sweep, because it
+  still built an owned `serde_json::Value` per element while JSONL parsed onto a tape. That
+  gap is now closed — see [json-array on the tape too](#json-array-on-the-tape-too). The row
+  above is left as measured so the before/after is legible rather than quietly restated.
+- **This number has moved a lot, in three steps.** The same sweep on the same machine measured
+  121,185 rows/s at 8M rows before any of it. Removing the per-row allocations took it to
+  149,649; overlapping the writer added nothing on musl at that point; parsing onto a tape took
+  it to 273,495. Each step is A/B'd below.
 - **Cold start: 3.0 ms** median (binary exec → 4 rows shaped → exit) — no JVM, no interpreter,
   no warm-up.
 - **Snappy vs zstd** (glibc `--features zstd` fat build, same 1M rows): zstd wrote **11 MB vs
   Snappy's 20 MB (1.85× smaller)** at ~2% more wall time.
-- **The allocator trade, stated plainly.** On a **glibc** (host) build the same engine runs
-  ~1.6× faster (~237k rows/s) but glibc malloc *retains* the freed batch buffers (its
-  dynamically rising mmap threshold), so peak RSS appears to grow with input — 139 MiB at 8M
-  rows. That is allocator retention, **not a leak**: `MALLOC_MMAP_THRESHOLD_=65536` on the same
+- **The allocator trade, much smaller than it was.** On a **glibc** (host) build the same
+  engine runs ~1.34× faster (367k rows/s at 8M rows on this machine, against musl's 273k).
+  That gap used to be ~2× on the parse path alone; the tape reader closed most of it by
+  removing what there was to allocate. glibc malloc still *retains* the freed batch buffers
+  (its dynamically rising mmap threshold), so its peak RSS appears to grow with input — 67 MiB
+  at 8M rows against musl's flat 14 MiB. That is allocator retention, **not a leak**: `MALLOC_MMAP_THRESHOLD_=65536` on the same
   glibc binary is flat at 16 MiB, and the shipped musl binary is flat at 13 MiB. Pick your
   binary by what you're optimizing for; the harness measures both.
+
+### Where the per-row cost went
+
+The gap between the glibc and musl numbers above is the tell: a build that differs only in
+its allocator should not differ in throughput unless the hot loop is *allocating*. Three
+allocations per row were doing no work, and removing them is what moved the table above.
+
+| removed | was | now |
+|---|---|---|
+| path re-split | `select()` split the column's dotted path into a fresh `Vec<&str>` per column, per row (8/row on this shape) | compiled once at build time into `Segment`s; the loop selects through them with no allocation |
+| value clone | `coerce` took an owned `Value`, so every cell cloned out of the record — a heap allocation per string, a deep clone per array, including for `date`/`timestamp` columns that only parse the text and drop it | `coerce` reads `&Value`; `Cell::Str` holds a `Cow`, so a value that survives as-is borrows the record's bytes. Only a synthesized value (a transform's output, a stringified number, a serialized nested value) allocates |
+| raw line copy | `JsonlReader` built the raw line `String` for **every** row, because simd-json parses destructively and the original bytes had to be saved before parsing — but they are only read on a reject | the parse runs on a reused scratch copy and `buf` keeps the pristine line, so a clean run never builds the string |
+
+Bounded RAM is unaffected — the flat-RSS check still passes, and peak RSS came out marginally
+lower. Output is unchanged: the shaped Parquet is byte-identical to the previous binary's for
+both the Parquet and Iceberg paths, and the reject sidecar matches.
+
+What is *not* done yet, and would be the next step change: the pipeline is still single-
+threaded (parse, shape, encode, compress all on one core), and the per-row `Vec<Cell>` is the
+one allocation left in `push`.
+
+### Overlapping the writer with the shaper (`--pipeline`)
+
+Encoding and compressing a row group used to take turns with shaping the next one on a
+single core. `--pipeline` hands finished row groups to a writer thread so the two overlap.
+It never changes the output — the shaped Parquet is byte-identical with it on and off, on
+both targets — only who is idle.
+
+**Same machine, 1M rows / 157 MB → Parquet, three interleaved reps, median:**
+
+| build | `--pipeline off` | `--pipeline on` | |
+|---|---|---|---|
+| glibc | 226,947 rows/s (29.3 MiB) | **257,628 rows/s** (21.6 MiB) | **+13.5%** |
+| musl (shipped) | 149,182 rows/s (11.7 MiB) | 141,298 rows/s (12.0 MiB) | **−5.3%** |
+
+Over the full 8M-row sweep the glibc gain is **+16.4%** (222,833 → 259,380 rows/s), and peak
+RSS *falls* (138.5 → 61.5 MiB) because the batch buffers turn over faster.
+
+**The default was `auto`: on, except on musl — and the tape reader below changed that.**
+musl's malloc takes a single global lock, so at the time a second allocating thread contended
+with the first instead of scaling. What changed is not the allocator but how much the shaper
+asks of it: parsing onto a reusable tape stopped allocating per record, so there is no longer
+a lock to fight over. Re-measured after that change, five interleaved reps:
+
+| build | `--pipeline off` | `--pipeline on` | |
+|---|---|---|---|
+| glibc | 281,649 rows/s | **344,550 rows/s** | **+22.3%** |
+| musl (shipped) | 238,850 rows/s | **262,779 rows/s** | **+10.0%** |
+
+So `auto` is now simply **on**, on both. `--pipeline on|off` overrides it either direction.
+The earlier reasoning was not wrong; its premise was removed.
+
+Memory stays bounded by the row group, not the input — at most two batches exist at once —
+and the writer thread is spawned lazily on the *second* row group, so a single-row-group
+run (every small input, including the 4-row cold-start case) never pays for a thread it
+would have nothing to overlap with. Cold start is unchanged at ~3 ms.
+
+**The negative result is the useful half.** The first attempt put the *source* on the far
+thread instead, handing `serde_json::Value`s across. That measured **~2× slower** than
+single-threaded on *both* glibc (0.47×) and musl (0.54×). A `Value` is a tree of small heap
+allocations, so shipping one to another thread means every record is allocated on one core
+and freed on another — cross-arena frees fight the allocator, and the consumer chases
+pointers into memory another core just wrote. An Arrow `RecordBatch` is the opposite shape:
+a few large contiguous buffers behind an `Arc`. *What* crosses the boundary mattered far
+more than whether anything did.
+
+### Not building a `Value` per record (the tape reader)
+
+The engine's record model was `serde_json::Value` — a tree of small heap allocations, one map
+per object and a `String` per key and per string value, built and thrown away for every record.
+That was the single largest remaining cost, and it fell hardest on the shipped musl binary.
+
+`shapeshift-json` now parses JSONL onto a **reusable simd-json tape**: a flat `Vec` of nodes,
+reused between records, whose strings point back into the read buffer. Nothing is allocated per
+record in the steady state. Parse only, 1M records of the benchmark shape
+([`shapeshift-json/examples/parsebench.rs`](./shapeshift-json/examples/parsebench.rs) — run it
+yourself):
+
+| record model | glibc | musl |
+|---|---|---|
+| owned `serde_json::Value` | 540k rec/s | 256k rec/s |
+| borrowed value | 855k rec/s | 488k rec/s |
+| **tape, reused buffers** | **1,849k rec/s** | **1,592k rec/s** |
+
+Read the *gap* as well as the rows: the owned model is 2.1× slower on musl than on glibc, the
+tape only 1.16×. With nearly nothing to allocate, the allocator nearly stops mattering — which
+is why this, and not a different allocator, was the answer to the section below.
+
+End to end, 1M rows → Parquet, three interleaved reps, median:
+
+| build | value model | tape | |
+|---|---|---|---|
+| **musl (shipped)** | 143,557 rows/s (11.6 MiB) | **241,211 rows/s** (11.7 MiB) | **+68.0%** |
+| glibc | 238,817 rows/s (20.1 MiB) | **351,486 rows/s** (21.4 MiB) | **+47.2%** |
+
+**The `serde_json::Value` contract did not change.** `shapeshift-core` reads records through a
+`Record` trait that `&Value` implements, so `Shaper::push(&value)` behaves exactly as before and
+an embedder sees no difference. Both models run the same coercion code, and
+`tape_and_serde_agree_on_every_accessor` asserts they answer identically — it caught two real
+divergences during development: simd-json's `as_f64` refuses an integer node (so `3` in a
+`float64` column would have been written as **null**), and `u64` past `i64::MAX` converted to
+null. Text rendering goes through serde_json rather than simd-json's encoder for the same
+reason: the two disagree (`1.79e308` vs `1.79e+308`), and a column's bytes must not depend on
+which reader produced them.
+
+`json-array` input now takes the same path — see below.
+
+### json-array on the tape too
+
+The array reader already framed each element into a reusable buffer, exactly as the line
+reader framed lines. So the only thing between `json-array` and the tape was that nothing had
+been written to use it: the framing was factored out of the `Value` iterator (one
+implementation of the array's state machine, shared, the same split JSONL uses), and a
+`TapeJsonArrayReader` was built on top of it. A `TapeSource` trait lets the shape loop keep one
+tape path rather than growing one per input format.
+
+The element scanner, the streaming behaviour, and the error semantics are untouched: a bad
+element is still recoverable and still reports its 1-based element index, a malformed array is
+still reported once and ends iteration.
+
+1M rows / 157 MB, three interleaved reps, median. **Different machine from the table above**
+(Xeon @ 2.10 GHz, 4 cores, 16 GiB, rustc 1.94.1), so read the deltas, not the absolutes:
+
+| build | before | after | |
+|---|---|---|---|
+| **musl (shipped)** | 151,268 rows/s | **308,298 rows/s** | **+103.8%** |
+| glibc | 318,094 rows/s | **436,462 rows/s** | +37.2% |
+
+Peak RSS is unmoved (11.9 → 12.2 MiB on musl).
+
+musl doubling while glibc gains a third is the [allocator story](#the-allocator-was-the-standing-bottleneck-on-musl)
+again, from the other end: an owned `Value` per element costs most where malloc takes a global
+lock, so removing it is worth most there. On the same machine `json-array` now runs at **93.5%
+of JSONL's rate on musl** (308,298 vs 329,779) against 46% before. What is left is the element
+scanner — a byte-at-a-time depth/string walk, where JSONL splits lines with `memchr` — and that
+is the next thing to look at if this path ever matters more.
+
+**A second, smaller thing was fixed on the way.** The array reader materialized an owned
+`String` of every element *before* parsing, so the raw text would be available if the parse
+failed — while JSONL had been switched to a scratch copy months earlier precisely so the raw
+line is built only on the error path. Bringing the array reader across removes an allocation
+per element. On glibc it measured as **nothing** (312,385 vs 312,299 rows/s — one small
+alloc/free against a 3.2 µs row budget is below noise); it is kept for consistency and because
+the same class of allocation is what musl charges for, not because it showed up in a number.
+
+### The allocator was the standing bottleneck on musl
+
+Two independent measurements on this machine pointed at the same thing. Kept here because it
+is what led to the tape reader above, and because the shape of the argument generalizes:
+
+| workload (1M rows / 157 MB) | glibc | musl | musl penalty |
+|---|---|---|---|
+| `cost -i` (parse only — build a `Value` per record, drop it) | 1.96s | 12.06s | **6.2×** |
+| `shape -i -o` (parse + shape + write) | 4.59s | 6.74s | 1.5× |
+
+Parsing in isolation is **six times** slower on the shipped binary, because that workload is
+almost pure allocate-and-free and musl serializes it. It is diluted to 1.5× in a full run
+only because the rest of the work is not allocation-bound. This is also why the writer
+thread loses on musl while winning on glibc.
+
+The lever it pointed at was the allocator itself, not more threads — but every well-known
+drop-in (mimalloc, snmalloc, rpmalloc) is C or C++, which the lean musl build deliberately does
+not link. **Reducing allocation was the portable alternative, and it is the one taken above.**
+The tape reader removed the `Value` tree, and with it most of the gap: the parse-only penalty
+fell from 6.2× to 1.16×, and the end-to-end one from 1.5× to ~1.34×. The `json-array` source
+was the last holdout on the owned model and has since been brought across too — where it
+promptly doubled on musl and gained a third on glibc, which is this same argument arriving a
+second time.
+
+### Schema-drift detection: the cost of the default
+
+`drift.policy` defaults to `warn`, so every run scans each record against the schema's consumed
+paths. That is not free, and this is what it costs. **Same machine as above; glibc release build
+(`cargo build --release -p shapeshift-cli`), 1,000,000 rows / 157 MB of the same
+`examples/events.jsonl` shape → Parquet.** Runs are interleaved A/B/A/B so machine drift hits both
+arms equally; the figure is the median of 6.
+
+| run | policy | median wall | vs `ignore` | peak RSS |
+|---|---|---|---|---|
+| clean (schema covers the source) | `ignore` | 4.47s | 1.00× | 28.3 MiB |
+| clean (schema covers the source) | `warn` | 4.75s | **1.06×** | 28.1 MiB |
+| every row drifts (6 uncovered fields) | `ignore` | 2.30s | 1.00× | 11.1 MiB |
+| every row drifts (6 uncovered fields) | `warn` | 3.38s | 1.47× | 11.1 MiB |
+| every row drifts (6 uncovered fields) | `rescue` | 5.61s | 2.44× | 30.9 MiB |
+
+- **On a run that has not drifted — the case that matters, because it is every healthy run — the
+  default costs ~6% of wall time and nothing measurable in RAM.** The scan does one trie lookup per
+  record key and only builds a path string on a miss, so a covered key costs a few short string
+  comparisons and no allocation.
+- **A run where every row drifts costs 1.47×**, and `rescue` on that same run 2.44× — it builds and
+  serializes a JSON object per row. That is the price of not losing the data; it is also a spec
+  that is badly out of date, and the report tells you exactly which columns to add.
+- `--on-drift ignore` restores the v0.1 hot loop exactly: no tracker is constructed and `push` does
+  no drift work at all.
+- The drifting rows here are cheaper in absolute terms because that spec declares one column
+  (`id`) instead of eight — compare down the `vs ignore` column, not across the rows.
 
 ---
 
@@ -316,7 +526,7 @@ duckdb -c "INSTALL iceberg; LOAD iceberg;
            SELECT count(*), round(sum(amount),2) FROM iceberg_scan('./out/events_ice');"
 ```
 
-The correctness suite that backs this — 68 tests (66 `#[test]` + 2 doctests), `cargo clippy
+The correctness suite that backs this — 91 tests (88 `#[test]` + 3 doctests), `cargo clippy
 --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean — runs with `cargo test
 --workspace`.
 

@@ -104,6 +104,18 @@
                       </select>
                     </label>
                   </div>
+                  <div class="row">
+                    <label class="field">
+                      <span class="lh">On schema drift <span class="note">what to do about fields the spec does not cover</span></span>
+                      <select class="ctrl" id="out-drift">
+                        <option value="warn">warn — report what the schema drops</option>
+                        <option value="rescue">rescue — keep it in a json catch-all column</option>
+                        <option value="quarantine">quarantine — reject the drifted rows</option>
+                        <option value="error">error — fail the run</option>
+                        <option value="ignore">ignore — do not look</option>
+                      </select>
+                    </label>
+                  </div>
                   <div id="iceberg-opts" class="stack hidden" style="gap:13px">
                     <label class="field">
                       <span class="lh">Partition by <span class="note">Iceberg only · e.g. day(event_at), bucket(16, id)</span></span>

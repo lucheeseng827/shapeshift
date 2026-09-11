@@ -20,6 +20,11 @@ pub enum ShapeError {
     #[error("record error: {0}")]
     Record(String),
 
+    /// The source drifted away from the spec's schema and `drift.policy` is `error`
+    /// (the offending record, path, and what was seen).
+    #[error("schema drift: {0}")]
+    Drift(String),
+
     /// An Arrow builder / RecordBatch assembly failure.
     #[error("arrow error: {0}")]
     Arrow(String),

@@ -9,8 +9,8 @@
 #
 # This crate is Apache-2.0 OSS: it only ever makes the engine a better *shaper*
 # (a UI over the existing CLI verbs). It has no scheduler, run queue, catalog
-# server, metering, connectors, or multi-tenant auth — those stay in the commercial-edition
-# control plane by design (see ../ARCHITECTURE.md §14).
+# server, metering, connectors, or multi-tenant auth — those are an orchestrator's
+# job by design (see ../ARCHITECTURE.md §14).
 [package]
 name = "shapeshift-serve"
 description = "shapeshift serve — a local web console (a single hand-rolled HTTP server, no async runtime) over the OSS shaper: infer a spec, shape JSON into Parquet/Iceberg, inspect the output, and price a run against MAR."

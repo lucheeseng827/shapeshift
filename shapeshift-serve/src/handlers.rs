@@ -5,8 +5,8 @@
 //! The server is single-user and stateless beyond the files it writes: shaped
 //! output and reject sidecars land under the configured data directory, and
 //! `inspect` reads them (or any local table) back. There is no run queue, no
-//! persistence of specs, and no metering — that orchestration lives in the commercial-edition
-//! control plane, never in the OSS core.
+//! persistence of specs, and no metering — that is orchestration, and out of scope
+//! here.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use shapeshift_core::{
-    estimate_mar, infer_columns, Compression, DatasetSpec, MarInputs, OutputFormat, OutputSpec,
-    PushOutcome, SchemaMode, Shaper, SourceFormat, SourceSpec,
+    estimate_mar, infer_columns, Compression, DatasetSpec, DriftPolicy, DriftReport, MarInputs,
+    OutputFormat, OutputSpec, PushOutcome, SchemaMode, Shaper, SourceFormat, SourceSpec,
 };
 use shapeshift_iceberg::IcebergSink;
 use shapeshift_json::{open_reader, JsonError};
@@ -138,6 +138,7 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
         },
         schema: SchemaMode::Infer,
         columns,
+        drift: Default::default(),
         options: Default::default(),
     };
     let spec_yaml = spec.to_yaml().map_err(|e| anyhow!("{e}"))?;
@@ -181,6 +182,10 @@ struct ShapeReq {
     partition_by: Vec<String>,
     #[serde(default)]
     append: bool,
+    /// What to do about schema drift. Overrides the spec's `drift.policy`; absent
+    /// means "whatever the spec says" (which defaults to `warn`).
+    #[serde(default)]
+    on_drift: Option<DriftPolicy>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +194,90 @@ struct RejectRow {
     line: Option<u64>,
     error: String,
     raw: Value,
+}
+
+/// One drifted path, flattened for the console.
+#[derive(Serialize)]
+struct DriftRow {
+    path: String,
+    count: u64,
+    first_record: u64,
+    suggested_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    example: Option<Value>,
+}
+
+/// The run's drift story, trimmed to [`DRIFT_ROW_CAP`] rows per kind: the console shows
+/// a summary and the engine's report carries the rest. Note that "the rest" is itself
+/// bounded — the engine tracks at most `MAX_TRACKED_PATHS` distinct paths — so when
+/// `truncated` is set neither this response nor the engine's report is a complete
+/// inventory of what drifted.
+#[derive(Serialize)]
+struct DriftResp {
+    policy: String,
+    rows_scanned: u64,
+    rows_with_drift: u64,
+    rows_quarantined: u64,
+    rows_rescued: u64,
+    /// The engine hit its per-run path cap: the `_total` counts below are how many
+    /// distinct paths were *tracked*, not how many drifted.
+    truncated: bool,
+    new_fields_total: usize,
+    type_mismatches_total: usize,
+    new_fields: Vec<DriftRow>,
+    type_mismatches: Vec<DriftRow>,
+    /// The columns to add to the spec to stop losing the new fields, as YAML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_columns_yaml: Option<String>,
+}
+
+/// Drifted paths the console shows per kind before deferring to the report.
+const DRIFT_ROW_CAP: usize = 25;
+
+fn drift_resp(r: &DriftReport) -> DriftResp {
+    let new_fields = r
+        .new_fields
+        .iter()
+        .take(DRIFT_ROW_CAP)
+        .map(|(path, f)| DriftRow {
+            path: path.clone(),
+            count: f.count,
+            first_record: f.first_record,
+            suggested_type: f.suggested_type.to_string(),
+            declared_type: None,
+            example: f.examples.first().cloned(),
+        })
+        .collect();
+    let type_mismatches = r
+        .type_mismatches
+        .iter()
+        .take(DRIFT_ROW_CAP)
+        .map(|(col, m)| DriftRow {
+            path: col.clone(),
+            count: m.count,
+            first_record: m.first_record,
+            suggested_type: m.suggested_type.to_string(),
+            declared_type: Some(m.declared_type.to_string()),
+            example: m.examples.first().cloned(),
+        })
+        .collect();
+    DriftResp {
+        policy: r.policy.to_string(),
+        rows_scanned: r.rows_scanned,
+        rows_with_drift: r.rows_with_drift,
+        rows_quarantined: r.rows_quarantined,
+        rows_rescued: r.rows_rescued,
+        truncated: r.truncated,
+        new_fields_total: r.new_fields.len(),
+        type_mismatches_total: r.type_mismatches.len(),
+        new_fields,
+        type_mismatches,
+        suggested_columns_yaml: (!r.new_fields.is_empty())
+            .then(|| serde_yaml::to_string(&r.suggested_columns()).ok())
+            .flatten(),
+    }
 }
 
 #[derive(Serialize)]
@@ -207,6 +296,10 @@ struct ShapeResp {
     rejects_total: u64,
     rejects_path: Option<String>,
     rejects_sample: Vec<RejectRow>,
+    /// What the source did that the schema does not cover — absent under
+    /// `drift.policy: ignore`, or when the run matched its schema exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drift: Option<DriftResp>,
 }
 
 pub fn shape(ctx: &Ctx, req: &Request) -> Response {
@@ -245,6 +338,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
             },
             schema: SchemaMode::Infer,
             columns: Vec::new(),
+            drift: Default::default(),
             options: Default::default(),
         },
     };
@@ -261,6 +355,9 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
             .iter()
             .flat_map(|s| split_partition_entries(s))
             .collect();
+    }
+    if let Some(p) = r.on_drift {
+        spec.drift.policy = p;
     }
 
     // 3. Compute a managed output path under the data dir (never a caller-chosen path).
@@ -308,7 +405,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
             .with_context(|| format!("clearing {}", output_path.display()))?;
     }
 
-    // 7. Create the sink (local filesystem only — object-store URLs are a CLI/`ee` concern).
+    // 7. Create the sink (local filesystem only — object-store URLs are CLI-only).
     let mut sink: Box<dyn shapeshift_core::Sink> = if is_iceberg {
         Box::new(
             IcebergSink::create(
@@ -392,6 +489,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         w.flush()?;
     }
     let summary = sink.finish().map_err(|e| anyhow!("{e}"))?;
+    let drift = shaper.into_drift_report();
 
     if temp_input {
         let _ = std::fs::remove_file(&input_path);
@@ -422,6 +520,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         rejects_total,
         rejects_path: (rejects_total > 0).then(|| reject_path.to_string_lossy().into_owned()),
         rejects_sample,
+        drift: drift.as_ref().filter(|r| !r.is_clean()).map(drift_resp),
     })
 }
 

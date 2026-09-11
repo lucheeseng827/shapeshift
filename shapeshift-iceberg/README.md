@@ -148,9 +148,9 @@ Paths are **location-anchored** (absolute): a table reads
 back at the location it was written to. It is also **relocatable for reading** — copy or move
 the whole table directory anywhere and DuckDB reads it with
 `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and
-multi-snapshot tables; predicate pruning still works). What stays commercial-edition: **catalog-managed
+multi-snapshot tables; predicate pruning still works). What is out of scope: **catalog-managed
 relocation** — re-anchoring the embedded paths so *any* engine reads the moved table with no
-special flag, plus multi-writer atomic commits (the roadmap REST catalog).
+special flag, plus multi-writer atomic commits (a REST catalog's job).
 
 ## Relocating a table (copy-anywhere)
 
@@ -172,5 +172,4 @@ SELECT * FROM iceberg_scan('/mnt/archive/events_tbl', allow_moved_paths = true);
 ```
 
 For a table that *any* engine reads after a move with no reader flag — paths re-anchored on
-commit, plus multi-writer atomic commits — you want a catalog: the hosted **REST catalog** is
-the commercial-edition story.
+commit, plus multi-writer atomic commits — you want an external Iceberg **REST catalog**.

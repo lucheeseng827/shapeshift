@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System context — the engine never sees Parquet</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f4f2ee;   /* bone */
+      --color-ink:     #1c1f26;   /* graphite */
+      --color-muted:   #4a5361;   /* slate */
+      --color-accent:  #a13d24;   /* oxide */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · shapeshift</p>
+    <h1>System context — the engine never sees Parquet</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="shapeshift-title shapeshift-desc">
+      <title id="shapeshift-title">System context — the engine never sees Parquet</title>
+      <desc id="shapeshift-desc">Architecture diagram showing shapeshift streaming JSON through a simd-json reader into an I/O-free core that shapes records into Arrow RecordBatches, then driving a Sink trait defined in that core — implemented by Parquet and Iceberg crates locally and an optional object-store sidecar for cloud buckets — with rows that do not fit the spec written to a rejects file.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4a5361"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a13d24"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f4f2ee"/>
+
+      <!-- ============ Connectors ============ -->
+
+      <line x1="184" y1="260" x2="232" y2="260" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <line x1="416" y1="260" x2="464" y2="260" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <path d="M 324,320 V 384 Q 324,392 316,392 H 144 Q 136,392 136,400"
+            fill="none" stroke="#4a5361" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <line x1="680" y1="260" x2="728" y2="260" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <line x1="904" y1="260" x2="952" y2="260" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1020" y1="344" x2="1020" y2="400" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <path d="M 816,344 V 376 Q 816,384 808,384 H 404 Q 396,384 396,392 V 400"
+            fill="none" stroke="#4a5361" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <line x1="512" y1="472" x2="560" y2="472" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ============ Arrow labels ============ -->
+
+      <rect x="186" y="240" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="208" y="249" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READ</text>
+
+      <rect x="418" y="240" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="440" y="249" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VALUE</text>
+
+      <rect x="200" y="372" width="64" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="232" y="381" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REJECTS</text>
+
+      <rect x="682" y="240" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="704" y="249" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BATCH</text>
+
+      <rect x="906" y="240" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="928" y="249" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">impl</text>
+
+      <rect x="1030" y="364" width="52" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="1056" y="373" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WRITE</text>
+
+      <rect x="560" y="364" width="80" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="600" y="373" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SAME TRAIT</text>
+
+      <rect x="516" y="452" width="40" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="536" y="461" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PUT</text>
+
+      <!-- ============ Nodes ============ -->
+
+      <!-- source (input) -->
+      <rect x="40" y="200" width="144" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="200" width="144" height="120" rx="6" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <rect x="48" y="206" width="24" height="12" rx="2" fill="transparent" stroke="rgba(121,129,143,0.40)" stroke-width="0.8"/>
+      <text x="60" y="215" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IN</text>
+      <text x="112" y="252" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">JSONL</text>
+      <text x="112" y="276" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">or JSON array</text>
+      <text x="112" y="292" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">possibly ragged</text>
+
+      <!-- shapeshift-json -->
+      <rect x="232" y="200" width="184" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="232" y="200" width="184" height="120" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="240" y="206" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="256" y="215" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">READ</text>
+      <text x="324" y="248" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">shapeshift-json</text>
+      <text x="324" y="272" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">simd-json streaming</text>
+      <text x="324" y="288" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">JsonlReader</text>
+      <text x="324" y="304" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">JsonArrayReader</text>
+
+      <!-- shapeshift-core (FOCAL 1) -->
+      <rect x="464" y="176" width="216" height="168" rx="6" fill="#f4f2ee"/>
+      <rect x="464" y="176" width="216" height="168" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="472" y="182" width="44" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="494" y="191" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ENGINE</text>
+      <text x="572" y="240" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">shapeshift-core</text>
+      <text x="572" y="268" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no I/O dependencies</text>
+      <text x="572" y="284" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">infer · Spec · Transform</text>
+      <text x="572" y="300" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Shaper: JSON Value →</text>
+      <text x="572" y="316" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Arrow RecordBatch</text>
+
+      <!-- Sink trait (FOCAL 2) -->
+      <rect x="728" y="176" width="176" height="168" rx="6" fill="#f4f2ee"/>
+      <rect x="728" y="176" width="176" height="168" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="736" y="182" width="32" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="752" y="191" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SEAM</text>
+      <text x="816" y="240" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Sink trait</text>
+      <text x="816" y="268" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">defined in core</text>
+      <text x="816" y="284" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">driven, never</text>
+      <text x="816" y="300" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">depended on</text>
+
+      <!-- Sink impls -->
+      <rect x="952" y="176" width="288" height="168" rx="6" fill="#f4f2ee"/>
+      <rect x="952" y="176" width="288" height="168" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="960" y="182" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="976" y="191" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IMPL</text>
+      <text x="1096" y="240" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Sink impls</text>
+      <text x="1096" y="268" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">shapeshift-parquet · ParquetSink</text>
+      <text x="1096" y="284" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">shapeshift-iceberg · IcebergSink v2</text>
+      <text x="1096" y="308" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">a new format is one more crate</text>
+
+      <!-- rejects (external) -->
+      <rect x="40" y="400" width="192" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="400" width="192" height="144" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="48" y="406" width="28" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="62" y="415" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REJ</text>
+      <text x="136" y="452" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">output.rejects</text>
+      <text x="136" y="480" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">.jsonl</text>
+      <text x="136" y="496" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">rows that would not</text>
+      <text x="136" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">fit the spec</text>
+
+      <!-- shapeshift-objstore (optional) -->
+      <rect x="272" y="400" width="240" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="272" y="400" width="240" height="144" rx="6" fill="rgba(28,31,38,0.02)" stroke="rgba(28,31,38,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="280" y="406" width="28" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="294" y="415" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OPT</text>
+      <text x="392" y="444" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">shapeshift-objstore</text>
+      <text x="392" y="472" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ObjectStoreParquetSink</text>
+      <text x="392" y="488" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ObjectStoreIcebergSink</text>
+      <text x="392" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">reuses the same builders</text>
+
+      <!-- Cloud outputs (external) -->
+      <rect x="560" y="400" width="200" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="560" y="400" width="200" height="144" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="568" y="406" width="40" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="588" y="415" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLOUD</text>
+      <text x="660" y="452" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">S3 / GCS / Azure</text>
+      <text x="660" y="480" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">bucket/*.parquet</text>
+      <text x="660" y="496" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">bucket/table/</text>
+      <text x="660" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">(Iceberg v2)</text>
+
+      <!-- Local outputs (external) -->
+      <rect x="800" y="400" width="440" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="800" y="400" width="440" height="144" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="808" y="406" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="824" y="415" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">FILE</text>
+      <text x="1020" y="444" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Local outputs</text>
+      <text x="1020" y="472" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Parquet file · Iceberg v2 table dir with data/*.parquet (field-ids)</text>
+      <text x="1020" y="488" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Avro manifest + manifest-list · v2 metadata.json + version-hint</text>
+      <text x="1020" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">verified identical against DuckDB</text>
+
+      <!-- ============ Legend ============ -->
+
+      <line x1="40" y1="604" x2="1240" y2="604" stroke="rgba(28,31,38,0.12)" stroke-width="0.8"/>
+      <text x="40" y="620" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="40" y="640" width="14" height="10" rx="2" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <text x="60" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Focal · the engine and the sink seam</text>
+
+      <rect x="400" y="640" width="14" height="10" rx="2" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <text x="420" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Crate in the binary</text>
+
+      <rect x="600" y="640" width="14" height="10" rx="2" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <text x="620" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Input</text>
+
+      <rect x="730" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <text x="750" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Output</text>
+
+      <rect x="860" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.02)" stroke="rgba(28,31,38,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="880" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Optional sidecar crate</text>
+
+      <line x1="1090" y1="645" x2="1118" y2="645" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <text x="1126" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Hot path</text>
+    </svg>
+  </div>
+</body>
+</html>

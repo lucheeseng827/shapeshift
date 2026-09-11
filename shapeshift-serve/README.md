@@ -5,11 +5,10 @@ HTTP server that puts a browser UI in front of the same four verbs the CLI expos
 **infer** a spec from sample JSON, **shape** JSON/JSONL into Parquet or an Apache
 Iceberg v2 table, **inspect** the output, and **cost** a run against MAR billing.
 
-It is the deliberately-lean OSS counterpart to the full commercial-edition operator console: a
+It is deliberately lean: a
 *shaper* console, not a control plane. Single-user, stateless beyond the files it
 writes, with **no scheduler, run queue, catalog server, connectors, metering, or
-auth**. Those orchestration concerns live in the separately-licensed control plane,
-never in the Apache-2.0 core.
+auth**. Those are orchestration concerns, and out of scope here.
 
 ## Single static binary, no runtime
 
@@ -113,7 +112,7 @@ Same-origin JSON, wrapping the OSS engine one-to-one:
 |---|---|
 | `GET /api/health` | liveness + version + data dir |
 | `POST /api/infer` | sample records → an editable `DatasetSpec` (YAML) |
-| `POST /api/shape` | records + spec → run report, output path, reject sample |
+| `POST /api/shape` | records + spec → run report, output path, reject sample, drift report (`on_drift` picks the policy) |
 | `POST /api/inspect` | a path → Parquet / Iceberg schema + row count |
 | `POST /api/cost` | rows + prices → the MAR vendor-vs-self-host comparison |
 

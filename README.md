@@ -1,3 +1,5 @@
+<img src="docs/images/shapeshift-logo.svg" alt="" width="72">
+
 # shapeshift
 
 **shapeshift** streams JSON/JSONL into **Parquet** or an **Apache Iceberg v2** table under a small
@@ -82,6 +84,15 @@ raw text was **sidecarred** to `events.parquet.rejects.jsonl`, one JSON object p
 
 ```json
 {"error":"ExpectedNull at character 0 ('n')","line":4,"raw":"not-json-a-bad-line"}
+```
+
+It composes in a pipeline too — `-` is standard input, and the source is read once, so a
+pipe shapes exactly what a file would:
+
+```sh
+$ cat examples/events.jsonl | shapeshift shape -i - -o events.parquet
+shaped `stdin` → events.parquet (Parquet)
+rows_in=4 rows_out=4 rejected=0 parse_errors=1 row_groups=1 bytes=2588
 ```
 
 ```sh
@@ -189,6 +200,65 @@ mixed scalar shapes to `string`, and detecting `YYYY-MM-DD` → date and RFC3339
 column becomes null; the same in a **required** column is a soft **row reject** (the row is dropped
 and counted, the run continues). *Strict*: a required miss or *any* coercion failure aborts the run.
 
+## Schema drift
+
+You write a spec once per source *shape*. Sources move anyway — a producer adds `currency`, or
+starts sending `"12.50"` where it used to send `12.50`. Both used to pass **silently**: an
+undeclared field has no column so its values are never selected, and an uncoercible value in an
+optional column is written as null. Neither shows up in `rows_in` / `rows_out` / `rejected`, so a
+drifted run looks exactly like a clean one.
+
+shapeshift now watches for both and tells you, by default:
+
+```sh
+$ shapeshift shape --spec events.yaml -i events.jsonl -o out.parquet
+shaped `events` → out.parquet (Parquet)
+rows_in=4 rows_out=4 rejected=0 parse_errors=0 row_groups=1 bytes=1145
+schema drift (policy: warn): 2 undeclared field(s), 1 column(s) no longer coercing in 2 of 4 rows
+  new field `currency` — 2 row(s), first at record 3, suggest type string, e.g. "usd"
+  new field `meta.source` — 1 row(s), first at record 3, suggest type string, e.g. "web"
+  column `amount` (float64) — 1 value(s) written as null, first at record 3, now looks like string, e.g. "n/a"
+  every row was written as-is; nothing was dropped for drift
+  to keep the new fields, add to the spec's `columns:`
+    - name: currency
+      type: string
+      required: false
+    - name: meta.source
+      type: string
+      required: false
+full drift report → out.parquet.drift.json
+```
+
+The suggested type is inference's own verdict on the values actually seen, so the block is
+paste-ready. The full report (`<output>.drift.json`) carries every path, count, first record, and
+example values.
+
+**Pick what a drift *does*** — in the spec, or with `--on-drift` on the command line:
+
+```yaml
+drift:
+  policy: warn          # ignore | warn | rescue | quarantine | error
+  rescue_column: _rescued
+  max_examples: 3
+```
+
+| policy | what the run writes | when you want it |
+|---|---|---|
+| `ignore` | exactly v0.1 behaviour, no detection | you measured that you need the last few percent |
+| `warn` *(default)* | every row, unchanged — plus the report | you want to know, and to keep loading |
+| `rescue` | every row, plus a `json` catch-all column holding what the schema would have dropped | you cannot lose data while the spec catches up |
+| `quarantine` | only exactly-on-schema rows; drifted rows are rejected into `<output>.rejects.jsonl` | downstream must never see a partial row |
+| `error` | nothing — the run fails at the first drift | a contract table: no new data beats quietly-different data |
+
+`rescue` appends its column *after* every declared one, so switching it on is an additive Iceberg
+schema change (`--append` accepts it as a new optional column). A run that fails under `error` never
+finalizes its sink, so there is no half-written table to consume — the Parquet file has no footer
+(no reader will open it) and the Iceberg table keeps its previous `metadata.json`, whatever was
+flushed before the drift. The written-but-unreferenced bytes stay on disk as leftovers to delete.
+
+Detection costs about **6% of wall time** on a clean 1M-row run and leaves peak RSS unchanged
+([BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)) — `--on-drift ignore` buys it back.
+
 ## Prove the MAR savings
 
 `shapeshift cost` turns a row count into the vendor-vs-self-host comparison. It **never guesses a
@@ -238,8 +308,7 @@ byte-for-byte unchanged).
 It is a *shaper* console, not a control plane: single-user, and it binds to
 `127.0.0.1` with **no authentication of its own** — keep it on loopback, or front it
 with your own auth/proxy. Scheduling, run history, connectors, and metering are
-deliberately not here — that is the hosted / commercial control plane's job, never
-the OSS core's. See [`shapeshift-serve`](./shapeshift-serve/README.md).
+deliberately not here — that is an orchestrator's job, not the engine's. See [`shapeshift-serve`](./shapeshift-serve/README.md).
 
 ## Embed it
 
@@ -277,7 +346,7 @@ fn main() -> shapeshift_core::Result<()> {
 | Crate | What it is |
 |---|---|
 | `shapeshift-core` | The engine, **no I/O backend deps**: the dataset transform Spec model, JSON schema inference, the named `Transform` library, the `Shaper` (JSON value → Arrow `RecordBatch`), the `Sink` trait, and the MAR cost arithmetic. |
-| `shapeshift-json` | Streaming JSON source on the **simd-json** SIMD lexer (via its serde bridge → `serde_json::Value`): `JsonlReader` (one object per line, bounded RAM, skips blanks, preserves the raw bad line on a parse error) and `JsonArrayReader` (**streamed** — a depth/string-aware scanner yields one element at a time, bounded RAM, same reject semantics). |
+| `shapeshift-json` | Streaming JSON source on the **simd-json** SIMD lexer. `TapeJsonlReader` and `TapeJsonArrayReader` parse each record onto a **reusable tape** — a flat node buffer whose strings point back into the read buffer — so a record costs no allocation, whichever framing produced it; both reach the shape loop through one `TapeSource`. `JsonlReader` and `JsonArrayReader` (**streamed** — a depth/string-aware scanner yields one element at a time) supply the `serde_json::Value` model for anything that must *keep* a record, such as schema inference over the sample. All bounded-RAM, all preserving the raw bad record on a parse error. |
 | `shapeshift-parquet` | `ParquetSink` (Arrow → Parquet, one row group flushed per batch; Snappy default) + `inspect()` read-back. |
 | `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), per-column statistics, and identity partitioning (`--partition-by`) + `inspect()`. Exposes a backend-agnostic table builder the object-store sink reuses. |
 | `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table in S3 / GCS / Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. Opt-in behind the CLI's `object_store` feature, so the default musl-static binary links no cloud SDKs. |
@@ -290,6 +359,15 @@ Solid arrows are the hot path inside the single `shapeshift` binary; dashed arro
 sidecar and the external readers that verify the output. The **`Sink` trait lives in `core`** and is
 *driven*, never depended on — so the engine never sees Parquet or Iceberg, and a new output format is
 one more crate behind the same trait.
+
+[![shapeshift system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below. The drawing merges the Parquet and Iceberg
+sink crates into one implementations node behind the trait, merges the Parquet file and
+Iceberg table directory into one local-outputs node, and folds the DuckDB cross-check
+into that node as the claim it verifies. Source:
+[`docs/images/architecture-system-context.html`](docs/images/architecture-system-context.html).
+The same topology as Mermaid, for diffing and for editing the drawing from:</sub>
 
 ```mermaid
 flowchart LR
@@ -326,8 +404,8 @@ Dashed nodes outside the binary box are optional/verification-only. The
 **object-store** path (`shapeshift-objstore`) is compiled in only with
 `--features object_store`; the default musl-static binary links no cloud SDKs and
 writes to the local filesystem. It lands **both** a Parquet file and a whole Iceberg
-v2 table in a bucket; only the hosted **REST catalog** (copy-anywhere relocation) is
-still a commercial-edition feature.
+v2 table in a bucket; a **REST catalog** (copy-anywhere relocation) is out of scope —
+use an external one.
 
 The crate split *is* the dependency story: `shapeshift-core` is the leaf (the Spec model, inference,
 the transform library, the `Shaper`, and the `Sink` trait) and `shapeshift-json` / `-parquet` /
@@ -414,10 +492,10 @@ attributes Iceberg readers need are preserved. See [ARCHITECTURE.md](./ARCHITECT
 
 ## What shapeshift is NOT
 
-- **Not an orchestrator or scheduler.** There is no DAG, no cron, no dependency graph — that is the
-  lab's **dagron**. shapeshift runs one shape and exits.
+- **Not an orchestrator or scheduler.** There is no DAG, no cron, no dependency graph — that is an
+  orchestrator's job (such as **dagron**). shapeshift runs one shape and exits.
 - **Not a connector catalog.** It does not reach into SaaS APIs or databases; it shapes JSON/JSONL you
-  already have. Connectors and incremental/CDC capture are hosted / commercial concerns, not OSS core.
+  already have. Connectors and incremental/CDC capture are out of scope.
 - **Not a query engine.** It *writes* Parquet and Iceberg for DuckDB, Spark, Trino, and friends to
   read; it does not run SQL over them.
 
@@ -428,7 +506,7 @@ it does that one job completely.
 
 > **v0.1.** The full loop — infer → shape → Parquet **and** Iceberg v2 — runs end-to-end and both
 > outputs are DuckDB-verified (`read_parquet` and `iceberg_scan`, identical rows and aggregates). It is
-> ~7,900 Rust LOC across 6 crates with **68 tests passing** (66 `#[test]` + 2 doctests); `cargo clippy
+> ~9,600 Rust LOC across the 6 core crates (plus the opt-in `serve` console) with **91 tests passing** (88 `#[test]` + 3 doctests); `cargo clippy
 > --workspace --all-targets -- -D warnings` and `cargo fmt --check` are both clean.
 
 ### Done
@@ -442,12 +520,23 @@ it does that one job completely.
 - [x] `shapeshift cost` — honest MAR comparison you price yourself (negative when it doesn't amortize).
 - [x] `shapeshift inspect` — auto-detects a Parquet file or an Iceberg table dir.
 - [x] Parse-error **reject sidecar** (`<output>.rejects.jsonl`); the run never aborts on a bad line.
+- [x] **Schema drift detection & mitigation** — undeclared fields and silently-nulled coercions are
+      counted, reported (`<output>.drift.json`, with the column declarations that would keep them),
+      and handled by policy: `warn` (default), `rescue`, `quarantine`, `error`, or `ignore`.
 - [x] Hand-rolled, **field-id-carrying** Avro OCF encoder (no Avro crate; readable manifests).
 - [x] Embeddable: `shapeshift-core` (no I/O deps) driving sinks through the `Sink` trait.
+- [x] **Zero-allocation record parsing**: JSONL *and* `json-array` land on a reusable simd-json *tape* — a flat
+      node buffer whose strings point back into the read buffer — instead of building a
+      `serde_json::Value` tree per row. `shapeshift-core` reads records through a `Record`
+      trait, so the `serde_json::Value` model an embedder uses is unchanged and both run the
+      same coercion code.
+- [x] **Overlapped writer** (`--pipeline`, on by default): a finished row group is encoded and
+      compressed on a writer thread while the next one is shaped. Output is byte-identical
+      with it on or off.
 - [x] **Measured benchmarks** via a reproducible harness ([`benchmarks/`](./benchmarks/)):
-      on the shipped musl-static binary, peak RSS is **flat (9.8 → 13.3 MiB) across a
-      1.5 MB → 1.26 GB (~820×) input spread** — the bounded-RAM claim, verified — at ~140k
-      rows/s on both output paths, 3 ms cold start.
+      on the shipped musl-static binary, peak RSS is **flat (9.9 → 14.1 MiB) across a
+      1.5 MB → 1.26 GB (~820×) input spread** — the bounded-RAM claim, verified — at ~270k
+      rows/s on both output paths, 4 ms cold start.
       See [BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured).
 
 ### v0.1 limits
@@ -462,7 +551,7 @@ it does that one job completely.
   back where it was written — yet **relocatable for reading**: copy or move the whole directory and
   DuckDB reads it with `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned
   and multi-snapshot tables). **Catalog-managed** relocation — re-anchoring paths so *any* engine
-  reads a moved table with no flag, plus multi-writer commits — stays the commercial-edition REST catalog.
+  reads a moved table with no flag, plus multi-writer commits — is left to an external Iceberg REST catalog.
 - **zstd is off by default** (musl-static): `--compression zstd` returns a clear error in the lean
   binary — use `snappy` or `uncompressed`, or build the opt-in fat binary
   (`cargo build -p shapeshift-cli --features zstd`) which links the codec for both Parquet and
@@ -473,21 +562,19 @@ it does that one job completely.
 - **Object-store output (S3/GCS/Azure):** **both Parquet and a whole Iceberg v2 table** can write
   straight to a bucket via a URL `--output` (`s3://` / `gs://` / `az://` / `file://`) when built
   `--features object_store` (kept off the default musl-static binary so it never links the cloud
-  SDKs). `inspect <url>` reads an object-store Iceberg table back. Only the hosted **REST catalog**
-  (copy-anywhere relocation, multi-writer) remains — that's a commercial-edition feature.
+  SDKs). `inspect <url>` reads an object-store Iceberg table back. A **REST catalog**
+  (copy-anywhere relocation, multi-writer) is out of scope — use an external one.
 - Integer timestamps read as epoch-milliseconds, integer dates as epoch-days; `timestamp` is zone-less
   (Iceberg `timestamp`, not `timestamptz`).
-- No incremental/CDC, no scheduling, no connectors in the OSS core — those are hosted / commercial
-  features. shapeshift is **open-core**: this Apache-2.0 engine is fully self-hostable with no row cap
-  and no telemetry; a freemium hosted **shapeshift Cloud** and a self-hosted commercial license (the
-  commercial control plane) sit on top.
+- No incremental/CDC, no scheduling, no connectors — those belong to an orchestrator. The engine is
+  Apache-2.0 and fully self-hostable, with no row cap and no telemetry.
 
 ---
 
 Deeper docs: **[ARCHITECTURE.md](./ARCHITECTURE.md)** (crate boundaries, the shape pipeline, why
 hand-rolled Avro) · **[docs/SPEC.md](./docs/SPEC.md)** (the full dataset transform spec reference) ·
 **[docs/DESIGN.md](./docs/DESIGN.md)** (coercion, inference, and Iceberg-writer internals) ·
-**[ROADMAP.md](./ROADMAP.md)** (what shipped per phase; what's left is the hosted commercial plane).
+**[ROADMAP.md](./ROADMAP.md)** (what shipped per phase, and what is deliberately out of scope).
 
 Copyright 2026 Nicholas Lu Chee Seng and the shapeshift contributors. Apache-2.0.
 [github.com/lucheeseng827/shapeshift](https://github.com/lucheeseng827/shapeshift)

@@ -11,12 +11,17 @@ use crate::error::JsonError;
 /// A JSON record plus its 1-based source line (the 1-based **element index** in
 /// array mode). Kept small so the CLI can attribute a shaping reject back to its
 /// input line.
-pub type RecordSource = Box<dyn Iterator<Item = Result<Value, JsonError>>>;
+///
+/// The `Send` bound lets a driver move the whole source onto a reader thread and
+/// overlap parsing with shaping (see the CLI's threaded shape loop). Every reader here
+/// is `Send`; stdin is taken as [`std::io::Stdin`] rather than its lock for that reason
+/// — `StdinLock` holds a `MutexGuard` and cannot cross threads.
+pub type RecordSource = Box<dyn Iterator<Item = Result<Value, JsonError>> + Send>;
 
 /// simd-json reads the input buffer in SIMD-width chunks; give the owned line
 /// buffer this many bytes of slack past its length so those reads never touch
 /// memory outside the allocation.
-const SIMD_SLACK: usize = 64;
+pub(crate) const SIMD_SLACK: usize = 64;
 
 /// Default per-record ceiling: a single JSONL line larger than this is rejected
 /// (not buffered whole), so a pathological huge/unterminated line can't OOM the
@@ -29,6 +34,10 @@ pub const DEFAULT_MAX_LINE: usize = 256 * 1024 * 1024;
 pub struct JsonlReader<R> {
     inner: R,
     buf: Vec<u8>,
+    /// Reused destructive-parse buffer. simd-json rewrites the bytes it parses, so it
+    /// works on a copy here and `buf` keeps the pristine line for error reporting —
+    /// which is what lets a good row avoid materializing its raw text at all.
+    scratch: Vec<u8>,
     line: u64,
     done: bool,
     max_line: usize,
@@ -48,6 +57,7 @@ impl<R: BufRead> JsonlReader<R> {
         JsonlReader {
             inner,
             buf: Vec::with_capacity(256),
+            scratch: Vec::with_capacity(256),
             line: 0,
             done: false,
             max_line: DEFAULT_MAX_LINE,
@@ -106,19 +116,22 @@ impl<R: BufRead> JsonlReader<R> {
             }
         }
     }
-}
 
-impl JsonlReader<BufReader<File>> {
-    /// Open a JSONL file.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, JsonError> {
-        Ok(JsonlReader::new(BufReader::new(File::open(path)?)))
+    /// The current line as text, for an error record. Only called on a reject, so a
+    /// clean run never pays for it.
+    fn raw_line(&self) -> String {
+        String::from_utf8_lossy(self.buf.trim_ascii_end()).into_owned()
     }
-}
 
-impl<R: BufRead> Iterator for JsonlReader<R> {
-    type Item = Result<Value, JsonError>;
+    // ---- framing, shared with the tape reader ----------------------------------
+    //
+    // `TapeJsonlReader` parses onto a reusable tape instead of building a `Value`, but
+    // the framing above it — bounded lines, blank-line skipping, the oversize reject —
+    // is identical and must stay identical. Rather than keep a second copy of it, the
+    // tape reader drives these.
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Advance to the next non-blank line, leaving it in `buf`. `None` at EOF.
+    pub(crate) fn next_line_bytes(&mut self) -> Option<Result<(), JsonError>> {
         if self.done {
             return None;
         }
@@ -134,34 +147,70 @@ impl<R: BufRead> Iterator for JsonlReader<R> {
                 }
                 Ok(LineOutcome::Line { truncated }) => {
                     self.line += 1;
-                    let raw = String::from_utf8_lossy(self.buf.trim_ascii_end()).into_owned();
                     if truncated {
-                        // Recoverable: reject this record, keep reading the rest.
                         return Some(Err(JsonError::Parse {
                             line: self.line,
                             message: format!(
                                 "record exceeds the {}-byte limit; skipped",
                                 self.max_line
                             ),
-                            raw,
+                            raw: self.raw_line(),
                         }));
                     }
-                    // Blank / whitespace-only line → skip.
                     if self.buf.iter().all(|b| b.is_ascii_whitespace()) {
                         continue;
                     }
-                    // Give simd-json its read slack, then parse the owned buffer in place.
-                    self.buf.reserve(SIMD_SLACK);
-                    match simd_json::serde::from_slice::<Value>(&mut self.buf) {
-                        Ok(v) => return Some(Ok(v)),
-                        Err(e) => {
-                            return Some(Err(JsonError::Parse {
-                                line: self.line,
-                                message: e.to_string(),
-                                raw,
-                            }))
-                        }
-                    }
+                    return Some(Ok(()));
+                }
+            }
+        }
+    }
+
+    /// The bytes of the line [`Self::next_line_bytes`] just read.
+    pub(crate) fn current_line(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// The 1-based number of that line.
+    pub(crate) fn line_number(&self) -> u64 {
+        self.line
+    }
+
+    /// That line as text, for an error record.
+    pub(crate) fn raw_line_text(&self) -> String {
+        self.raw_line()
+    }
+}
+
+impl JsonlReader<BufReader<File>> {
+    /// Open a JSONL file.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, JsonError> {
+        Ok(JsonlReader::new(BufReader::new(File::open(path)?)))
+    }
+}
+
+impl<R: BufRead> Iterator for JsonlReader<R> {
+    type Item = Result<Value, JsonError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Framing is `next_line_bytes`' job, here and in the tape reader, so there is
+        // exactly one copy of it to keep correct. This adds only the parse.
+        match self.next_line_bytes()? {
+            Err(e) => Some(Err(e)),
+            Ok(()) => {
+                // simd-json parses **destructively**, so it gets a scratch copy and
+                // `buf` keeps the original bytes — that way the raw line is only
+                // materialized on the error path, not allocated for every good row.
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&self.buf);
+                self.scratch.reserve(SIMD_SLACK);
+                match simd_json::serde::from_slice::<Value>(&mut self.scratch) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) => Some(Err(JsonError::Parse {
+                        line: self.line,
+                        message: e.to_string(),
+                        raw: self.raw_line(),
+                    })),
                 }
             }
         }
@@ -184,7 +233,11 @@ impl<R: BufRead> Iterator for JsonlReader<R> {
 /// eagerly at construction.
 pub struct JsonArrayReader<R> {
     inner: R,
+    /// The element's bytes, kept intact so the raw text stays available for an
+    /// error without being materialized for every good element.
     buf: Vec<u8>,
+    /// A throwaway copy of `buf` for simd-json, which parses destructively.
+    scratch: Vec<u8>,
     /// 1-based index of the element currently being read (for error reporting).
     index: u64,
     /// Whether a `]` at depth 0 is legal at the next element position: true right
@@ -217,6 +270,7 @@ impl<R: BufRead> JsonArrayReader<R> {
                 Ok(JsonArrayReader {
                     inner,
                     buf: Vec::with_capacity(256),
+                    scratch: Vec::with_capacity(256),
                     index: 0,
                     allow_close: true,
                     closed: false,
@@ -242,6 +296,86 @@ impl<R: BufRead> JsonArrayReader<R> {
                 raw: String::new(),
             }),
         }
+    }
+
+    /// Advance to the next element, leaving its bytes in `buf`.
+    ///
+    /// `None` ends iteration (the array closed, and the trailing-content check has
+    /// run). `Some(Err(..))` is either a *structural* error — reported once, after
+    /// which iteration ends — or a per-element error such as an oversized record,
+    /// after which iteration continues at the next element. `Some(Ok(()))` means
+    /// `current_element` now holds one element's bytes.
+    pub(crate) fn next_element_bytes(&mut self) -> Option<Result<(), JsonError>> {
+        if self.done {
+            return None;
+        }
+        if self.closed {
+            // The `]` was consumed with the previous element; finish up now.
+            self.done = true;
+            return match self.check_trailing() {
+                Ok(()) => None,
+                Err(e) => Some(Err(e)),
+            };
+        }
+        self.index += 1;
+        let outcome = match self.read_element() {
+            Ok(o) => o,
+            Err(e) => {
+                // Structural: report once, then end.
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        match outcome {
+            ElemOutcome::Close => {
+                self.done = true;
+                match self.check_trailing() {
+                    Ok(()) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            ElemOutcome::Elem { truncated, last } => {
+                if last {
+                    // The element's `]` terminator also closed the array; the
+                    // trailing-content check runs on the next call, after this
+                    // element is yielded.
+                    self.closed = true;
+                }
+                if truncated {
+                    return Some(Err(JsonError::Parse {
+                        line: self.index,
+                        message: format!(
+                            "record exceeds the {}-byte limit; skipped",
+                            self.max_record
+                        ),
+                        raw: self.raw_element(),
+                    }));
+                }
+                Some(Ok(()))
+            }
+        }
+    }
+
+    /// The bytes of the element `next_element_bytes` just framed.
+    pub(crate) fn current_element(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// The 1-based index of the current element — the array's analogue of a line
+    /// number, and what error reports carry.
+    pub(crate) fn element_index(&self) -> u64 {
+        self.index
+    }
+
+    /// The current element's text, for an error report. Lossy, trimmed, and
+    /// allocated only when something has already gone wrong.
+    fn raw_element(&self) -> String {
+        String::from_utf8_lossy(self.buf.trim_ascii()).into_owned()
+    }
+
+    /// Same as [`Self::raw_element`], for the tape reader in the sibling module.
+    pub(crate) fn raw_element_text(&self) -> String {
+        self.raw_element()
     }
 
     /// Override the per-element byte ceiling (default [`DEFAULT_MAX_LINE`]).
@@ -385,59 +519,26 @@ impl<R: BufRead> Iterator for JsonArrayReader<R> {
     type Item = Result<Value, JsonError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        if self.closed {
-            // The `]` was consumed with the previous element; finish up now.
-            self.done = true;
-            return match self.check_trailing() {
-                Ok(()) => None,
-                Err(e) => Some(Err(e)),
-            };
-        }
-        self.index += 1;
-        let outcome = match self.read_element() {
-            Ok(o) => o,
-            Err(e) => {
-                // Structural: report once, then end.
-                self.done = true;
-                return Some(Err(e));
-            }
-        };
-        match outcome {
-            ElemOutcome::Close => {
-                self.done = true;
-                match self.check_trailing() {
-                    Ok(()) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            }
-            ElemOutcome::Elem { truncated, last } => {
-                if last {
-                    // The element's `]` terminator also closed the array; the
-                    // trailing-content check runs on the next call, after this
-                    // element is yielded.
-                    self.closed = true;
-                }
-                let raw = String::from_utf8_lossy(self.buf.trim_ascii()).into_owned();
-                if truncated {
-                    return Some(Err(JsonError::Parse {
-                        line: self.index,
-                        message: format!(
-                            "record exceeds the {}-byte limit; skipped",
-                            self.max_record
-                        ),
-                        raw,
-                    }));
-                }
-                self.buf.reserve(SIMD_SLACK);
-                match simd_json::serde::from_slice::<Value>(&mut self.buf) {
+        // Framing is `next_element_bytes`' job, here and in the tape reader, so the
+        // array's state machine has exactly one implementation. This adds only the
+        // parse — the same split the JSONL reader uses.
+        match self.next_element_bytes()? {
+            Err(e) => Some(Err(e)),
+            Ok(()) => {
+                // simd-json parses **destructively**, so it gets a scratch copy and
+                // `buf` keeps the original bytes — that way the raw element is only
+                // materialized on the error path, not allocated for every good one.
+                // (The JSONL reader has worked this way since the per-row allocation
+                // pass; the array reader was simply never brought across.)
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&self.buf);
+                self.scratch.reserve(SIMD_SLACK);
+                match simd_json::serde::from_slice::<Value>(&mut self.scratch) {
                     Ok(v) => Some(Ok(v)),
                     Err(e) => Some(Err(JsonError::Parse {
                         line: self.index,
                         message: e.to_string(),
-                        raw,
+                        raw: self.raw_element(),
                     })),
                 }
             }
@@ -452,13 +553,39 @@ pub fn open_reader(
     format: shapeshift_core::SourceFormat,
 ) -> Result<RecordSource, JsonError> {
     let path = path.as_ref();
-    match format {
-        shapeshift_core::SourceFormat::Jsonl => {
+    match (format, is_stdin(path)) {
+        (shapeshift_core::SourceFormat::Jsonl, true) => {
+            Ok(Box::new(JsonlReader::new(BufReader::new(std::io::stdin()))) as RecordSource)
+        }
+        (shapeshift_core::SourceFormat::Jsonl, false) => {
             Ok(Box::new(JsonlReader::open(path)?) as RecordSource)
         }
-        shapeshift_core::SourceFormat::JsonArray => {
+        (shapeshift_core::SourceFormat::JsonArray, true) => {
+            Ok(Box::new(JsonArrayReader::new(BufReader::new(std::io::stdin()))?) as RecordSource)
+        }
+        (shapeshift_core::SourceFormat::JsonArray, false) => {
             Ok(Box::new(JsonArrayReader::open(path)?) as RecordSource)
         }
+    }
+}
+
+/// `-` means standard input, the usual shell convention — so shapeshift composes in a
+/// pipeline (`producer | shapeshift shape -i - -o out.parquet`).
+pub fn is_stdin(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// Whether an input can be opened and read a second time. Standard input, a pipe, and a
+/// FIFO cannot: bytes consumed by one pass are gone for the next. A caller that would
+/// otherwise buffer a whole source to replay it uses this to refuse instead.
+pub fn is_rereadable(path: &Path) -> bool {
+    if is_stdin(path) {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file(),
+        // Non-existent / unreadable: let the real open report it properly.
+        Err(_) => true,
     }
 }
 

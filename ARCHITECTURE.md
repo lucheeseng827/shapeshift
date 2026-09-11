@@ -7,8 +7,8 @@ append, the field-id chain, and the hand-rolled Avro encoder) that are easy to g
 expensive to get wrong.
 
 Scope: this is the **OSS engine** (Apache-2.0) — fully self-hostable, no row cap, no telemetry.
-The managed control plane (shapeshift Cloud) and the self-hosted commercial license live behind
-the boundary described in the last section; nothing in this document depends on them.
+Scheduling, run history, and connectors sit outside it, behind the boundary described in the last
+section; nothing in this document depends on them.
 
 ---
 
@@ -360,6 +360,65 @@ Both are appended to `<output>.rejects.jsonl` as one JSON object per line —
 the counts. Strict mode (`schema: strict`) converts these into aborts. Logs go to stderr at the
 `-v`/`-vv` level; the summary and command output go to stdout.
 
+### Schema drift — the third loss channel
+
+Parse errors and rejects are *loud*: both are counted and both keep the row. There is a third way a
+run loses data, and until the `drift` block existed it was **silent**:
+
+- A **new field** the spec has no column for. `schema: infer` builds columns from the first
+  `infer_sample` records, so a field a producer adds at record 100,000 has no column; `schema:
+  strict` writes only declared columns by construction. Either way the values are simply never
+  selected — `rows_in == rows_out`, nothing counted, nothing sidecarred.
+- A **type mismatch** in an *optional* column under the lenient policy: `"12.50"` arriving in a
+  `float64` column is not coercible, so the cell is written as null. A required column would have
+  rejected the row and counted it; an optional one just… nulls.
+
+Both are now detected by `drift.policy` (anything but `ignore`) and reported: per path, the count,
+the record it first appeared in, example values, and the type inference would give it — i.e. the
+column declaration that would keep it. The CLI prints a summary and writes the full report to
+`<output>.drift.json`; the engine returns it as `RunReport.drift`.
+
+**How detection works.** The effective columns' source paths are compiled once into a small trie
+(sorted children, binary search — a schema has a handful of paths per level and this runs per
+record, so comparing a few short strings beats hashing one, and it adds no dependency). Each record
+is walked against it: a key whose trie node is *terminal* is consumed (including a `json` column
+over a whole subtree); a key with a deeper node is descended into; a key with **no** node at all is
+uncovered, and its leaves are reported the way `flatten` would have named the columns. A column that
+reaches *into* a value (`tags.0` into an array) counts as covering it — the trie has a node there,
+so only paths nothing reads at all are reported. The path string is built lazily, on a miss, so a
+run whose source has not drifted does one lookup per key and no string work.
+
+Deliberately **not** tracked: a declared column simply *absent* from a record. That loss is already
+visible as a null in the output, and counting it per row would spend throughput to report what the
+data already says.
+
+**What a policy does** — `ignore` (no detection at all, the v0.1 hot loop), `warn` (default: count
+and report; the rows written are byte-identical to `ignore`), `rescue` (a `json` catch-all column,
+appended *after* every real column so enabling it is an additive Iceberg schema change, holding
+whatever the row would have lost), `quarantine` (a drifted row is rejected — counted and sidecarred
+— so the table holds only exactly-on-schema rows), and `error` (fail the run at the first event).
+`error` fails *before* the row reaches the builders, and a run that aborts never calls `finish()` on
+its sink: a Parquet file without its footer is unreadable and an Iceberg table without its new
+`metadata.json` is unchanged, so a failed contract run cannot be half-consumed. This holds however
+many batches were already flushed — verified with `row_group_rows: 1`, where twenty clean rows reach
+the writer before the drifted one: the 3 KB Parquet file left behind is rejected outright
+(*"Invalid Parquet file. Corrupt footer"*), and an aborted `--append` leaves the table on its
+previous snapshot with the new data files referenced by no manifest. Those bytes *do* stay on disk —
+a footer-less file, or Iceberg orphan files — but they are leftovers to delete, not data any reader
+can see.
+
+**Bounded, like everything else.** At most `MAX_TRACKED_PATHS` (1,000) distinct paths are tracked
+per run, and at most `drift.max_examples` values per path; past that the counts stop and the report
+says `truncated`. A source that uses UUIDs as keys must not turn a bounded-RAM run unbounded.
+
+Measured cost of the default (`warn` vs `ignore`, 1M-row 7-column nested JSONL, release build):
+**~6% wall time, peak RSS unchanged**. A pathological run where *every* row drifts on six uncovered
+fields is 1.47×, and `rescue` on that same run 2.44× (it builds and serializes a JSON object per
+row) — see [BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured).
+
+This is drift detection *within one run*. A schema registry, drift history across runs, or alerting
+is orchestration — §14's line, not the engine's.
+
 ---
 
 ## 13. v0.1 limits & roadmap (architectural)
@@ -380,7 +439,7 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   **readable** — DuckDB resolves it with `iceberg_scan('<new path>', allow_moved_paths=true)`
   (verified for partitioned and multi-snapshot tables). **Catalog-managed** relocation
   (re-anchoring the embedded paths so any engine reads a moved table with no flag, plus
-  multi-writer commits) stays the commercial-edition REST catalog.
+  multi-writer commits) is left to an external Iceberg REST catalog.
 - **zstd** is off by default (musl-static); in the lean binary `--compression zstd` is a clear
   error (the opt-in `--features zstd` fat build enables it) — otherwise use
   `snappy`/`uncompressed`.
@@ -394,33 +453,29 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   DuckDB `iceberg_scan('file://…')`, identical to the local path.
 - **Temporal edge cases**: integer timestamps read as epoch-milliseconds, integer dates as
   epoch-days; `timestamp` is zone-less (Iceberg `timestamp`, not `timestamptz`).
-- **No incremental/CDC, no scheduling, no connectors** in the OSS core — those are hosted / ee
-  features, deliberately kept out of the engine (next section).
+- **Schema drift** is detected and mitigated **within a run**: undeclared fields and
+  silently-nulled coercions are counted and reported (`<output>.drift.json`, carrying the column
+  declarations that would keep them), and `drift.policy` chooses what happens — `warn` (the
+  default), `rescue`, `quarantine`, `error`, or `ignore`. What is *not* here is the stateful half:
+  remembering a dataset's shape between runs, propagating a new column into the destination on the
+  next run, drift history, alerting. Those need memory and a schedule — an orchestrator's job.
+- **No incremental/CDC, no scheduling, no connectors** — deliberately kept out of the engine
+  (next section).
 
 ---
 
-## 14. The deliberate boundary: engine vs. orchestrator, and the open-core planes
+## 14. The deliberate boundary: engine vs. orchestrator
 
 shapeshift is a **shaper**, not an orchestrator. It has no scheduler, no state store, no metering,
 and no connector registry — and that omission is intentional. Scheduling, retries, run history,
-and the metering/billing substrate are the job of the lab's orchestrator (**dagron**),
+and metering are the job of an orchestrator (such as **dagron**),
 which composes tools like shapeshift as steps. Keeping that boundary sharp is what lets the engine
 stay a pure, I/O-free-core, single static binary that anyone can self-host with no row cap and no
 telemetry.
 
-The open-core split follows the same seam:
-
-- **OSS engine (this workspace, Apache-2.0)** — the six crates above. Self-hostable, unbounded
-  rows, no telemetry. The free / self-host tier.
-- **shapeshift Cloud (hosted, freemium)** — a managed control plane to try it: scheduling, run
-  history, connectors, and MAR reporting layered *around* the same engine, not forked from it.
-- **Commercial license (paid self-host)** — the managed control plane inside a
-  team's own perimeter.
-
-Because incremental/CDC, scheduling, and connectors are explicitly *not* in the core, the paid
-planes add capability at the orchestration layer without ever needing to change — or cap — the
-engine. The engine's contract to those planes is exactly the CLI surface and the `SinkSummary` it
-prints; nothing more couples them.
+The engine's contract to an orchestrator is exactly the CLI surface and the `SinkSummary` it
+prints; nothing more couples them, so capability added at the orchestration layer never needs to
+change — or cap — the engine.
 
 ---
 

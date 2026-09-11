@@ -17,8 +17,8 @@
 //! ## Scope (deliberately small)
 //! It is a *shaper* console, not a control plane: single-user, stateless beyond the
 //! files it writes, with **no scheduler, run queue, catalog server, connectors,
-//! metering, or auth**. Those orchestration concerns live in the separately-licensed
-//! commercial control plane, never in the OSS core. The server binds to `127.0.0.1` by
+//! metering, or auth**. Those are orchestration concerns, out of scope here. The
+//! server binds to `127.0.0.1` by
 //! default and — as a local tool — has no application-level authentication; keep it
 //! bound to loopback, or put your own auth in front of it if you expose it.
 //!

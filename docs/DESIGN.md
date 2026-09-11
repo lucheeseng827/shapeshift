@@ -14,8 +14,8 @@ complete type and transform tables — is in [SPEC.md](./SPEC.md); this doc quot
 design discussion needs.
 
 Scope: everything here is the **OSS engine** (Apache-2.0) — the single `shapeshift` binary and its
-six crates, self-hostable with no row cap and no telemetry. The hosted and commercial planes are
-a boundary, described last; nothing in the engine depends on them.
+six crates, self-hostable with no row cap and no telemetry. Orchestration sits outside it, behind
+a boundary described last; nothing in the engine depends on it.
 
 ---
 
@@ -292,7 +292,7 @@ output path — same input, same spec, same table. There is no partial-commit st
 > references for a *default* reader — but DuckDB reads a moved/copied table in place with
 > `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
 > tables). Appends now ship; catalog-managed relocation (re-anchoring paths so any engine reads with
-> no reader flag) is the roadmap commercial-edition catalog. All additive; none of it changes the engine.
+> no reader flag) is left to an external Iceberg REST catalog. All additive; none of it changes the engine.
 
 ---
 
@@ -453,31 +453,21 @@ The forward-looking ones are roadmap; the rest are permanent boundaries.
 
 | Not in the OSS engine | Why | Where it belongs |
 |---|---|---|
-| Append-to-existing / multi-snapshot Iceberg | shipped: `--append` chains a new snapshot onto an existing table (reads prior metadata + manifest list, carries manifests forward, bumps version) | ✅ done — row-level **merge / upsert** (CDC) is a hosted/`ee` concern |
+| Append-to-existing / multi-snapshot Iceberg | shipped: `--append` chains a new snapshot onto an existing table (reads prior metadata + manifest list, carries manifests forward, bumps version) | ✅ done — row-level **merge / upsert** (CDC) is out of scope |
 | Partitioning (identity + hidden transforms) | shipped: `--partition-by` accepts columns and transform expressions (`bucket(N, col)` with spec-exact Murmur3, `truncate(W, col)`, `year\|month\|day\|hour(col)`); the spec records the real transform strings, rows fan out per **transformed** value, and the manifest partition tuple stores the transform's result type | ✅ done |
-| Object-store output (S3/GCS/Azure) | shipped for **both Parquet and Iceberg** via `shapeshift-objstore` (a new `Sink` crate, opt-in behind the CLI's `object_store` feature) | ✅ done — a moved table reads with `allow_moved_paths=true`; only **catalog-managed** relocation + multi-writer (the hosted **REST catalog**) remains a commercial-edition feature |
+| Object-store output (S3/GCS/Azure) | shipped for **both Parquet and Iceberg** via `shapeshift-objstore` (a new `Sink` crate, opt-in behind the CLI's `object_store` feature) | ✅ done — a moved table reads with `allow_moved_paths=true`; only **catalog-managed** relocation + multi-writer is left to an external **REST catalog** |
 | `zstd` compression | not linked **by default** — it would pull a C codec and break the musl-static single binary; the lean binary gives a **clear error** | ✅ opt-in: `cargo build --features zstd` (the fat build) enables it for Parquet + Iceberg; otherwise `snappy` (default) / `uncompressed` |
 | Streaming json-array input | shipped: `JsonArrayReader` streams one element at a time (a depth- and string-aware boundary scanner, same per-record byte cap as JSONL) | ✅ done — both input formats are bounded-RAM streaming paths |
-| Incremental / CDC, scheduling, connectors, metering | the moment runs relate or must be operated, you need an orchestrator — a different product with different failure modes | the lab's orchestrator (**dagron**) and the hosted / commercial planes |
+| Incremental / CDC, scheduling, connectors, metering | the moment runs relate or must be operated, you need an orchestrator — a different product with different failure modes | an orchestrator (such as **dagron**) |
 
 The last row is the load-bearing boundary. shapeshift is a **shaper**, not an orchestrator: no
 scheduler, no state store, no metering, no connector registry. Keeping that out is exactly what
 lets the engine stay a pure, I/O-free-core, single static binary that anyone self-hosts with no row
 cap and no telemetry.
 
-The open-core split follows the same seam:
-
-- **OSS engine** (this workspace, Apache-2.0) — the six crates above; unbounded rows, no
-  telemetry. The free / self-host tier.
-- **shapeshift Cloud** (hosted, freemium) — a managed control plane to try it: scheduling, run
-  history, connectors, MAR reporting layered *around* the same engine, never forked from it.
-- **Commercial license** (paid self-host) — that same managed control plane inside
-  a team's own perimeter.
-
-Because incremental/CDC, scheduling, and connectors are explicitly not in the core, the paid planes
-add capability at the orchestration layer without ever changing — or capping — the engine. The
-engine's contract to those planes is exactly the CLI surface and the `SinkSummary` it prints;
-nothing more couples them.
+The engine's contract to an orchestrator is exactly the CLI surface and the `SinkSummary` it
+prints; nothing more couples them, so capability added at the orchestration layer never needs to
+change — or cap — the engine.
 
 ---
 

@@ -10,11 +10,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::drift::{DriftPolicy, DriftSpec};
 use crate::transform::Transform;
 use crate::types::ColumnType;
 
 /// A complete dataset shaping spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DatasetSpec {
     /// Logical table name (used for the Iceberg table dir / Parquet file stem when
     /// the output path is a directory).
@@ -37,6 +39,11 @@ pub struct DatasetSpec {
     #[serde(default)]
     pub columns: Vec<ColumnSpec>,
 
+    /// What the run does when the source's shape outgrows this schema. Defaults to
+    /// `warn` — detected and reported, never silent.
+    #[serde(default, skip_serializing_if = "DriftSpec::is_default")]
+    pub drift: DriftSpec,
+
     /// Dataset-wide shaping options.
     #[serde(default)]
     pub options: Options,
@@ -44,6 +51,7 @@ pub struct DatasetSpec {
 
 /// Input description.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     /// `jsonl` (one JSON object per line, the default) or `json-array` (a single
     /// top-level array).
@@ -75,6 +83,7 @@ pub enum SourceFormat {
 
 /// Output description.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OutputSpec {
     /// `parquet` (a single file, or `<path>/<dataset>.parquet` when `path` is a
     /// directory) or `iceberg` (an Iceberg v2 table rooted at `path`).
@@ -129,6 +138,7 @@ pub enum SchemaMode {
 /// One output column: where it comes from, what it becomes, and how it is
 /// transformed on the way.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnSpec {
     /// Output column name.
     pub name: String,
@@ -162,6 +172,7 @@ impl ColumnSpec {
 
 /// Dataset-wide shaping options.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Options {
     /// Flatten nested objects into dotted column names during inference
     /// (`{"user":{"name":..}}` → `user.name`). Arrays become JSON-encoded string
@@ -236,6 +247,23 @@ impl DatasetSpec {
                 return Err(ShapeError::Spec(format!(
                     "duplicate column name `{}`",
                     c.name
+                )));
+            }
+        }
+        // The rescue column is a real output column, so it needs a real name — and one
+        // that cannot collide with a declared one. (A collision with an *inferred*
+        // column is only knowable once the sample is read; the shaper checks that.)
+        if self.drift.policy == DriftPolicy::Rescue {
+            let rescue = self.drift.rescue_column.trim();
+            if rescue.is_empty() {
+                return Err(ShapeError::Spec(
+                    "`drift.rescue_column` must not be empty under `policy: rescue`".into(),
+                ));
+            }
+            if self.columns.iter().any(|c| c.name == rescue) {
+                return Err(ShapeError::Spec(format!(
+                    "`drift.rescue_column` `{rescue}` collides with a declared column \
+                     (pick another name)"
                 )));
             }
         }

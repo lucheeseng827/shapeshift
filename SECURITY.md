@@ -35,8 +35,8 @@ local path, shapes it through a declarative spec, and writes Parquet or a
 self-contained Iceberg v2 table to a local path. Concretely:
 
 - **No network in the OSS core.** The engine and CLI open no sockets, make no
-  outbound calls, and ship no telemetry. Hosted control-plane and connector
-  features live in the separate hosted/`ee` planes, not here.
+  outbound calls, and ship no telemetry. There is no connector or hosted-service
+  code in this repository.
 - **No eval, no exec, no code loading.** The transform spec is data. Column
   transforms are a fixed, named library (`lowercase`, `trim`, `dollars_to_cents`,
   `json_encode`, …); there is no expression evaluator, no scripting, and no

@@ -3,8 +3,7 @@
 `shapeshift-objstore` lands shapeshift's output in an **object store** — **S3 / GCS /
 Azure**, or `file://` — instead of the local filesystem, for **both** sink formats. Each
 implements `shapeshift_core::Sink`, so the shaping engine is unchanged; only the
-destination moves. This is the first hosting primitive: whatever the commercial control plane
-writes to a bucket flows through here.
+destination moves.
 
 ## What it does
 
@@ -139,4 +138,4 @@ DuckDB `iceberg_scan('file://…')` (identical to the local path). Tables are
 **location-anchored** (absolute paths) — valid and readable at the prefix they were written
 to, and still **readable after a move/copy** via `iceberg_scan('<new path>',
 allow_moved_paths=true)`. **Catalog-managed** relocation (re-anchoring paths so any engine
-reads a moved table with no flag, plus multi-writer commits) is the commercial-edition REST catalog.
+reads a moved table with no flag, plus multi-writer commits) is left to an external Iceberg REST catalog.

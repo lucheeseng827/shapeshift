@@ -17,7 +17,7 @@ members = [
 # parquet / simd-json / avro stack resolves independently of the shared workspace.
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/shapeshift"
@@ -45,7 +45,7 @@ clap = { version = "4", features = ["derive"] }
 # bridge to land straight in a `serde_json::Value`, so downstream code stays on
 # the ubiquitous value model while the hot lexing stays SIMD.
 simd-json = "0.14"
-# Columnar core. arrow 54 to match the lab's proven musl-static Snappy build
+# Columnar core. arrow 54 to match the proven musl-static Snappy build
 # (parquet default-features=false + snap avoids the zstd/brotli C codecs). The
 # arrow-array/arrow-schema major MUST match parquet's arrow-rs major.
 arrow-array = "54"

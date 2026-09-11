@@ -112,7 +112,7 @@ python scripts/register_catalog.py --table s3://lake/db/events --identifier anal
 
 > To keep the pointer live automatically, register once at table creation, then re-register
 > `--replace` on a schedule (cron / the loop that runs `stream_drain.sh`). Auto-advancing
-> commits on every append is what the commercial control plane's managed catalog does.
+> commits on every append is what a REST catalog does.
 
 ## 3. Query it from any engine
 
@@ -158,7 +158,7 @@ If your events truly have no per-key ordering column, add one upstream — there
 correct latest-per-key without it.
 
 Or materialise it downstream with a periodic `MERGE`/CTAS in your engine. True in-table
-`MERGE`/upsert and CDC state are commercial-edition features — see the module
+`MERGE`/upsert and CDC state are out of scope for shapeshift — see the
 [README](../../README.md).
 
 ---

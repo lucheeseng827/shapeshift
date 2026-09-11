@@ -39,6 +39,20 @@ impl ColumnType {
         }
     }
 
+    /// The name this type is written as in a spec (`float64`, `timestamp`, …), so a
+    /// message about a column reads the same way the spec that declared it does.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ColumnType::Bool => "bool",
+            ColumnType::Int64 => "int64",
+            ColumnType::Float64 => "float64",
+            ColumnType::String => "string",
+            ColumnType::Date => "date",
+            ColumnType::Timestamp => "timestamp",
+            ColumnType::Json => "json",
+        }
+    }
+
     /// The Iceberg primitive-type name for the table metadata schema.
     pub fn iceberg_type(self) -> &'static str {
         match self {
@@ -49,5 +63,11 @@ impl ColumnType {
             ColumnType::Date => "date",
             ColumnType::Timestamp => "timestamp",
         }
+    }
+}
+
+impl std::fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }

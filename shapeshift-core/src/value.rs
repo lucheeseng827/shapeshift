@@ -15,6 +15,8 @@
 
 use serde_json::Value;
 
+use crate::record::{Kind, Record};
+
 /// Split a path spec into its segments, dropping a leading `$`/`$.`.
 pub fn segments(path: &str) -> Vec<&str> {
     let p = path.strip_prefix('$').unwrap_or(path);
@@ -27,6 +29,9 @@ pub fn segments(path: &str) -> Vec<&str> {
 
 /// Resolve a dotted path against a record, returning a borrow of the leaf value if
 /// present. An empty path (`$`) selects the whole record.
+///
+/// This re-splits `path` on every call. The shaper's hot loop uses [`compile_path`] +
+/// [`select_compiled`] instead, which does the split once per column at build time.
 pub fn select<'a>(record: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = record;
     for seg in segments(path) {
@@ -36,6 +41,47 @@ pub fn select<'a>(record: &'a Value, path: &str) -> Option<&'a Value> {
                 let idx: usize = seg.parse().ok()?;
                 arr.get(idx)?
             }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// One path segment, compiled once. Carries the literal object key *and* its reading as
+/// an array index (`None` when the segment is not all-digits), because which one applies
+/// depends on the shape of the value actually met at that depth — an object is keyed, an
+/// array is indexed.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    key: String,
+    index: Option<usize>,
+}
+
+/// Compile a dotted path into its segments once, so the hot loop never re-splits it.
+/// Same grammar as [`select`]: leading `$`/`$.` dropped, `.` separates, an all-digits
+/// segment doubles as an array index.
+pub fn compile_path(path: &str) -> Vec<Segment> {
+    segments(path)
+        .into_iter()
+        .map(|s| Segment {
+            key: s.to_string(),
+            index: s.parse().ok(),
+        })
+        .collect()
+}
+
+/// Resolve a pre-compiled path against a record. Identical semantics to [`select`],
+/// with no allocation per call — the whole point of compiling the path.
+///
+/// Generic over [`Record`], so the same walk serves an owned `serde_json::Value` and a
+/// borrowed tape cursor. Which one applies at a given depth still depends on the value
+/// actually met there: an object is keyed, an array is indexed.
+pub fn select_compiled<'a, R: Record<'a>>(record: R, segs: &[Segment]) -> Option<R> {
+    let mut cur = record;
+    for seg in segs {
+        cur = match cur.kind() {
+            Kind::Object => cur.get_key(seg.key.as_str())?,
+            Kind::Array => cur.get_index(seg.index?)?,
             _ => return None,
         };
     }

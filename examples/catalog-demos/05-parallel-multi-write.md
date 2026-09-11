@@ -24,7 +24,7 @@ no catalog server). So the rule is simple:
 
 > **Parallelise across disjoint commit targets. Never point two concurrent writers at one
 > table dir.** Coordinating concurrent commits *into one table* is a catalog's job (atomic
-> CAS on the pointer) — that's Pattern B/C below, and the commercial REST catalog.
+> CAS on the pointer) — that's Pattern B/C below, or a REST catalog.
 
 ## Pattern A — parallel writers → shard tables → union at read *(recommended)*
 
@@ -107,8 +107,8 @@ for attempt in range(10):
 ```
 
 This is precisely the guarantee shapeshift's OSS file-system append cannot give on its own,
-and what the **commercial control plane's managed REST catalog** provides out of the box
-(multi-writer commits + copy-anywhere relocation — see the module [README](../../README.md)
+and what an Iceberg **REST catalog** provides out of the box
+(multi-writer commits + copy-anywhere relocation — see the [README](../../README.md)
 and [ROADMAP](../../ROADMAP.md)).
 
 ## Anti-pattern — concurrent `--append` to one table dir *(silent data loss)*
@@ -158,5 +158,5 @@ target is a single shared table.
 
 ---
 
-Back to the [index](./README.md) · the managed multi-writer catalog is the commercial
-control plane ([ROADMAP](../../ROADMAP.md)).
+Back to the [index](./README.md) · why a multi-writer catalog is out of scope:
+[ROADMAP](../../ROADMAP.md).

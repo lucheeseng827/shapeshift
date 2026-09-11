@@ -129,6 +129,33 @@ fn full_console_flow_over_tcp() {
     assert_eq!(v["parse_errors"], 1);
     assert_eq!(v["rejects_total"], 1);
 
+    // A run whose source outgrew its spec: the console reports what the schema drops
+    // rather than writing a clean-looking run over quietly-lost data.
+    let drift_spec = "dataset: t\noutput:\n  format: parquet\n  path: t.parquet\n\
+                      schema: strict\ncolumns:\n- name: id\n  type: int64\n";
+    let drift_body = serde_json::json!({
+        "input": "{\"id\":1}\n{\"id\":2,\"currency\":\"usd\"}",
+        "spec_yaml": drift_spec,
+        "format": "jsonl", "to": "parquet", "compression": "snappy", "dataset": "drifted"
+    });
+    let (s, body) = request(port, "POST", "/api/shape", Some(&drift_body.to_string()));
+    assert_eq!(s, 200, "shape: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["rows_out"], 2,
+        "drift `warn` still writes every row: {body}"
+    );
+    assert_eq!(v["drift"]["policy"], "warn");
+    assert_eq!(v["drift"]["new_fields"][0]["path"], "currency");
+    assert_eq!(v["drift"]["new_fields"][0]["suggested_type"], "string");
+    assert!(
+        v["drift"]["suggested_columns_yaml"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("name: currency"),
+        "drift body: {body}"
+    );
+
     // Inspect the Parquet output written above.
     let (s, body) = request(
         port,

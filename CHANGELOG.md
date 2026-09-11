@@ -10,6 +10,147 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-12
+
+### Upgrading from 0.1.x
+
+Three changes can break an existing setup; everything else is additive.
+
+- **Drift detection is on by default.** `drift.policy` defaults to `warn`: every `shape` run now
+  prints a drift summary and writes `<output>.drift.json` beside its output. The rows written are
+  identical to 0.1.x. To keep the old behaviour exactly, set `drift.policy: ignore` in the spec or
+  pass `--on-drift ignore`.
+- **Unknown spec keys are rejected.** A spec with a misspelled or extra key (`colums:`) used to
+  run on pure inference and report success; it now fails, naming the key, its line, and the valid
+  names. Fix the key.
+- **Library: `RunReport` changed.** It gained a public `drift` field and no longer derives `Eq`.
+  Code that builds a `RunReport` with a struct literal, or compares reports with `Eq`, needs
+  updating. `Shaper::new` and `Shaper::push(&value)` are unchanged.
+
+### Added
+
+- **`json-array` input parses onto a tape too, and doubles on the shipped binary.** The array
+  reader already framed each element into a reusable buffer, exactly as the line reader framed
+  lines — so the framing was factored out of the `Value` iterator (one implementation of the
+  array's state machine, shared by both readers, the same split JSONL uses) and a
+  `TapeJsonArrayReader` built on it. A new `TapeSource` trait keeps the shape loop to one tape
+  path instead of one per input format. Streaming, the element scanner, and the error semantics
+  are untouched: a bad element is still recoverable and still reports its 1-based element index,
+  a malformed array is still reported once and ends iteration. Measured on one machine, 1M rows
+  → Parquet, three interleaved reps, median: **151,268 → 308,298 rows/s (+103.8%) on musl**,
+  318,094 → 436,462 (+37.2%) on glibc, peak RSS unmoved. That leaves `json-array` at **93.5% of
+  JSONL's rate on musl**, against 46% before. Output is byte-identical — the same Parquet md5 as
+  the JSONL framing of the same records, on both targets.
+- **`shapeshift-core` reads records through a `Record` trait.** The engine only ever *reads* a
+  record, so it no longer names a concrete type to do it. **The `serde_json::Value` contract is
+  unchanged** — `&Value` implements the trait, `Shaper::push(&value)` behaves exactly as before,
+  and `core` still names no parser. This is what let a second, cheaper record model exist beside
+  the first rather than replace it. Both run the same coercion code, and a conformance test
+  asserts the two answer identically on every accessor.
+- **`shapeshift-json/examples/parsebench.rs`** — the parse-cost measurement behind the change,
+  runnable on your own data and against either allocator.
+
+- **`--pipeline` — overlap encoding a row group with shaping the next one.** Finished row
+  groups are handed to a writer thread, so Parquet encoding and Snappy compression stop
+  taking turns with shaping on one core. The output is byte-identical with it on or off.
+  Measured on one machine, 1M rows → Parquet: **+13.5% on a glibc build** (226,947 →
+  257,628 rows/s; **+16.4%** over the 8M-row sweep, with peak RSS *falling* 138.5 → 61.5
+  MiB), and **−5.3% on musl**, whose malloc takes a single global lock so a second
+  allocating thread contends rather than scales. *(That made the default `auto` — on,
+  except on musl. The tape reader below removed the contention, and the default is now on
+  everywhere; see the Changed entry.)* `--pipeline on|off` overrides it either way. Memory stays bounded
+  by the row group (at most two batches at once), and the thread is spawned lazily on the
+  *second* row group so small runs and the ~3 ms cold start are untouched.
+  See [`BENCHMARKS.md` §7](./BENCHMARKS.md#7-performance-measured), which also records the
+  discarded first design — putting the *source* on the far thread and passing
+  `serde_json::Value`s measured **~2× slower** on both targets — and the standing
+  finding that parsing alone is **6.2× slower on musl than glibc**, which is what bounds
+  further threading.
+
+- **Standard input (`-i -`).** A shape composes in a pipeline now —
+  `producer | shapeshift shape -i - -o out.parquet` — the usual shell convention, on `shape`,
+  `infer`, and `cost`. Previously `-i -` failed with `opening -: No such file or directory`,
+  and the only documented pipe recipe (`-i /dev/stdin`) was the data-loss bug fixed below.
+
+- **Schema drift detection and mitigation (`drift` in the spec, `--on-drift` on the CLI).** A spec is
+  written once per source *shape*, but sources move — and until now two kinds of movement passed
+  **silently**: a field the spec has no column for (its values were never selected; nothing counted,
+  nothing sidecarred) and a value that stopped coercing in an *optional* column under the lenient
+  policy (written as null, uncounted). Both showed `rows_in == rows_out` and looked like a clean run.
+  They are now detected per record and reported: for each drifted path, how many rows carried it, the
+  record it first appeared in, example values, and the type inference would give it — i.e. the
+  `columns:` block to paste into the spec to keep it. `shape` prints a summary and writes the full
+  report to `<output>.drift.json`; the console returns it on `/api/shape` and renders it; embedders
+  read `RunReport.drift` / `Shaper::drift_report()`.
+  Five policies decide what a drift *does*: `ignore` (v0.1 behaviour, no detection),
+  **`warn` (the new default** — count and report; the rows written are identical to `ignore`),
+  `rescue` (a `json` catch-all column, appended after every real column so enabling it is an additive
+  Iceberg schema change, holding whatever the row would have lost), `quarantine` (a drifted row is
+  rejected into the existing reject sidecar, so the table holds only exactly-on-schema rows), and
+  `error` (fail the run at the first event — and since a failed run never finalizes its sink, there
+  is no footer-less Parquet file or new Iceberg metadata to half-consume).
+  Detection is bounded like the rest of the engine (at most 1,000 distinct paths and
+  `drift.max_examples` values per path, then the report says `truncated`) and measured: **~6% of wall
+  time on a clean 1M-row run, peak RSS unchanged** — see [BENCHMARKS.md §7](./BENCHMARKS.md). A
+  column merely *absent* from a record is deliberately not tracked; that loss is already visible as a
+  null in the output.
+
+### Fixed
+
+- **The `json-array` reader built an owned `String` of every element before parsing**, so the
+  raw text would be available if the parse failed — while the JSONL reader had been switched to
+  a scratch copy precisely so the raw line is materialized only on the error path. The array
+  reader now does the same. On glibc this measured as nothing (one small alloc/free against a
+  3.2 µs row budget); it is corrected for consistency with the path it was modelled on.
+
+- **A piped source shaped only its inference sample, and reported success.** `shape` read the
+  input twice — once to sample for inference, once to shape it. That is harmless for a regular
+  file and destroys any non-seekable input, because the sampling pass consumes bytes the shaping
+  pass never sees. Piping 2,000 records through `-i /dev/stdin` (the recipe
+  `examples/catalog-demos/02` gave) shaped **542** of them and exited **0** — `rows_in` simply
+  reported the truncated count, so nothing looked wrong. The source is now read **once**: the
+  head is sampled for inference and chained back in front of the remainder, so a pipe shapes
+  exactly what a file would. Parse errors met while sampling ride along in the prefix, so they
+  are still counted and sidecarred with their original line numbers. This also drops a redundant
+  re-parse of the first `infer_sample` records from every inferred run.
+- **An unknown key in a spec was silently ignored.** `colums:` (the classic typo) parsed cleanly
+  and the run proceeded on pure inference — every type pin, `required` flag, and transform
+  silently not applied, reported as a clean run. The spec model now rejects unknown fields with
+  the offending key, its line, and the list of valid names.
+
+### Changed
+
+- **JSONL parses onto a reusable tape instead of building a `serde_json::Value` per record
+  — ~1.7× faster shaping on the shipped binary.** The record model was a tree of small heap
+  allocations, built and discarded for every row; that was the largest remaining cost, and it
+  fell hardest on the musl-static build, whose allocator takes one global lock. The JSONL
+  reader now parses onto a flat simd-json tape, reused between records, whose strings point
+  back into the read buffer — nothing is allocated per record in the steady state. Measured on
+  one machine, 1M rows → Parquet, three interleaved reps, median: **143,557 → 241,211 rows/s
+  (+68.0%) on musl**, 238,817 → 351,486 (+47.2%) on glibc. Over the 8M-row sweep the shipped
+  binary now does **273,495 rows/s**, against 144,745 before and 121,185 before any of this
+  release's performance work. Peak RSS is unchanged and the flat-RSS check still passes;
+  `json-array` input followed shortly after (below).
+- **The `--pipeline` default is now on everywhere.** It was off on musl because a second
+  allocating thread contended on that allocator's global lock. The tape reader removed the
+  allocation, and with it the contention: the same A/B now reads **+10.0% on musl** and +22.3%
+  on glibc. The earlier reasoning was not wrong; its premise is gone.
+
+- **~26% faster shaping, same output, same bounded RAM.** Three per-row allocations that did no
+  work are gone: the column's dotted path is compiled to segments once instead of being re-split
+  every row; coercion reads the record by reference (`Cell::Str` holds a `Cow`) instead of cloning
+  every selected value, so a string, date, timestamp, or json column no longer copies bytes it
+  only reads; and `JsonlReader` no longer materializes each line's raw text for the error path on
+  rows that parse fine. Measured on one machine (Xeon 2.80GHz, 4 cores), 1M rows, three
+  interleaved A/B reps, median: **119,276 → 150,815 rows/s** on the shipped musl-static binary
+  (glibc: 172,706 → 227,508). Peak RSS is unchanged (marginally lower) and the flat-RSS check
+  still passes; the shaped Parquet is byte-identical to the previous binary's on both the Parquet
+  and Iceberg paths. See [`BENCHMARKS.md` §7](./BENCHMARKS.md#7-performance-measured).
+
+- `RunReport` gained a `drift` field (and dropped its `Eq` derive, which a report carrying JSON
+  example values cannot have). `Shaper::new` is unchanged and does no drift work; `Shaper::from_spec`
+  honours the spec's `drift` block, and `Shaper::with_drift` is the explicit constructor.
+
 ## [0.1.2] - 2026-07-18
 
 ### Fixed
@@ -53,7 +194,7 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
   it lives behind the CLI's off-by-default **`serve`** feature, so the lean
   musl-static `shapeshift` binary is byte-for-byte unchanged. Local & single-user by
   design (no scheduler, run queue, catalog server, connectors, metering, or auth —
-  those stay in the commercial control plane); binds to `127.0.0.1` with a
+  those belong to an orchestrator); binds to `127.0.0.1` with a
   DNS-rebinding `Host` allow-list and a JSON-only/no-CORS gate on POSTs. Verified
   end-to-end (unit + an over-TCP integration test, plus a headless-browser run of the
   full infer→shape→inspect→cost flow).
@@ -188,7 +329,7 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
   builder (`IcebergDataWriter` + `build_metadata_artifacts`) that both the local and
   object-store sinks reuse; local tables now embed their real location rather than a
   `canonicalize`d path. A hosted **REST** catalog (catalog-managed relocation,
-  multi-writer commits) stays a commercial-edition concern.
+  multi-writer commits) is left to an external catalog.
 
 ### Changed
 
@@ -217,7 +358,7 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
   and multi-snapshot tables (predicate pruning still works). This is the OSS "copy-anywhere"
   story; writer-embedded *relative* paths are deliberately not pursued (non-standard in
   Iceberg, not read by default across engines), and **catalog-managed** relocation (any
-  engine, no reader flag, plus multi-writer commits) remains the commercial-edition REST catalog.
+  engine, no reader flag, plus multi-writer commits) is left to an external Iceberg REST catalog.
   Documented across README, ARCHITECTURE, SPEC, DESIGN, ROADMAP, SECURITY,
   and the crate READMEs.
 
@@ -352,10 +493,11 @@ build musl-static and ships as a single binary.
 - **Output** is local filesystem only; object-store (S3 / GCS / Azure) output is roadmap.
 - **Temporal integers:** integer timestamps read as epoch-milliseconds and integer dates
   as epoch-days; `timestamp` is zone-less (Iceberg `timestamp`, not `timestamptz`).
-- **Not in the OSS core:** no incremental / CDC, no scheduling, and no connectors — those
-  are hosted / commercial features.
+- **Not in the engine:** no incremental / CDC, no scheduling, and no connectors — those
+  belong to an orchestrator.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lucheeseng827/shapeshift/releases/tag/v0.1.0

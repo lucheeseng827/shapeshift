@@ -78,7 +78,7 @@ For very large tables, pipe straight through (no intermediate file) on Linux:
 
 ```sh
 TABLE=public.orders ./scripts/pg_to_jsonl.sh full \
-  | shapeshift shape -s orders.spec.yaml -i /dev/stdin --to iceberg
+  | shapeshift shape -s orders.spec.yaml -i - --to iceberg
 ```
 
 ## 3. Register in the catalog
@@ -130,7 +130,7 @@ SELECT * EXCLUDE (rn) FROM (
   JSON per row — swap the exporter, keep everything downstream.
 - ⚠️ **Watermark incremental catches inserts and updates, not hard deletes.** For deletes
   you need the DB's change log — that's [Demo 4 (CDC)](./04-cdc-roundtrip-stream-and-db.md).
-  In-table `MERGE`/upsert is a commercial-edition feature.
+  In-table `MERGE`/upsert is out of scope for shapeshift.
 
 ---
 

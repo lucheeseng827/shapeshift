@@ -52,6 +52,20 @@ flowchart LR
   composes with `--append`). Source parse errors are counted and
   sidecarred to `<output>.rejects.jsonl`; the run never aborts on a bad line. Prints
   `rows_in / rows_out / rejected / parse_errors / row_groups / bytes`.
+  `--on-drift ignore|warn|rescue|quarantine|error` (overriding the spec's `drift.policy`,
+  default `warn`) decides what happens when the source outgrows the schema — an undeclared
+  field, or a value that stopped coercing in an optional column. Both used to pass silently;
+  now they are counted, summarized on stdout (with the `columns:` block that would keep them),
+  and written in full to `<output>.drift.json`. `rescue` keeps the dropped values in a `json`
+  catch-all column named by `--rescue-column` (default `_rescued`); `quarantine` rejects the
+  drifted rows into the reject sidecar; `error` fails the run.
+  `--pipeline auto|on|off` (default `auto`, which is on) hands each finished row group to
+  a writer thread, so encoding and compressing it overlaps with shaping the next instead
+  of taking turns on one core — worth **+10% on musl and +22% on glibc**
+  ([BENCHMARKS §7](../BENCHMARKS.md#7-performance-measured)). It never changes the output,
+  only who waits; memory stays bounded by the row group, and the thread is only spawned
+  once a second row group exists, so small runs and cold start are untouched. `off` is the
+  escape hatch for a constrained box, or to measure what it is worth on your hardware.
 - **`shapeshift inspect <path>`** — auto-detects a Parquet file or an Iceberg table dir
   and prints its schema + row/record count.
 - **`shapeshift cost`** — price a run against a managed vendor's MAR rate:
@@ -142,8 +156,8 @@ shapeshift inspect s3://my-bucket/db/events                                     
 `AWS_*` / `GOOGLE_*` / `AZURE_*` env vars); data uploads as a bounded-RAM multipart
 stream. The Iceberg table's paths are anchored at the destination, so DuckDB
 `iceberg_scan('s3://…')` reads it in place. The default binary refuses a URL `--output`
-(or `inspect <url>`) with a clear "rebuild with `--features object_store`" message. Only a
-hosted **REST catalog** (copy-anywhere relocation) remains a commercial-edition feature. See
+(or `inspect <url>`) with a clear "rebuild with `--features object_store`" message. A
+**REST catalog** (copy-anywhere relocation) is out of scope — use an external one. See
 [`shapeshift-objstore`](../shapeshift-objstore).
 
 See [`examples/embed.rs`](./examples/embed.rs) for driving the same engine as a library.

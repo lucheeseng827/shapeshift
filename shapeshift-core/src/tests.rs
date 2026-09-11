@@ -327,3 +327,271 @@ fn mar_estimate_is_honest_both_ways() {
     });
     assert!(tiny.saved < 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// Schema drift
+// ---------------------------------------------------------------------------
+
+/// A two-column spec over `{"id": int, "amount": float}` — the shape everything below
+/// drifts away from. `schema: infer` with an empty inferred list means "these columns,
+/// lenient policy": the forgiving default, and the one where a loss is silent.
+fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
+    DatasetSpec {
+        dataset: "t".into(),
+        source: Default::default(),
+        output: OutputSpec {
+            format: OutputFormat::Parquet,
+            path: "t.parquet".into(),
+            compression: Compression::Snappy,
+            partition_by: Vec::new(),
+        },
+        schema: SchemaMode::Infer,
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                from: None,
+                ty: ColumnType::Int64,
+                transform: None,
+                required: false,
+            },
+            ColumnSpec {
+                name: "amount".into(),
+                from: None,
+                ty: ColumnType::Float64,
+                transform: None,
+                required: false,
+            },
+        ],
+        drift: DriftSpec {
+            policy,
+            ..Default::default()
+        },
+        options: Default::default(),
+    }
+}
+
+#[test]
+fn drift_detects_a_field_the_schema_never_reaches() {
+    let spec = drift_spec(DriftPolicy::Warn);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5})).unwrap();
+    // The producer added `currency` (and a nested `meta.source`) after the spec was
+    // written. Both used to vanish without a trace.
+    sh.push(&json!({"id": 2, "amount": 2.5, "currency": "usd", "meta": {"source": "web"}}))
+        .unwrap();
+    sh.push(&json!({"id": 3, "amount": 3.5, "currency": "eur"}))
+        .unwrap();
+
+    let r = sh.drift_report().unwrap();
+    assert!(!r.is_clean());
+    assert_eq!(r.rows_scanned, 3);
+    assert_eq!(r.rows_with_drift, 2);
+    assert_eq!(r.new_fields.len(), 2);
+    let cur = &r.new_fields["currency"];
+    assert_eq!(cur.count, 2);
+    assert_eq!(cur.first_record, 2);
+    // Inference's own verdict on the values seen: what to declare to keep them.
+    assert_eq!(cur.suggested_type, ColumnType::String);
+    // Nested paths are reported the way `flatten` would name the column.
+    assert_eq!(r.new_fields["meta.source"].count, 1);
+    // Every row is still written — `warn` reports, it does not change the output.
+    assert_eq!(sh.flush().unwrap().unwrap().num_rows(), 3);
+}
+
+#[test]
+fn drift_detects_the_silently_nulled_coercion() {
+    let spec = drift_spec(DriftPolicy::Warn);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    // `amount` starts arriving as a non-numeric string: an optional column under the
+    // lenient policy writes null and, before drift detection, said nothing at all.
+    sh.push(&json!({"id": 1, "amount": 1.5})).unwrap();
+    assert_eq!(
+        sh.push(&json!({"id": 2, "amount": "n/a"})).unwrap(),
+        PushOutcome::Appended
+    );
+    let r = sh.drift_report().unwrap();
+    let m = &r.type_mismatches["amount"];
+    assert_eq!(m.count, 1);
+    assert_eq!(m.first_record, 2);
+    assert_eq!(m.declared_type, ColumnType::Float64);
+    assert_eq!(m.examples, vec![json!("n/a")]);
+    // The cell really is null — detection reports the loss, it does not paper over it.
+    let batch = sh.flush().unwrap().unwrap();
+    let amount = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!(amount.is_null(1));
+}
+
+#[test]
+fn drift_ignores_what_a_column_already_reaches() {
+    let mut spec = drift_spec(DriftPolicy::Warn);
+    // `user` is kept whole as json, and `tags.0` indexes into the array: neither the
+    // subtree under `user` nor the rest of `tags` is a *new* field.
+    spec.columns.push(ColumnSpec {
+        name: "user".into(),
+        from: None,
+        ty: ColumnType::Json,
+        transform: None,
+        required: false,
+    });
+    spec.columns.push(ColumnSpec {
+        name: "first_tag".into(),
+        from: Some("tags.0".into()),
+        ty: ColumnType::String,
+        transform: None,
+        required: false,
+    });
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({
+        "id": 1, "amount": 1.5,
+        "user": {"name": "Ada", "plan": "pro"},
+        "tags": ["a", "b"]
+    }))
+    .unwrap();
+    assert!(sh.drift_report().unwrap().is_clean());
+}
+
+#[test]
+fn drift_ignores_nulls_and_the_ignore_policy_tracks_nothing() {
+    // A null under an undeclared path carries nothing to lose.
+    let spec = drift_spec(DriftPolicy::Warn);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5, "extra": null}))
+        .unwrap();
+    assert!(sh.drift_report().unwrap().is_clean());
+
+    // `ignore` is the opt-out: no tracker at all.
+    let spec = drift_spec(DriftPolicy::Ignore);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5, "extra": "gone"}))
+        .unwrap();
+    assert!(sh.drift_report().is_none());
+}
+
+#[test]
+fn drift_rescue_keeps_what_the_schema_would_have_dropped() {
+    let spec = drift_spec(DriftPolicy::Rescue);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    // The rescue column is appended after every declared column, so switching it on is
+    // an additive schema change.
+    assert_eq!(sh.schema().fields().len(), 3);
+    assert_eq!(sh.schema().field(2).name(), "_rescued");
+    assert!(sh.schema().field(2).is_nullable());
+
+    sh.push(&json!({"id": 1, "amount": 1.5})).unwrap();
+    sh.push(&json!({"id": 2, "amount": "n/a", "currency": "usd"}))
+        .unwrap();
+    let batch = sh.flush().unwrap().unwrap();
+    let rescued = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    // A clean row rescues nothing.
+    assert!(rescued.is_null(0));
+    // A drifted row keeps both the undeclared field and the value that would not coerce.
+    let got: serde_json::Value = serde_json::from_str(rescued.value(1)).unwrap();
+    assert_eq!(got, json!({"currency": "usd", "amount": "n/a"}));
+    assert_eq!(sh.drift_report().unwrap().rows_rescued, 1);
+}
+
+#[test]
+fn drift_quarantine_keeps_the_output_exactly_on_schema() {
+    let spec = drift_spec(DriftPolicy::Quarantine);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    assert_eq!(
+        sh.push(&json!({"id": 1, "amount": 1.5})).unwrap(),
+        PushOutcome::Appended
+    );
+    let out = sh.push(&json!({"id": 2, "amount": 2.5, "currency": "usd"}));
+    match out.unwrap() {
+        // A quarantined row is a normal reject: counted, and sidecarred for replay.
+        PushOutcome::Rejected(reason) => assert!(reason.contains("currency"), "got: {reason}"),
+        other => panic!("expected a reject, got {other:?}"),
+    }
+    assert_eq!(sh.flush().unwrap().unwrap().num_rows(), 1);
+    assert_eq!(sh.drift_report().unwrap().rows_quarantined, 1);
+}
+
+#[test]
+fn drift_error_fails_the_run_on_the_first_event() {
+    let spec = drift_spec(DriftPolicy::Error);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5})).unwrap();
+    let err = sh
+        .push(&json!({"id": 2, "amount": 2.5, "currency": "usd"}))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("schema drift"), "got: {msg}");
+    assert!(msg.contains("record 2"), "got: {msg}");
+    assert!(msg.contains("currency"), "got: {msg}");
+    // The failed record never reached the builders — the batch is still just row 1.
+    assert_eq!(sh.flush().unwrap().unwrap().num_rows(), 1);
+}
+
+#[test]
+fn drift_report_suggests_the_columns_to_add() {
+    let spec = drift_spec(DriftPolicy::Warn);
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5, "currency": "usd", "qty": 2}))
+        .unwrap();
+    let cols = sh.drift_report().unwrap().suggested_columns();
+    assert_eq!(cols.len(), 2);
+    assert_eq!(col_type(&cols, "currency"), ColumnType::String);
+    assert_eq!(col_type(&cols, "qty"), ColumnType::Int64);
+}
+
+#[test]
+fn drift_is_watched_in_strict_schema_mode_too() {
+    // `schema: strict` writes only declared columns — so a field the source grew is
+    // refused by design. Refused is not the same as *unreported*.
+    let mut spec = drift_spec(DriftPolicy::Warn);
+    spec.schema = SchemaMode::Strict;
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"id": 1, "amount": 1.5, "currency": "usd"}))
+        .unwrap();
+    assert_eq!(sh.drift_report().unwrap().new_fields["currency"].count, 1);
+}
+
+#[test]
+fn drift_watches_inferred_schemas_too() {
+    // Inference only sees the sample; a field that shows up afterwards has no column,
+    // and this is the case the whole feature exists for.
+    let mut spec = drift_spec(DriftPolicy::Warn);
+    spec.columns.clear();
+    let sample = [json!({"id": 1, "amount": 1.5})];
+    let inferred = infer_columns(sample.iter(), true);
+    let mut sh = Shaper::from_spec(&spec, &inferred).unwrap();
+    sh.push(&sample[0]).unwrap();
+    sh.push(&json!({"id": 2, "amount": 2.5, "currency": "usd"}))
+        .unwrap();
+    assert_eq!(sh.drift_report().unwrap().new_fields["currency"].count, 1);
+}
+
+#[test]
+fn drift_rescue_column_may_not_collide() {
+    let mut spec = drift_spec(DriftPolicy::Rescue);
+    spec.drift.rescue_column = "amount".into();
+    assert!(spec.validate().is_err());
+    spec.drift.rescue_column = "  ".into();
+    assert!(spec.validate().is_err());
+}
+
+#[test]
+fn drift_spec_round_trips_and_defaults_to_warn() {
+    let spec = DatasetSpec::parse(
+        "dataset: t\noutput:\n  format: parquet\n  path: t.parquet\ndrift:\n  policy: quarantine\n",
+    )
+    .unwrap();
+    assert_eq!(spec.drift.policy, DriftPolicy::Quarantine);
+    assert_eq!(spec.drift.rescue_column, "_rescued");
+    // Absent block → the safe default: detected and reported, never silent.
+    let spec =
+        DatasetSpec::parse("dataset: t\noutput:\n  format: parquet\n  path: t.parquet\n").unwrap();
+    assert_eq!(spec.drift.policy, DriftPolicy::Warn);
+    // A default block is not re-emitted, so `shapeshift infer` stays terse.
+    assert!(!spec.to_yaml().unwrap().contains("drift:"));
+}

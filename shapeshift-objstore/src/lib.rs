@@ -10,8 +10,7 @@
 //!   `iceberg_scan('s3://…')`.
 //!
 //! Both implement `shapeshift_core::Sink`, so the shaping engine is unchanged; only the
-//! destination moves. This is the first hosting primitive: everything the commercial-edition control
-//! plane lands in a bucket flows through here.
+//! destination moves.
 //!
 //! **Bounded RAM.** The Parquet is written to a local temp file first (one row group
 //! at a time, exactly like [`shapeshift_parquet::ParquetSink`]), then streamed to the
@@ -29,8 +28,8 @@
 //!
 //! Iceberg tables use **location-anchored** paths (the table's `location` and every
 //! file reference are the destination URI), so the table is valid at its bucket
-//! prefix; a REST catalog (relative-path relocation, multi-writer commits) stays an
-//! a commercial-edition concern.
+//! prefix; a REST catalog (relative-path relocation, multi-writer commits) is out of
+//! scope.
 
 use std::path::PathBuf;
 use std::sync::Arc;

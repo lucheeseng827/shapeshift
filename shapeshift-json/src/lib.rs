@@ -26,6 +26,10 @@
 
 mod error;
 mod source;
+mod tape;
 
 pub use error::JsonError;
-pub use source::{open_reader, JsonArrayReader, JsonlReader, RecordSource};
+pub use source::{
+    is_rereadable, is_stdin, open_reader, JsonArrayReader, JsonlReader, RecordSource,
+};
+pub use tape::{TapeJsonArrayReader, TapeJsonlReader, TapeRecord, TapeSource};

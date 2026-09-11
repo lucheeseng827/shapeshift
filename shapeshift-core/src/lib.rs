@@ -33,9 +33,11 @@
 //! assert!(batch.schema().column_with_name("user.name").is_some());
 //! ```
 
+mod drift;
 mod error;
 mod infer;
 mod mar;
+mod record;
 mod shaper;
 mod sink;
 mod spec;
@@ -46,6 +48,7 @@ mod value;
 #[cfg(test)]
 mod tests;
 
+pub use drift::{DriftPolicy, DriftReport, DriftSpec, NewField, TypeMismatch, MAX_TRACKED_PATHS};
 pub use error::{Result, ShapeError};
 pub use infer::{infer_columns, looks_like_date, looks_like_timestamp};
 pub use mar::{estimate as estimate_mar, MarInputs, MarReport};
@@ -63,3 +66,4 @@ pub use value::{flatten_leaves, segments, select};
 // pinning arrow themselves.
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::{Schema, SchemaRef};
+pub use record::{Kind, Record};

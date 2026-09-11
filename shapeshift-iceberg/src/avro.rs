@@ -494,7 +494,8 @@ fn skip_opt_kv_map(r: &mut Reader, value_is_bytes: bool) -> Result<()> {
         }
         let count = if n < 0 {
             let _byte_size = r.long()?;
-            n.checked_neg().ok_or_else(|| read_err("bad array block count"))?
+            n.checked_neg()
+                .ok_or_else(|| read_err("bad array block count"))?
         } else {
             n
         };
@@ -532,7 +533,7 @@ pub fn read_manifest_data_files(data: &[u8]) -> Result<Vec<ManifestDataFile>> {
             read_opt_long(&mut r)?; // snapshot_id
             read_opt_long(&mut r)?; // sequence_number
             read_opt_long(&mut r)?; // file_sequence_number
-            // data_file record
+                                    // data_file record
             let content = r.int()?;
             let file_path = r.string()?;
             let _file_format = r.string()?;

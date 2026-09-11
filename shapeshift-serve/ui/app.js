@@ -2,7 +2,7 @@
  *
  * Vanilla ES2020, no framework, no bundler, no dependency. Talks to the same-origin
  * JSON API (/api/*) the hand-rolled Rust server exposes. Kept lean on purpose: this
- * is the OSS shaper's console, not the ee control plane. */
+ * is a shaper console, not a control plane. */
 
 "use strict";
 
@@ -127,6 +127,7 @@ async function doShape() {
       dataset: $("out-dataset").value,
       partition_by: partitionList(),
       append: $("out-append").checked,
+      on_drift: $("out-drift").value,
     });
     renderShape(res);
     toast(`Shaped ${fmtNum(res.rows_out)} rows → ${baseName(res.output_path)}`, "ok");
@@ -195,7 +196,44 @@ function renderShape(res) {
     rejects = `<div><div class="section-title">Rejected rows</div><div class="rejects">${rows}</div>${more}</div>`;
   }
 
-  $("shape-result").innerHTML = stats + pipeline + output + rejects;
+  let drift = "";
+  if (res.drift) {
+    const d = res.drift;
+    const row = (r) => {
+      const what = r.declared_type
+        ? `column <code>${esc(r.path)}</code> (${esc(r.declared_type)}) → now looks like ${esc(r.suggested_type)}`
+        : `new field <code>${esc(r.path)}</code> → suggest ${esc(r.suggested_type)}`;
+      // Absent means "no example was kept" — a JSON null would be a real observed
+      // value, so only `undefined` is suppressed.
+      const eg = r.example === undefined
+        ? "" : ` · e.g. ${esc(JSON.stringify(r.example))}`;
+      return `<div class="reject"><div class="rh"><span class="rl">${fmtNum(r.count)} row(s)</span><span class="re">first at record ${fmtNum(r.first_record)}</span></div><div class="rr">${what}${eg}</div></div>`;
+    };
+    const rows = [...d.new_fields, ...d.type_mismatches].map(row).join("");
+    const shown = d.new_fields.length + d.type_mismatches.length;
+    const total = d.new_fields_total + d.type_mismatches_total;
+    // When the engine hit its path cap, `total` is what was tracked — not what drifted.
+    const capped = d.truncated
+      ? " The run hit its tracked-path cap, so further paths were not counted at all."
+      : "";
+    const more = (total > shown || d.truncated)
+      ? `<div class="note" style="font-size:11.5px;color:var(--eg-faint);margin-top:6px">Showing ${shown} of ${fmtNum(total)} ${d.truncated ? "tracked" : "drifted"} paths.${capped}</div>` : "";
+    // What the policy actually did to the rows, so a drift report is never mistaken
+    // for "rows were dropped".
+    const did = d.policy === "quarantine"
+      ? `${fmtNum(d.rows_quarantined)} row(s) quarantined — not written`
+      : d.policy === "rescue"
+        ? `${fmtNum(d.rows_rescued)} row(s) rescued into the catch-all column`
+        : "every row was written as-is; nothing was dropped for drift";
+    const suggest = d.suggested_columns_yaml
+      ? `<div class="note" style="margin-top:8px">Add to the spec's <code>columns:</code></div><pre class="codeline" style="white-space:pre-wrap;margin-top:6px">${esc(d.suggested_columns_yaml)}</pre>`
+      : "";
+    drift = `<div><div class="section-title">Schema drift <span class="badge warn">policy: ${esc(d.policy)}</span></div>
+      <div class="note" style="font-size:11.5px;color:var(--eg-faint);margin-bottom:6px">${fmtNum(d.rows_with_drift)} of ${fmtNum(d.rows_scanned)} rows drifted · ${did}</div>
+      <div class="rejects">${rows}</div>${more}${suggest}</div>`;
+  }
+
+  $("shape-result").innerHTML = stats + pipeline + output + drift + rejects;
   const ob = $("btn-inspect-out");
   if (ob) ob.addEventListener("click", () => { $("inspect-path").value = res.output_path; showView("inspect"); doInspect(); });
 }

@@ -75,7 +75,7 @@ options:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `format` | `jsonl` \| `json-array` | `jsonl` | `jsonl` = one JSON object per line (streaming, bounded RAM, blank lines skipped, a bad line is counted and its raw text preserved). `json-array` = a single top-level JSON array, **streamed element-at-a-time** (bounded RAM; an invalid/oversized element is counted and its raw bytes preserved, with the 1-based element index reported as the reject's `line`; structural problems — not an array, truncated array, trailing comma/garbage — are reported once). |
-| `path` | string | *(none)* | Optional input path. The CLI `-i/--input` flag overrides it; when both are absent the input comes from the command line / stdin. |
+| `path` | string | *(none)* | Optional input path. The CLI `-i/--input` flag overrides it. Use `-` for standard input, so a shape composes in a pipeline (`producer \| shapeshift shape -i - -o out.parquet`); the source is read once, so a pipe shapes exactly what a file would. |
 
 ### 2.3 `OutputSpec`
 
@@ -442,7 +442,7 @@ table directory).
   written). A moved or copied table is still **readable** via DuckDB's
   `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
   tables); **catalog-managed** relocation (re-anchoring paths so any engine reads with no flag, plus
-  multi-writer commits) is the commercial-edition REST catalog.
+  multi-writer commits) is left to an external Iceberg REST catalog.
 
 ---
 
