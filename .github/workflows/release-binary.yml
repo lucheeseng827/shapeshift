@@ -1,0 +1,101 @@
+# Build the static `shapeshift` CLI for x86_64-unknown-linux-musl and attach it,
+# with its SHA-256, to the GitHub Release for the tag.
+#
+# The default build is Snappy-only and pure Rust (the `snap` and simd-json stacks
+# have no C; the cloud SDKs and the zstd C codec are off-by-default features), so it
+# links against rustup's self-contained musl with no system toolchain: one
+# relocatable file, no runtime dependencies. The opt-in fat builds (`object_store`,
+# `zstd`) stay build-from-source.
+#
+# Fires on the `vX.Y.Z` tag every release carries, and builds exactly that tag. The
+# Release normally exists already; if it does not (a tag pushed by hand), this
+# creates it. A manual run rebuilds a given tag and replaces its assets.
+
+name: Publish release binary
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.2.0)"
+        required: true
+
+concurrency:
+  group: release-binary-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the release + upload assets
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  binary:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve tag and version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then TAG="$INPUT_TAG"; else TAG="$GITHUB_REF_NAME"; fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::not a release tag: '$TAG'"; exit 1
+          fi
+          { echo "tag=$TAG"; echo "version=${TAG#v}"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.ver.outputs.tag }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Assert the tag matches the workspace version
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # [workspace.package].version is the source of truth; a tag that disagrees
+          # ships a binary whose --version contradicts its release. Fail closed.
+          WS="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ "$WS" = "$V" ] || { echo "::error::tag version '$V' != workspace version '$WS'"; exit 1; }
+
+      - name: Build static musl binary (default features — Snappy-only, C-free)
+        run: cargo build -p shapeshift-cli --release --target "$TARGET" --locked
+
+      - name: Verify the binary is static and boots
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/release/shapeshift"
+          file "$BIN"
+          # "Needs no dynamic loader" is the ABSENCE of a program interpreter segment.
+          # ldd and file(1) are unreliable on static-PIE binaries; readelf is not.
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "::error::binary has a program interpreter — it is not static"; exit 1
+          fi
+          "$BIN" --help >/dev/null
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT="shapeshift-$V-$TARGET"
+          cp "target/$TARGET/release/shapeshift" "$OUT"
+          sha256sum "$OUT" > "$OUT.sha256"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "shapeshift $TAG" \
+              --notes "Release $TAG."
+          # --clobber so a manual re-run replaces the assets rather than failing.
+          gh release upload "$TAG" "$OUT" "$OUT.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Attached $OUT (+ .sha256) to $TAG. Verify with: sha256sum -c $OUT.sha256" >> "$GITHUB_STEP_SUMMARY"
