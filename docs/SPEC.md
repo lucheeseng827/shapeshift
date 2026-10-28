@@ -42,6 +42,7 @@ output:                            # required
   path: <output path>              # required
   compression: snappy | zstd | uncompressed   # default snappy
   partition_by: [<col> | <transform(col)>, ...]  # default [] (Iceberg; identity or bucket|truncate|year|month|day|hour)
+  merge_on: [<col>, ...]           # default [] (Iceberg; upsert on these key columns)
 schema: infer | strict             # default infer
 columns:                           # default [] (all inferred)
   - name: <col>
@@ -85,6 +86,7 @@ options:
 | `path` | string | — (required) | Destination. For `parquet`: a file path, or a directory (then `<path>/<dataset>.parquet` is written). For `iceberg`: the table root directory (created if absent). |
 | `compression` | `snappy` \| `zstd` \| `uncompressed` | `snappy` | Parquet page compression. **`zstd` needs the opt-in fat build** (`--features zstd`); the default musl-static binary has no C codecs, so selecting it there returns a clear error — use `snappy`/`uncompressed` or rebuild with the feature. |
 | `partition_by` | list of string | `[]` | Partition fields (Iceberg output). Each entry is a column name (**identity**) or a **hidden-transform expression**: `bucket(N, col)` (spec-exact Murmur3; long/string/date/timestamp), `truncate(W, col)` (long/string), `year(col)`/`month(col)`/`day(col)` (date/timestamp), `hour(col)` (timestamp). When columns are declared, every *source* column must be declared (§9); in `infer` mode it resolves against the inferred schema. **Applied:** the table's partition spec records the real transform strings and rows fan out to one data file per **transformed** value under Hive-style directories (temporal segments human-readable, e.g. `data/event_at_day=2026-01-01/`). Ignored for `parquet` output (a single file is still written). |
+| `merge_on` | list of string | `[]` | Iceberg only: **upsert** on these key columns instead of appending. Each written row replaces any row already in the table with the same key (every key column equal); a key the input carries more than once keeps its **last** occurrence; a row with a null in any key column is appended and matches nothing. Creates the table if there is none. Key columns may be `int64`, `string`, `json`, `date`, `timestamp`, or `bool` — `float64` is refused. Rows are removed with Iceberg v2 position deletes (merge-on-read). Works on a local table and, in a build with the `object_store` feature, an object-store `output.path`. `--merge-on` overrides it. |
 
 ### 2.4 `ColumnSpec`
 
@@ -266,6 +268,9 @@ there first). The structural checks and their messages:
 | `schema: strict` with no `columns` | `strict schema mode requires at least one declared column` |
 | Two columns share a `name` | `` duplicate column name `<name>` `` |
 | `partition_by` names a column not in `columns` (declared/`strict` mode only) | `` partition column `<name>` is not a declared column (declare it to partition by it) `` |
+| `merge_on` with `format: parquet` | `` `output.merge_on` applies only to Iceberg tables (`format: iceberg`) `` |
+| `merge_on` names a column twice | `` `output.merge_on` names `<name>` twice `` |
+| `merge_on` names a column not in `columns` (`strict` mode only) | `` merge key `<name>` is not a declared column (declare it to merge on it) `` |
 
 When columns are declared, a partition column must be among them so Iceberg has a stable field-id
 for it. In `infer` mode there are no declared columns; the check is deferred and the sink resolves
@@ -312,6 +317,8 @@ spec field for a single run without editing the file:
 - `-o/--output` overrides `output.path`; `--to` overrides `output.format`; `--compression`
   overrides `output.compression`.
 - `--dataset` overrides `dataset`.
+- `--partition-by` overrides `output.partition_by`; `--merge-on` overrides `output.merge_on`
+  (comma-separate a composite key).
 
 With no `-s/--spec`, `shape` infers a spec on the fly (then `--input` and `--output` are required),
 which is equivalent to running `infer` and immediately shaping with the result.
@@ -443,6 +450,9 @@ table directory).
   `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
   tables); **catalog-managed** relocation (re-anchoring paths so any engine reads with no flag, plus
   multi-writer commits) is left to an external Iceberg REST catalog.
+- `merge_on` is single-writer like `--append`, and leaves position-delete files in place until a
+  compaction command exists. A key column's type is checked when the schema is known (at write time in
+  `infer` mode).
 
 ---
 

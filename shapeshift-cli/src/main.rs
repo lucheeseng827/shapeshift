@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use shapeshift_core::{
     estimate_mar, infer_columns, ColumnSpec, Compression, DatasetSpec, DriftPolicy, DriftReport,
-    MarInputs, OutputFormat, OutputSpec, PushOutcome, Record, RecordBatch, SchemaMode, Shaper,
-    Sink, SinkSummary, SourceFormat, SourceSpec,
+    MarInputs, MergeSummary, OutputFormat, OutputSpec, PushOutcome, Record, RecordBatch,
+    SchemaMode, Shaper, Sink, SinkSummary, SourceFormat, SourceSpec,
 };
 use shapeshift_iceberg::IcebergSink;
 use shapeshift_json::{
@@ -169,6 +169,13 @@ struct ShapeArgs {
     /// low-cardinality transforms.
     #[arg(long)]
     partition_by: Vec<String>,
+    /// Merge (upsert) on these key columns instead of appending (overrides the spec's
+    /// `merge_on`): each row replaces any row already in the table with the same key, and
+    /// a key repeated in the input keeps its last occurrence. Creates the table if there
+    /// is none. Comma-separate a composite key or repeat the flag. Iceberg only (a local
+    /// table, or an object-store URL in a build with the `object_store` feature).
+    #[arg(long, value_delimiter = ',')]
+    merge_on: Vec<String>,
     /// What to do when the source's shape outgrows the schema (overrides the spec's
     /// `drift.policy`): `ignore` (no detection), `warn` (default — count and report
     /// what the schema drops), `rescue` (keep the dropped values in a json catch-all
@@ -768,6 +775,7 @@ fn cmd_infer(a: InferArgs) -> Result<()> {
             path: format!("{dataset}.parquet"),
             compression: Compression::Snappy,
             partition_by: Vec::new(),
+            merge_on: Vec::new(),
         },
         schema: SchemaMode::Infer,
         columns,
@@ -849,6 +857,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                     path: output,
                     compression: a.compression.map(Into::into).unwrap_or(Compression::Snappy),
                     partition_by: Vec::new(),
+                    merge_on: Vec::new(),
                 },
                 schema: SchemaMode::Infer,
                 columns: Vec::new(),
@@ -878,6 +887,9 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             .flat_map(|s| split_partition_entries(s))
             .collect();
     }
+    if !a.merge_on.is_empty() {
+        spec.output.merge_on = a.merge_on.iter().map(|k| k.trim().to_string()).collect();
+    }
     if let Some(p) = a.on_drift {
         spec.drift.policy = p.into();
     }
@@ -900,6 +912,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     if a.append && spec.output.format != OutputFormat::Iceberg {
         bail!("--append applies only to Iceberg tables (--to iceberg)");
     }
+    let merging = !spec.output.merge_on.is_empty();
 
     // 4. Build the shaper (inferring in Infer mode). The source is opened **once**:
     // inference reads the head and hands back a reader that still yields every record,
@@ -939,18 +952,29 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 spec.output.compression,
                 a.append,
                 &spec.output.partition_by,
+                &spec.output.merge_on,
             )?;
             (s, PathBuf::from(&spec.output.path))
         }
         OutputFormat::Iceberg => {
             let dir = PathBuf::from(&spec.output.path);
-            let s = IcebergSink::create(
-                &dir,
-                schema.clone(),
-                spec.output.compression,
-                a.append,
-                &spec.output.partition_by,
-            )
+            let s = if merging {
+                IcebergSink::create_merge(
+                    &dir,
+                    schema.clone(),
+                    spec.output.compression,
+                    &spec.output.partition_by,
+                    &spec.output.merge_on,
+                )
+            } else {
+                IcebergSink::create(
+                    &dir,
+                    schema.clone(),
+                    spec.output.compression,
+                    a.append,
+                    &spec.output.partition_by,
+                )
+            }
             .map_err(|e| anyhow!("{e}"))?;
             (Box::new(s), dir)
         }
@@ -1079,6 +1103,9 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             println!("iceberg table metadata → {}", meta.display());
         }
     }
+    if let Some(m) = &summary.merge {
+        print_merge(m);
+    }
     if let Some(report) = shaper.into_drift_report() {
         if !report.is_clean() {
             print_drift(&report);
@@ -1087,6 +1114,35 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Summarize a merge: what the key matched, what it replaced, and what it cost to find.
+fn print_merge(m: &MergeSummary) {
+    println!(
+        "merged on ({}): {} key(s) — {} updated, {} inserted; {} prior row(s) replaced",
+        m.key_columns.join(", "),
+        m.distinct_keys,
+        m.keys_updated,
+        m.keys_inserted,
+        m.prior_rows_replaced
+    );
+    if m.duplicates_in_input > 0 {
+        println!(
+            "  {} earlier occurrence(s) of a repeated key in the input were dropped (the last one wins)",
+            m.duplicates_in_input
+        );
+    }
+    if m.null_key_rows > 0 {
+        println!(
+            "  warning: {} row(s) have a null key — appended, but they match nothing and can \
+             never be updated by a later merge",
+            m.null_key_rows
+        );
+    }
+    println!(
+        "  scanned {} data file(s), pruned {} by key bounds; {} position delete(s) in {} delete file(s)",
+        m.data_files_scanned, m.data_files_pruned, m.position_deletes, m.delete_files
+    );
 }
 
 /// Lines shown for individual drifted paths before the rest is left to the sidecar.
@@ -1241,8 +1297,9 @@ fn objstore_parquet_sink(
     )
 }
 
-/// Build an object-store Iceberg sink for a URL `--output` (the table location).
-/// Feature-gated like the Parquet variant, so the default binary links no cloud SDKs.
+/// Build an object-store Iceberg sink for a URL `--output` (the table location) — a
+/// merge when `merge_on` names key columns. Feature-gated like the Parquet variant, so the
+/// default binary links no cloud SDKs.
 #[cfg(feature = "object_store")]
 fn objstore_iceberg_sink(
     url: &str,
@@ -1250,14 +1307,14 @@ fn objstore_iceberg_sink(
     compression: Compression,
     append: bool,
     partition_by: &[String],
+    merge_on: &[String],
 ) -> Result<Box<dyn Sink + Send>> {
-    let s = shapeshift_objstore::ObjectStoreIcebergSink::create(
-        url,
-        schema,
-        compression,
-        append,
-        partition_by,
-    )
+    use shapeshift_objstore::ObjectStoreIcebergSink;
+    let s = if merge_on.is_empty() {
+        ObjectStoreIcebergSink::create(url, schema, compression, append, partition_by)
+    } else {
+        ObjectStoreIcebergSink::create_merge(url, schema, compression, partition_by, merge_on)
+    }
     .map_err(|e| anyhow!("{e}"))?;
     Ok(Box::new(s))
 }
@@ -1269,6 +1326,7 @@ fn objstore_iceberg_sink(
     _compression: Compression,
     _append: bool,
     _partition_by: &[String],
+    _merge_on: &[String],
 ) -> Result<Box<dyn Sink + Send>> {
     bail!(
         "object-store Iceberg output ({url}) needs a build with `--features object_store` \
@@ -1306,7 +1364,16 @@ fn print_iceberg_info(label: &str, info: &shapeshift_iceberg::IcebergInfo) {
     println!("  format-version: {}", info.format_version);
     println!("  table-uuid: {}", info.table_uuid);
     println!("  current-snapshot-id: {}", info.current_snapshot_id);
-    println!("  total-records: {}", info.total_records);
+    if info.total_position_deletes > 0 {
+        println!(
+            "  live-records: {} ({} written, {} removed by position deletes)",
+            info.live_records(),
+            info.total_records,
+            info.total_position_deletes
+        );
+    } else {
+        println!("  total-records: {}", info.total_records);
+    }
     println!("  columns ({}):", info.fields.len());
     for (n, t) in &info.fields {
         println!("    {n}: {t}");

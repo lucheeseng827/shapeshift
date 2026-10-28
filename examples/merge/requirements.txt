@@ -1,0 +1,5 @@
+# Python dependencies of verify_duckdb.py, pinned so a CI run is reproducible.
+duckdb==2.0.0
+# Only for `--tables s3://…` against a local S3-compatible server:
+moto[server]==5.2.4
+boto3==1.43.119

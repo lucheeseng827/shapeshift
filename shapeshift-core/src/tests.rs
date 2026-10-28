@@ -344,6 +344,7 @@ fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
             path: "t.parquet".into(),
             compression: Compression::Snappy,
             partition_by: Vec::new(),
+            merge_on: Vec::new(),
         },
         schema: SchemaMode::Infer,
         columns: vec![

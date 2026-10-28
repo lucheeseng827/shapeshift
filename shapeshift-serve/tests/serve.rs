@@ -168,5 +168,34 @@ fn full_console_flow_over_tcp() {
     assert_eq!(v["kind"], "parquet");
     assert_eq!(v["rows"], 2);
 
+    // A spec with `output.merge_on` upserts: the second run replaces id 2 and keeps
+    // id 1, rather than clearing the table the first run wrote.
+    let merge_spec = "dataset: m\noutput:\n  format: iceberg\n  path: m\n  merge_on: [id]\n\
+                      schema: strict\ncolumns:\n- name: id\n  type: int64\n\
+                      - name: status\n  type: string\n";
+    for input in [
+        "{\"id\":1,\"status\":\"new\"}\n{\"id\":2,\"status\":\"new\"}",
+        "{\"id\":2,\"status\":\"paid\"}\n{\"id\":3,\"status\":\"new\"}",
+    ] {
+        let merge_body = serde_json::json!({
+            "input": input, "spec_yaml": merge_spec,
+            "format": "jsonl", "to": "iceberg", "compression": "snappy", "dataset": "m"
+        });
+        let (s, body) = request(port, "POST", "/api/shape", Some(&merge_body.to_string()));
+        assert_eq!(s, 200, "merge shape: {body}");
+    }
+    let (s, body) = request(
+        port,
+        "POST",
+        "/api/inspect",
+        Some(r#"{"path":"outputs/m"}"#),
+    );
+    assert_eq!(s, 200, "inspect: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["kind"], "iceberg");
+    assert_eq!(v["total_records"], 4, "inspect body: {body}");
+    assert_eq!(v["position_deletes"], 1, "inspect body: {body}");
+    assert_eq!(v["live_records"], 3, "inspect body: {body}");
+
     let _ = std::fs::remove_dir_all(&data_dir);
 }

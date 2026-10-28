@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1979,11 +1979,12 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-iceberg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "bytes",
  "parquet",
  "serde_json",
  "shapeshift-core",
@@ -1993,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-json"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "shapeshift-core",
@@ -2004,9 +2005,10 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-objstore"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
+ "bytes",
  "object_store",
  "parquet",
  "serde_json",
@@ -2021,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-parquet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2034,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "shapeshift-serve"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",

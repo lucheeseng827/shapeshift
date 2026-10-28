@@ -53,7 +53,7 @@ pub use error::{Result, ShapeError};
 pub use infer::{infer_columns, looks_like_date, looks_like_timestamp};
 pub use mar::{estimate as estimate_mar, MarInputs, MarReport};
 pub use shaper::{effective_columns, run_pipeline, PushOutcome, RunReport, Shaper};
-pub use sink::{Sink, SinkSummary};
+pub use sink::{MergeSummary, Sink, SinkSummary};
 pub use spec::{
     partition_source_column, ColumnSpec, Compression, DatasetSpec, Options, OutputFormat,
     OutputSpec, SchemaMode, SourceFormat, SourceSpec,

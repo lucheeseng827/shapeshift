@@ -15,6 +15,10 @@ this is the engine (Apache-2.0), running entirely on your own machine.
 > **streaming systems** (Kafka/Redpanda) and **databases** (Postgres) as source *and*
 > sink — plus a local `docker compose` stack to run them on your laptop.
 
+> **Source with updates?** See [`merge/`](./merge/README.md): `--merge-on` upserts a
+> delta into an Iceberg table by key (one row per key, not per version), plus a script
+> that model-checks it against DuckDB.
+
 ## The fixtures
 
 ### `events.jsonl` — 5 lines, one deliberately broken

@@ -112,8 +112,8 @@ Same-origin JSON, wrapping the OSS engine one-to-one:
 |---|---|
 | `GET /api/health` | liveness + version + data dir |
 | `POST /api/infer` | sample records → an editable `DatasetSpec` (YAML) |
-| `POST /api/shape` | records + spec → run report, output path, reject sample, drift report (`on_drift` picks the policy) |
-| `POST /api/inspect` | a path → Parquet / Iceberg schema + row count |
+| `POST /api/shape` | records + spec → run report, output path, reject sample, drift report (`on_drift` picks the policy); a spec's `output.merge_on` upserts into the table |
+| `POST /api/inspect` | a path → Parquet / Iceberg schema + row count (an Iceberg table's live rows after position deletes, too) |
 | `POST /api/cost` | rows + prices → the MAR vendor-vs-self-host comparison |
 
 ## License

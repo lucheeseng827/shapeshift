@@ -33,9 +33,10 @@ presented as a promise for another; run the harness yourself to compare.
 | **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; a REST catalog is out of scope |
 | **3 — Reach & format coverage** | Object-store output, optional zstd fat build, streaming json-array, a real benchmark suite | ✅ **shipped** — object-store output (Parquet _and_ Iceberg), the zstd fat build (`--features zstd`), streaming json-array, and the measured benchmark suite ([`benchmarks/`](./benchmarks/)) |
 | **4 — Trustworthy against a moving source** | Schema drift detection and mitigation: what the schema silently dropped, and five policies for what to do about it | ✅ **shipped** — `drift.policy` (`ignore`/`warn`/`rescue`/`quarantine`/`error`), a per-path report with the columns to add, measured at ~6% on a clean run |
+| **5 — Row-level writes** | Upsert on a key, then the hygiene and reach that make it production-grade: compaction, object-store merge, change-feed deletes | 🟡 **in progress (0.3)** — `--merge-on` upsert into local **and object-store** tables is in the tree, DuckDB-verified (over S3 too); compaction and change-feed deletes are next |
 
 Phases 2, 3, and 4 are independent of each other and can interleave — each only depends on the v0.1
-core.
+core. Phase 5 builds on Phase 2's multi-snapshot write path.
 
 ---
 
@@ -267,6 +268,45 @@ the engine growing any state.
       scheduled: an orchestrator's job ([ARCHITECTURE §14](./ARCHITECTURE.md)), listed in the
       out-of-scope section below.
 
+## Phase 5 — Row-level writes *(in progress, 0.3)*
+
+Append-only is the honest limit that matters most for a shaper aimed at per-row billing: the data a
+MAR bill punishes is *update-heavy*, and appending it leaves one row per version instead of one per
+key. Phase 5 makes the table hold the latest row per key — without the engine growing any state
+between runs (each merge reads what it needs from the table itself).
+
+- [x] **Upsert on a key** — `shape --merge-on <cols>` / `output.merge_on`. Merge-on-read: the delta
+      is appended, and the rows it supersedes are removed with Iceberg v2 **position deletes** (one
+      `(file_path, pos)` Parquet file per partition, in a delete manifest); no data file is rewritten.
+      Last occurrence wins within a write; a null key matches nothing; composite keys; keys may move
+      between partitions; additive schema evolution composes. Finding superseded rows reads only the
+      key columns of existing files, and files whose manifest key bounds rule out every incoming key
+      are never opened. A row an earlier merge deleted is not deleted twice, so
+      `total-position-deletes` and `inspect`'s `live-records` stay exact.
+- [x] **Verified against DuckDB 2.0** by a randomized model-check
+      ([`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py)): six scenarios, every
+      merge compared with a plain-Python model of the semantics, every snapshot time-travelled, and a
+      negative control that must fail. Measured in [BENCHMARKS.md §7](./BENCHMARKS.md).
+- [x] **Manifests read against their own schema** — the reader decodes each manifest with the Avro
+      schema in its header, so partitioned tables' partition tuples (which a merge must reproduce
+      exactly — a delete in the wrong partition is silently never applied) read correctly for any
+      spec.
+- [x] **Object-store merge** — the same merge for an `s3://` / `gs://` / `az://` table. Every read
+      of the existing table goes through one seam, so local and object-store merges run the same
+      code; a data file the merge must scan costs one `HEAD`, a footer `GET`, and one ranged `GET`
+      per row group for the key columns' chunks. Verified over the S3 protocol against an
+      S3-compatible server, with DuckDB reading back through `httpfs`.
+- [ ] **Compaction** — `shapeshift compact`: rewrite data files that carry deletes (and merge small
+      files) in one `replace` snapshot, so read cost stops growing with every merge. Plus snapshot
+      expiry: today every write keeps the whole history.
+- [ ] **A commit guard** — refuse to publish `v{N+1}.metadata.json` if another writer got there
+      first, so two concurrent writers fail loudly instead of one silently losing.
+- [ ] **Change-feed deletes** — a spec predicate that marks a row as a delete (`op: d` in a CDC
+      envelope), so one merge applies inserts, updates, and deletes.
+- [ ] **Writing into tables other engines created** — compressed (`deflate`) manifests and a
+      schema-driven manifest-list reader, so `--append` / `--merge-on` work on a table Spark,
+      PyIceberg, or DuckDB made.
+
 ---
 
 ## Out of scope (by design)
@@ -278,8 +318,9 @@ it prints ([ARCHITECTURE §14](./ARCHITECTURE.md)).
 
 - **Scheduling** — run a spec on a cadence or trigger. Compose shapeshift as a step under an
   orchestrator (such as **dagron**) rather than growing a scheduler inside the engine.
-- **Incremental / CDC shaping** — shape only the rows changed since the last run (watermarks, change
-  feeds). The engine stays a stateless, whole-source shaper; the
+- **Incremental / CDC capture** — deciding *which* rows changed since the last run (watermarks,
+  change-feed offsets) is state the engine does not keep. What it does do is apply a delta it is
+  handed: `--merge-on` upserts it by key ([Phase 5](#phase-5--row-level-writes-in-progress-03)). The
   [catalog demos](./examples/catalog-demos/README.md) show watermark and CDC patterns built around it.
 - **Connectors** — source/sink connectors (databases, SaaS APIs) feeding the engine. Kept out of its
   dependency graph entirely.

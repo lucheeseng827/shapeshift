@@ -259,6 +259,59 @@ flushed before the drift. The written-but-unreferenced bytes stay on disk as lef
 Detection costs about **6% of wall time** on a clean 1M-row run and leaves peak RSS unchanged
 ([BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)) — `--on-drift ignore` buys it back.
 
+## Upsert — merge on a key
+
+A source with updates — a nightly snapshot of an orders table, a change feed reshaped to JSONL —
+carries the same key again and again. Appending it leaves one row per *version*; `--merge-on`
+leaves one per *key*:
+
+```console
+$ shapeshift shape -i day1.jsonl -o orders --to iceberg --merge-on id
+merged on (id): 3 key(s) — 0 updated, 3 inserted; 0 prior row(s) replaced
+
+$ shapeshift shape -i day2.jsonl -o orders --to iceberg --merge-on id
+merged on (id): 2 key(s) — 1 updated, 1 inserted; 1 prior row(s) replaced
+  1 earlier occurrence(s) of a repeated key in the input were dropped (the last one wins)
+  warning: 1 row(s) have a null key — appended, but they match nothing and can never be updated by a later merge
+  scanned 1 data file(s), pruned 0 by key bounds; 2 position delete(s) in 1 delete file(s)
+
+$ shapeshift inspect orders | grep records
+  live-records: 5 (7 written, 2 removed by position deletes)
+```
+
+- **The last occurrence wins.** A row replaces any row already in the table with the same key, and
+  a key the input carries twice keeps its later row.
+- **A null key matches nothing** (as in SQL `MERGE`): the row is appended, counted, and warned about.
+- **Composite keys** — `--merge-on region,id` — match on every column. Key columns may be `int64`,
+  `string`, `date`, `timestamp`, or `bool`; a `float64` key is refused (a float is not a reliable
+  key). In a spec, it is `output.merge_on: [id]`.
+- The merge **creates the table** if there is none, works across **partitions** (a key may move to
+  another partition and its old row is still removed), and accepts **additive schema evolution**
+  like `--append`.
+
+How it works: the delta is appended as new data files, and every row it supersedes is removed with
+an Iceberg v2 **position delete** — a small `(file_path, pos)` Parquet file per partition that lost
+rows. No existing data file is rewritten. To find the superseded rows the merge reads only the key
+columns of existing files, and skips any file whose manifest key bounds rule out every incoming
+key. Every Iceberg v2 reader applies the deletes; this is verified against DuckDB 2.0's
+`iceberg_scan` by a randomized model-check,
+[`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py).
+
+Measured on one machine ([BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)): merging
+100,000 rows (50,000 of them updates) into a 1M-row table takes **0.37 s** against **0.14 s** to
+append them; when the updates touch only recent keys, files holding older keys are pruned.
+Memory grows with the **delta**, not the table: unlike an append, a merge holds an entry per distinct
+key in the delta and every position it deletes, one per earlier repeat of a key in the input among
+them (33 MiB peak for 100,000 keys, against 14 MiB for the append). It also loads the positions
+earlier merges deleted, which pile up until a compaction exists.
+
+It works the same on an **object-store table** (`-o s3://bucket/db/orders`, in a build with
+`--features object_store`): the existing table is read with ranged GETs — for each data file the
+merge must scan, its footer and then, per row group, its key columns' chunks only.
+
+Limits, stated plainly: one writer at a time, like `--append`; and delete files accumulate until a
+compaction command exists — `inspect` shows how many rows they hide.
+
 ## Prove the MAR savings
 
 `shapeshift cost` turns a row count into the vendor-vs-self-host comparison. It **never guesses a
@@ -348,7 +401,7 @@ fn main() -> shapeshift_core::Result<()> {
 | `shapeshift-core` | The engine, **no I/O backend deps**: the dataset transform Spec model, JSON schema inference, the named `Transform` library, the `Shaper` (JSON value → Arrow `RecordBatch`), the `Sink` trait, and the MAR cost arithmetic. |
 | `shapeshift-json` | Streaming JSON source on the **simd-json** SIMD lexer. `TapeJsonlReader` and `TapeJsonArrayReader` parse each record onto a **reusable tape** — a flat node buffer whose strings point back into the read buffer — so a record costs no allocation, whichever framing produced it; both reach the shape loop through one `TapeSource`. `JsonlReader` and `JsonArrayReader` (**streamed** — a depth/string-aware scanner yields one element at a time) supply the `serde_json::Value` model for anything that must *keep* a record, such as schema inference over the sample. All bounded-RAM, all preserving the raw bad record on a parse error. |
 | `shapeshift-parquet` | `ParquetSink` (Arrow → Parquet, one row group flushed per batch; Snappy default) + `inspect()` read-back. |
-| `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), per-column statistics, and identity partitioning (`--partition-by`) + `inspect()`. Exposes a backend-agnostic table builder the object-store sink reuses. |
+| `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), **upsert** (`--merge-on`, position deletes), per-column statistics, and identity + hidden partitioning (`--partition-by`) + `inspect()`. Reads manifests against the schema each one carries. Exposes a backend-agnostic table builder the object-store sink reuses. |
 | `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table in S3 / GCS / Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. Opt-in behind the CLI's `object_store` feature, so the default musl-static binary links no cloud SDKs. |
 | `shapeshift-serve` | `shapeshift serve` — a local web console over the shaper (infer · shape · inspect · cost). The HTTP server is **hand-rolled on `std::net`** (no async runtime, no web framework) and the UI is embedded static files, so it stays a single static binary. Opt-in behind the CLI's `serve` feature; the default binary is unchanged. |
 | `shapeshift-cli` | The single `shapeshift` binary. |
@@ -495,7 +548,8 @@ attributes Iceberg readers need are preserved. See [ARCHITECTURE.md](./ARCHITECT
 - **Not an orchestrator or scheduler.** There is no DAG, no cron, no dependency graph — that is an
   orchestrator's job (such as **dagron**). shapeshift runs one shape and exits.
 - **Not a connector catalog.** It does not reach into SaaS APIs or databases; it shapes JSON/JSONL you
-  already have. Connectors and incremental/CDC capture are out of scope.
+  already have. Connectors and CDC *capture* are out of scope — though it can upsert a delta you hand
+  it (`--merge-on`).
 - **Not a query engine.** It *writes* Parquet and Iceberg for DuckDB, Spark, Trino, and friends to
   read; it does not run SQL over them.
 
@@ -504,9 +558,9 @@ it does that one job completely.
 
 ## Status
 
-> **v0.1.** The full loop — infer → shape → Parquet **and** Iceberg v2 — runs end-to-end and both
+> **v0.2.0.** The full loop — infer → shape → Parquet **and** Iceberg v2 — runs end-to-end and both
 > outputs are DuckDB-verified (`read_parquet` and `iceberg_scan`, identical rows and aggregates). It is
-> ~9,600 Rust LOC across the 6 core crates (plus the opt-in `serve` console) with **91 tests passing** (88 `#[test]` + 3 doctests); `cargo clippy
+> ~11,400 Rust LOC across the 6 core crates (plus the opt-in `serve` console) with **98 tests passing** (95 `#[test]` + 3 doctests); `cargo clippy
 > --workspace --all-targets -- -D warnings` and `cargo fmt --check` are both clean.
 
 ### Done
@@ -520,6 +574,9 @@ it does that one job completely.
 - [x] `shapeshift cost` — honest MAR comparison you price yourself (negative when it doesn't amortize).
 - [x] `shapeshift inspect` — auto-detects a Parquet file or an Iceberg table dir.
 - [x] Parse-error **reject sidecar** (`<output>.rejects.jsonl`); the run never aborts on a bad line.
+- [x] **Upsert** (`--merge-on`, unreleased — lands in 0.3): replace rows by key with Iceberg v2
+      position deletes; last occurrence wins; key-bound file pruning; DuckDB-verified by a
+      randomized model-check.
 - [x] **Schema drift detection & mitigation** — undeclared fields and silently-nulled coercions are
       counted, reported (`<output>.drift.json`, with the column declarations that would keep them),
       and handled by policy: `warn` (default), `rescue`, `quarantine`, `error`, or `ignore`.
@@ -539,7 +596,7 @@ it does that one job completely.
       rows/s on both output paths, 4 ms cold start.
       See [BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured).
 
-### v0.1 limits
+### v0.2 limits
 
 - Iceberg supports **append-to-existing / multi-snapshot** (`--append` chains a new snapshot onto an
   existing table, with **additive schema evolution** — new optional columns are welcomed with fresh field-ids while existing columns keep theirs; drops/renames/type-changes are refused) and records **per-column statistics**
@@ -566,7 +623,10 @@ it does that one job completely.
   (copy-anywhere relocation, multi-writer) is out of scope — use an external one.
 - Integer timestamps read as epoch-milliseconds, integer dates as epoch-days; `timestamp` is zone-less
   (Iceberg `timestamp`, not `timestamptz`).
-- No incremental/CDC, no scheduling, no connectors — those belong to an orchestrator. The engine is
+- **Upsert** (`--merge-on`) assumes a single writer and accumulates delete files until compaction
+  exists. Rows are matched by key; deleting a row because a change feed says so (`op: d`) is not
+  supported yet.
+- No CDC capture, no scheduling, no connectors — those belong to an orchestrator. The engine is
   Apache-2.0 and fully self-hostable, with no row cap and no telemetry.
 
 ---

@@ -104,6 +104,13 @@ pub struct OutputSpec {
     /// written — Hive-style directory partitioning for Parquet is on the roadmap.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_by: Vec<String>,
+
+    /// Iceberg only: **merge** (upsert) on these key columns instead of appending. Each
+    /// written row replaces any row already in the table with the same key, and when the
+    /// input carries a key more than once the last occurrence wins. Creates the table if
+    /// there is none. Empty (the default) = a plain write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,6 +287,28 @@ impl DatasetSpec {
                 if !self.columns.iter().any(|c| c.name == col) {
                     return Err(ShapeError::Spec(format!(
                         "partition column `{col}` is not a declared column (declare it to partition by it)"
+                    )));
+                }
+            }
+        }
+        // A merge key is matched against rows already in an Iceberg table, so it needs
+        // one; its columns follow the same declared-column rule as partition columns (the
+        // sink checks the key's types once the schema is known).
+        if !self.output.merge_on.is_empty() {
+            if self.output.format != OutputFormat::Iceberg {
+                return Err(ShapeError::Spec(
+                    "`output.merge_on` applies only to Iceberg tables (`format: iceberg`)".into(),
+                ));
+            }
+            for (i, k) in self.output.merge_on.iter().enumerate() {
+                if self.output.merge_on[..i].contains(k) {
+                    return Err(ShapeError::Spec(format!(
+                        "`output.merge_on` names `{k}` twice"
+                    )));
+                }
+                if self.schema == SchemaMode::Strict && !self.columns.iter().any(|c| &c.name == k) {
+                    return Err(ShapeError::Spec(format!(
+                        "merge key `{k}` is not a declared column (declare it to merge on it)"
                     )));
                 }
             }

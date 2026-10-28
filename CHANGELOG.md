@@ -10,6 +10,97 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
+### Upgrading
+
+Only Rust embedders are affected; YAML/JSON specs and the CLI are unchanged unless you
+opt into the new flag.
+
+- `SinkSummary` gained `merge: Option<MergeSummary>`, and `OutputSpec` gained
+  `merge_on` (serde-defaulted, so specs on disk still parse). Struct literals need
+  `merge: None` / `merge_on: Vec::new()`.
+- `IcebergInfo` gained `total_position_deletes`, `MetadataBuild` gained `delete_files`,
+  and `MetadataArtifacts` gained `delete_manifest` — an object-store caller of
+  `build_metadata_artifacts` must persist it before the manifest list.
+- **`current_data_files` now errors on a table that has delete files.** Listing a merged
+  table's data files alone would resurrect the rows its deletes removed; use the new
+  `current_scan_files`, which returns each data file with its deleted positions.
+
+### Added
+
+- **Upsert into an Iceberg table: `--merge-on <cols>` / `output.merge_on`.** Each row
+  written replaces any row already in the table with the same key, so a source with
+  updates — a daily snapshot, a change feed reshaped to JSONL — lands once per key instead
+  of once per version. Within one write a repeated key keeps its **last** occurrence. A
+  row with a null key is appended and matches nothing (SQL `MERGE` semantics), and the
+  run warns about it. Composite keys (`--merge-on region,id`) work, the merge creates the
+  table if there is none, and it composes with partitioning (a key may move between
+  partitions) and with additive schema evolution.
+  It is **merge-on-read**: the delta is appended as new data files, and the rows it
+  supersedes are removed with Iceberg v2 **position deletes** — one small
+  `(file_path, pos)` Parquet file per partition that lost rows, in a delete manifest. No
+  existing data file is rewritten. Finding the superseded rows reads only the **key
+  columns** of existing files, and a file whose manifest key bounds rule out every
+  incoming key is never opened. A row already deleted by an earlier merge is neither
+  matched nor deleted twice, so the delete counts stay exact.
+  The run prints what the merge did — keys updated vs inserted, prior rows replaced,
+  duplicates dropped, null-key rows, files scanned vs pruned — and embedders read it as
+  `SinkSummary.merge`. `inspect` reports `live-records` once a table has deletes.
+  **Verified against DuckDB 2.0's `iceberg_scan`** by
+  [`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py): six randomized
+  scenarios (unpartitioned; identity partitions with keys moving between them; hidden
+  partitions with a composite key; files of many row groups; climbing keys that prune;
+  files past 64 KiB with a composite key whose columns are adjacent and delete files of
+  tens of thousands of rows, read back by the next merge),
+  each checked against a plain-Python model after every merge and time-travelled to every
+  snapshot — with a negative control (`--append` in place of the merge fails it). Measured
+  on one machine (see [BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)): a
+  100,000-row delta with 50,000 updates merges into a 1M-row table in **0.37 s** against
+  **0.14 s** to append it, peak RSS 33 MiB against 14 MiB; when the updates touch only
+  the newest rows of a 10-file table, 9 of the 10 files are pruned (0.24 s).
+  Single writer, like `--append`. Delete files accumulate until a compaction command
+  exists — `inspect` shows how many rows they hide. The local console (`serve`) merges
+  too when a submitted spec sets `output.merge_on`, and its inspect reports live rows.
+- **Merge into an object-store table** (`--merge-on` with an `s3://` / `gs://` / `az://` /
+  `file://` `--output`, in a build with `--features object_store`). Same semantics and the
+  same code as a local merge: only the source of the bytes differs. The existing table
+  is read with as few requests as the work allows: the manifests and delete files whole,
+  and for each data file the merge must scan one `HEAD`, one ranged `GET` for the
+  footer, and then **one ranged `GET` per row group for the key columns' chunks only** —
+  never the other columns, and never a request per page. The delete files are staged
+  and uploaded with the data files, before the manifest that lists them, so the
+  snapshot still becomes visible only when `version-hint.text` lands last.
+  **Verified over the S3 protocol**: `verify_duckdb.py --tables s3://…` runs all six
+  scenarios against an S3-compatible server (moto), with DuckDB reading the tables back
+  through `httpfs`, time travel included; the negative control fails there too. A merge
+  into a 1M-row, 20-row-group table sent exactly 1 `HEAD` + 21 ranged `GET`s for the
+  existing data file. How much of the file those GETs carry depends on how wide the table
+  is: 6.0 of 8.7 MB on that narrow benchmark table (unique `int64` ids barely compress;
+  its other columns are near-constant), under a quarter on a table with one wide column.
+  `inspect <url>` reports the live row count.
+- **`TableFiles`** (`shapeshift-iceberg`): the read seam a merge goes through —
+  whole-file reads, sizes, and byte ranges of a table's existing files —
+  with `LocalTableFiles` (local disk) and `StoreFiles` (`shapeshift-objstore`). The merge
+  write path is `MergeWriter`, shared by both sinks; `ObjectStoreIcebergSink::create_merge`
+  is the object-store constructor.
+- **`current_scan_files`** (`shapeshift-iceberg`): a table's live data files, each with
+  the positions its delete files remove — what a reader needs to return exactly the live
+  rows.
+
+### Changed
+
+- **Manifests are read against the schema they carry.** The manifest reader used to
+  assume shapeshift's unpartitioned byte layout; it now parses the Avro schema in each
+  manifest's own header and decodes against it, so a partition tuple reads correctly for
+  any partition spec. `current_data_files` therefore lists a **partitioned** table's
+  committed files exactly, where it used to report a mismatch and leave the caller to scan
+  the directory. A compressed manifest (another engine's `deflate`) is refused by name
+  rather than misread.
+- Snapshot summaries count data and delete files apart, as the Iceberg spec's keys do:
+  `total-records` is every row in a live data file, `total-position-deletes` the rows
+  deleted out of them, and a snapshot that deletes rows is an `overwrite`.
+
 ## [0.2.0] - 2026-09-12
 
 ### Upgrading from 0.1.x
@@ -496,7 +587,8 @@ build musl-static and ships as a single binary.
 - **Not in the engine:** no incremental / CDC, no scheduling, and no connectors — those
   belong to an orchestrator.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.0...v0.1.1

@@ -530,3 +530,171 @@ fn sample_everything_is_refused_on_a_stream() {
     );
     assert!(String::from_utf8_lossy(&ok.stdout).contains("rows_out=2"));
 }
+
+fn run(args: &[&str]) -> std::process::Output {
+    Command::new(bin()).args(args).output().unwrap()
+}
+
+#[test]
+fn merge_on_upserts_into_an_iceberg_table() {
+    let d = workdir("merge");
+    let day1 = d.join("day1.jsonl");
+    let day2 = d.join("day2.jsonl");
+    fs::write(
+        &day1,
+        "{\"id\":1,\"status\":\"new\"}\n{\"id\":2,\"status\":\"new\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        &day2,
+        "{\"id\":2,\"status\":\"paid\"}\n{\"id\":3,\"status\":\"new\"}\n{\"id\":3,\"status\":\"paid\"}\n",
+    )
+    .unwrap();
+    let table = d.join("orders");
+    let t = table.to_str().unwrap();
+
+    for input in [&day1, &day2] {
+        let out = run(&[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            t,
+            "--to",
+            "iceberg",
+            "--merge-on",
+            "id",
+        ]);
+        assert!(
+            out.status.success(),
+            "merge failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("merged on (id)"), "got: {stdout}");
+        if input == &day2 {
+            assert!(
+                stdout.contains("2 key(s) — 1 updated, 1 inserted; 1 prior row(s) replaced"),
+                "got: {stdout}"
+            );
+            assert!(stdout.contains("1 earlier occurrence(s)"), "got: {stdout}");
+        }
+    }
+
+    let inspect = run(&["inspect", t]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        out.contains("live-records: 3 (5 written, 2 removed by position deletes)"),
+        "got: {out}"
+    );
+}
+
+#[test]
+fn merge_on_is_refused_where_it_cannot_apply() {
+    let d = workdir("merge-refused");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let i = input.to_str().unwrap();
+    let parquet = d.join("out.parquet");
+
+    let out = run(&[
+        "shape",
+        "-i",
+        i,
+        "-o",
+        parquet.to_str().unwrap(),
+        "--merge-on",
+        "id",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("applies only to Iceberg"), "got: {err}");
+
+    // The lean binary has no object-store support at all, merge or not.
+    #[cfg(not(feature = "object_store"))]
+    {
+        let out = run(&[
+            "shape",
+            "-i",
+            i,
+            "-o",
+            "s3://bucket/t",
+            "--to",
+            "iceberg",
+            "--merge-on",
+            "id",
+        ]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--features object_store"), "got: {err}");
+    }
+
+    let table = d.join("t");
+    let out = run(&[
+        "shape",
+        "-i",
+        i,
+        "-o",
+        table.to_str().unwrap(),
+        "--to",
+        "iceberg",
+        "--merge-on",
+        "missing",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("merge_on column `missing`"), "got: {err}");
+}
+
+/// The same upsert through the object-store sink: a `file://` URL exercises the code an
+/// `s3://` table runs (ranged reads of the existing table, staged delete files).
+#[cfg(feature = "object_store")]
+#[test]
+fn merge_on_upserts_into_an_object_store_table() {
+    let d = workdir("merge-url");
+    let day1 = d.join("day1.jsonl");
+    let day2 = d.join("day2.jsonl");
+    fs::write(
+        &day1,
+        "{\"id\":1,\"status\":\"new\"}\n{\"id\":2,\"status\":\"new\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        &day2,
+        "{\"id\":2,\"status\":\"paid\"}\n{\"id\":3,\"status\":\"new\"}\n{\"id\":3,\"status\":\"paid\"}\n",
+    )
+    .unwrap();
+    let url = format!("file://{}", d.join("orders").display());
+
+    for input in [&day1, &day2] {
+        let out = run(&[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            &url,
+            "--to",
+            "iceberg",
+            "--merge-on",
+            "id",
+        ]);
+        assert!(
+            out.status.success(),
+            "merge failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if input == &day2 {
+            assert!(
+                stdout.contains("2 key(s) — 1 updated, 1 inserted; 1 prior row(s) replaced"),
+                "got: {stdout}"
+            );
+        }
+    }
+    let inspect = run(&["inspect", &url]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        out.contains("live-records: 3 (5 written, 2 removed by position deletes)"),
+        "got: {out}"
+    );
+}

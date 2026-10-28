@@ -499,6 +499,48 @@ arms equally; the figure is the median of 6.
 - The drifting rows here are cheaper in absolute terms because that spec declares one column
   (`id`) instead of eight — compare down the `vs ignore` column, not across the rows.
 
+### Upsert (`--merge-on`): what a merge costs over an append
+
+A merge does everything an append does, then finds the rows the delta supersedes — reading only
+the **key column** of existing data files that could hold one — and writes their position deletes.
+This measures that extra work. **A different machine from the runs above: 4 vCPU Intel Xeon @
+2.10 GHz, glibc release build (`cargo build --release -p shapeshift-cli`).** Each run starts from
+a fresh copy of the same base table; the figure is the median of 3. The delta is 100,000 JSONL
+rows (10 MB): 50,000 updates to keys already in the table and 50,000 new keys. The base is
+1,000,000 rows of the same five-column shape.
+
+| base table | delta's updates | `--append` | `--merge-on id` | peak RSS (append → merge) | what the merge read |
+|---|---|---|---|---|---|
+| one data file | at random keys | 0.144 s | 0.368 s | 14.1 → 33.3 MiB | 1 file's key column (1M keys) |
+| ten data files, ids ascending | the newest 100,000 keys | 0.149 s | 0.242 s | 14.9 → 33.2 MiB | 1 file; **9 pruned** by key bounds |
+
+- **The merge's extra cost is reading keys, not rewriting data.** 0.22 s on top of the append to
+  read a million keys and write 50,000 deletes; no existing data file is rewritten.
+- **Pruning is what keeps it from scaling with the table.** When the updated keys cluster (recent
+  rows, ascending ids), a file whose manifest key bounds miss the delta is never opened. Updates at
+  random keys across every file read every file's key column. Partitioning by the key keeps
+  those reads local, but pruning by partition is not implemented yet.
+- **Memory follows the delta.** The merge peaks 19 MiB above the append: on top of one row group it
+  holds an entry per distinct key in the delta (here 100,000), the positions it deletes (here
+  50,000), and the key-column batch it is reading. It holds nothing per live *table* row; the one
+  table-sized cost is the positions earlier merges deleted (none here), loaded so they are skipped.
+- Read back with DuckDB 2.0 `iceberg_scan`: 1,050,000 rows, every id distinct, 50,000 carrying the
+  update.
+- **On an object store the cost is requests, so this counts them** (timings against a local S3 mock
+  would say nothing about S3). The same merge into the same 1M-row table, stored on an
+  S3-compatible server (moto), read the existing data file with exactly **1 `HEAD` + 21 ranged
+  `GET`s**: the footer, then one per row group (20 groups of 50,000 rows), each carrying only the
+  `id` column's chunk. That was 6.0 MB of the 8.7 MB file — on this narrow table the key column
+  *is* most of the bytes (unique `int64` ids barely compress; the other four columns are
+  near-constant). On a table with a wide payload column the same read fetched under a quarter of
+  the file (`files::tests` in `shapeshift-iceberg`).
+- Reading through the range-prefetching path instead of parquet's own file reader cost nothing
+  measurable locally: interleaved A/B, 8 runs each, 0.387 s → 0.390 s (one file) and
+  0.286 s → 0.281 s (ten files).
+- Correctness is checked separately, by
+  [`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py) (randomized deltas against a
+  plain-Python model, every snapshot time-travelled through DuckDB).
+
 ---
 
 ## 8. Reproduce

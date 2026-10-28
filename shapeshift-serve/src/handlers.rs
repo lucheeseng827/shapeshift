@@ -135,6 +135,7 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
             path: format!("{dataset}.parquet"),
             compression: Compression::Snappy,
             partition_by: Vec::new(),
+            merge_on: Vec::new(),
         },
         schema: SchemaMode::Infer,
         columns,
@@ -335,6 +336,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
                 path: String::new(),
                 compression: r.compression,
                 partition_by: Vec::new(),
+                merge_on: Vec::new(),
             },
             schema: SchemaMode::Infer,
             columns: Vec::new(),
@@ -400,14 +402,25 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
 
     // 6. For a fresh (non-append) Iceberg write, start from a clean table dir so a
     //    rerun never mixes stale data files. Safe: the path is always inside out_dir.
-    if is_iceberg && !r.append && output_path.exists() {
+    //    A merge (`output.merge_on` in the spec) upserts into the table that is there,
+    //    as the CLI's does, so it never clears it.
+    let merging = !spec.output.merge_on.is_empty();
+    if is_iceberg && !r.append && !merging && output_path.exists() {
         std::fs::remove_dir_all(&output_path)
             .with_context(|| format!("clearing {}", output_path.display()))?;
     }
 
     // 7. Create the sink (local filesystem only — object-store URLs are CLI-only).
     let mut sink: Box<dyn shapeshift_core::Sink> = if is_iceberg {
-        Box::new(
+        let s = if merging {
+            IcebergSink::create_merge(
+                &output_path,
+                schema,
+                spec.output.compression,
+                &spec.output.partition_by,
+                &spec.output.merge_on,
+            )
+        } else {
             IcebergSink::create(
                 &output_path,
                 schema,
@@ -415,8 +428,8 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
                 r.append,
                 &spec.output.partition_by,
             )
-            .map_err(|e| anyhow!("{e}"))?,
-        )
+        };
+        Box::new(s.map_err(|e| anyhow!("{e}"))?)
     } else {
         Box::new(
             ParquetSink::create(&output_path, schema, spec.output.compression)
@@ -559,6 +572,8 @@ fn do_inspect(ctx: &Ctx, path: &str) -> Result<Value> {
             "table_uuid": info.table_uuid,
             "current_snapshot_id": info.current_snapshot_id,
             "total_records": info.total_records,
+            "position_deletes": info.total_position_deletes,
+            "live_records": info.live_records(),
             "columns": info.fields.iter().map(|(n, t)| json!({ "name": n, "type": t })).collect::<Vec<_>>(),
         }))
     } else {

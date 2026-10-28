@@ -30,6 +30,11 @@
 //! file reference are the destination URI), so the table is valid at its bucket
 //! prefix; a REST catalog (relative-path relocation, multi-writer commits) is out of
 //! scope.
+//!
+//! **Merge** ([`ObjectStoreIcebergSink::create_merge`]) runs the same upsert as a local
+//! table. The existing table is read through [`StoreFiles`]: manifests and delete files
+//! whole, and a data file's footer plus its key-column chunks with ranged GETs, one row
+//! group at a time. The delete files are staged and uploaded with the data files.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,8 +50,8 @@ use shapeshift_iceberg::{
     build_metadata_artifacts, current_manifest_list_key, current_metadata_key,
     ensure_partition_compatible, evolve_fields, ice_fields_from_schema, join_location,
     parse_metadata_json, read_manifest_list, resolve_partition_fields, snapshot_timestamp_ms,
-    IceField, IcebergInfo, MetadataArtifacts, MetadataBuild, PartitionField, PartitionedWriter,
-    PriorTable,
+    IceField, IcebergInfo, MergeContext, MergeWriter, MetadataArtifacts, MetadataBuild,
+    PartitionField, PartitionedWriter, PriorTable, TableFiles,
 };
 use shapeshift_parquet::ParquetSink;
 
@@ -253,6 +258,80 @@ fn child_key(base: &ObjPath, rel: &str) -> ObjPath {
     ObjPath::from(format!("{base}/{rel}"))
 }
 
+/// An object-store table's existing files, for a merge to read. A path recorded under the
+/// table's `location` resolves under the table's current key (so a copied table reads its
+/// own files); any other path is read at the key its URL names in the same store.
+pub struct StoreFiles {
+    store: Arc<dyn ObjectStore>,
+    base_key: ObjPath,
+    location: String,
+    /// One runtime for every read of the merge, rather than one per request.
+    rt: tokio::runtime::Runtime,
+}
+
+impl StoreFiles {
+    /// `location` is what the table's metadata records; `base_key` is where the table is.
+    pub fn new(store: Arc<dyn ObjectStore>, base_key: ObjPath, location: &str) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(sink_err)?;
+        Ok(StoreFiles {
+            store,
+            base_key,
+            location: location.trim_end_matches('/').to_string(),
+            rt,
+        })
+    }
+
+    fn key(&self, path: &str) -> Result<ObjPath> {
+        if !self.location.is_empty() {
+            if let Some(rest) = path.strip_prefix(&self.location) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    return Ok(child_key(&self.base_key, rest.trim_start_matches('/')));
+                }
+            }
+        }
+        let url = url::Url::parse(path)
+            .map_err(|e| sink_err(format!("{path}: not a path in this store ({e})")))?;
+        ObjPath::from_url_path(url.path()).map_err(sink_err)
+    }
+}
+
+impl TableFiles for StoreFiles {
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let key = self.key(path)?;
+        self.rt.block_on(get_bytes(&self.store, &key))
+    }
+
+    fn size(&self, path: &str) -> Result<u64> {
+        let key = self.key(path)?;
+        self.rt.block_on(async {
+            let meta = self
+                .store
+                .head(&key)
+                .await
+                .map_err(|e| sink_err(format!("{path}: {e}")))?;
+            Ok(meta.size)
+        })
+    }
+
+    fn read_ranges(
+        &self,
+        path: &str,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>> {
+        let key = self.key(path)?;
+        // `get_ranges` coalesces nearby ranges into one request.
+        self.rt.block_on(async {
+            self.store
+                .get_ranges(&key, ranges)
+                .await
+                .map_err(|e| sink_err(format!("{path}: {e}")))
+        })
+    }
+}
+
 impl Sink for ObjectStoreParquetSink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.inner
@@ -275,6 +354,7 @@ impl Sink for ObjectStoreParquetSink {
             files: vec![PathBuf::from(&self.dest_url)],
             rows: local.rows,
             bytes,
+            merge: None,
         })
     }
 }
@@ -309,9 +389,13 @@ pub struct ObjectStoreIcebergSink {
     table_uuid: uuid::Uuid,
     store: Arc<dyn ObjectStore>,
     base_key: ObjPath,
+    compression: Compression,
     /// The existing table to append onto, read from the store and validated at `create`
     /// time (`None` = a fresh table). Consumed by `finish` to chain the new snapshot.
     prior: Option<PriorTable>,
+    /// Set for a merge: follows the written keys so `finish` can delete what they
+    /// supersede.
+    merge: Option<MergeWriter>,
 }
 
 impl ObjectStoreIcebergSink {
@@ -331,6 +415,35 @@ impl ObjectStoreIcebergSink {
         compression: Compression,
         append: bool,
         partition_by: &[String],
+    ) -> Result<Self> {
+        Self::open(dest_url, schema, compression, append, partition_by, &[])
+    }
+
+    /// Create a sink that **merges** (upserts) into the table at `dest_url` on the
+    /// `merge_on` key columns, creating the table if there is none — the object-store
+    /// twin of `IcebergSink::create_merge`, with the same semantics. Finding the rows to
+    /// replace reads only the existing data files' footers and key-column chunks (ranged
+    /// GETs), skipping files whose key bounds rule out every incoming key.
+    pub fn create_merge(
+        dest_url: &str,
+        schema: SchemaRef,
+        compression: Compression,
+        partition_by: &[String],
+        merge_on: &[String],
+    ) -> Result<Self> {
+        if merge_on.is_empty() {
+            return Err(sink_err("merge_on names no key column"));
+        }
+        Self::open(dest_url, schema, compression, true, partition_by, merge_on)
+    }
+
+    fn open(
+        dest_url: &str,
+        schema: SchemaRef,
+        compression: Compression,
+        append: bool,
+        partition_by: &[String],
+        merge_on: &[String],
     ) -> Result<Self> {
         // Fail fast on a bad URL / unsupported scheme; keep the built store for finish.
         let (store, base_key) = build_store(dest_url)?;
@@ -355,6 +468,12 @@ impl ObjectStoreIcebergSink {
         if let Some(p) = &prior {
             ensure_partition_compatible(&partition_fields, &p.metadata)?;
         }
+        // Key columns resolve against the evolved fields, before anything is staged.
+        let merge = if merge_on.is_empty() {
+            None
+        } else {
+            Some(MergeWriter::new(&ice_fields, merge_on)?)
+        };
 
         // Partitioned data files are staged under a temp dir, then uploaded at finish.
         let temp_dir =
@@ -376,7 +495,9 @@ impl ObjectStoreIcebergSink {
             table_uuid: uuid::Uuid::new_v4(),
             store,
             base_key,
+            compression,
             prior,
+            merge,
         })
     }
 
@@ -420,10 +541,15 @@ impl ObjectStoreIcebergSink {
         })
     }
 
-    /// Upload every staged data file (multipart), then the built metadata blobs.
-    /// `uploads` is `(object key, local staged path)` per data file. Returns the total
-    /// data bytes uploaded.
-    fn upload_table(&self, uploads: Vec<(String, PathBuf)>, art: MetadataArtifacts) -> Result<u64> {
+    /// Upload every staged data file (multipart), then any staged delete files, then the
+    /// built metadata blobs. `uploads` and `deletes` are `(object key, local staged path)`
+    /// per file. Returns the total **data** bytes uploaded.
+    fn upload_table(
+        &self,
+        uploads: Vec<(String, PathBuf)>,
+        deletes: Vec<(String, PathBuf)>,
+        art: MetadataArtifacts,
+    ) -> Result<u64> {
         let store = self.store.clone();
         let base_key = self.base_key.clone();
         block_on(async move {
@@ -437,12 +563,19 @@ impl ObjectStoreIcebergSink {
                 data_bytes +=
                     upload_multipart(&store, &child_key(&base_key, data_key), local).await?;
             }
+            // A merge's delete files: in place before the manifest that lists them.
+            for (key, local) in &deletes {
+                upload_multipart(&store, &child_key(&base_key, key), local).await?;
+            }
             put_bytes(
                 &store,
                 &child_key(&base_key, &art.manifest_key),
                 art.manifest_bytes,
             )
             .await?;
+            if let Some((key, bytes)) = art.delete_manifest {
+                put_bytes(&store, &child_key(&base_key, &key), bytes).await?;
+            }
             put_bytes(
                 &store,
                 &child_key(&base_key, &art.manifest_list_key),
@@ -470,10 +603,14 @@ impl ObjectStoreIcebergSink {
 
 impl Sink for ObjectStoreIcebergSink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.writer
+        let writer = self
+            .writer
             .as_mut()
-            .ok_or_else(|| sink_err("write after finish"))?
-            .write_batch(batch)
+            .ok_or_else(|| sink_err("write after finish"))?;
+        match &mut self.merge {
+            None => writer.write_batch(batch),
+            Some(m) => m.write_batch(writer, batch),
+        }
     }
 
     fn finish(&mut self) -> Result<SinkSummary> {
@@ -490,6 +627,36 @@ impl Sink for ObjectStoreIcebergSink {
             .collect();
         // Read + validated at `create` time (fail-fast); consume it to chain the snapshot.
         let prior = self.prior.take();
+
+        // A merge reads the existing table from the store (key columns only, ranged) and
+        // stages its delete files beside the data files for the same upload.
+        let (delete_files, merge) = match self.merge.take() {
+            None => (Vec::new(), None),
+            Some(m) => {
+                let location = prior
+                    .as_ref()
+                    .and_then(|p| p.metadata["location"].as_str())
+                    .unwrap_or(&self.base_url);
+                let files = StoreFiles::new(self.store.clone(), self.base_key.clone(), location)?;
+                let out = m.finish(
+                    &MergeContext {
+                        staging_dir: &self.temp_dir,
+                        base_location: &self.base_url,
+                        prior: prior.as_ref(),
+                        new_files: &data_files,
+                        partition_fields: &self.partition_fields,
+                        compression: self.compression,
+                    },
+                    &files,
+                )?;
+                (out.delete_files, Some(out.summary))
+            }
+        };
+        let deletes: Vec<(String, PathBuf)> = delete_files
+            .iter()
+            .map(|d| (d.data_key.clone(), self.temp_dir.join(&d.data_key)))
+            .collect();
+
         let table_uuid = self.table_uuid.to_string();
         let art = build_metadata_artifacts(&MetadataBuild {
             base_location: &self.base_url,
@@ -497,17 +664,19 @@ impl Sink for ObjectStoreIcebergSink {
             ice_fields: &self.ice_fields,
             partition_fields: &self.partition_fields,
             data_files,
+            delete_files,
             timestamp_ms: snapshot_timestamp_ms(),
             prior,
         })?;
         let metadata_uri = join_location(&self.base_url, &art.metadata_key);
-        tracing::debug!(dest = %self.base_url, rows, files = uploads.len(), "uploading iceberg table to object store");
-        let bytes = self.upload_table(uploads, art)?;
+        tracing::debug!(dest = %self.base_url, rows, files = uploads.len(), deletes = deletes.len(), "uploading iceberg table to object store");
+        let bytes = self.upload_table(uploads, deletes, art)?;
         let _ = std::fs::remove_dir_all(&self.temp_dir);
         Ok(SinkSummary {
             files: vec![PathBuf::from(metadata_uri)],
             rows,
             bytes,
+            merge,
         })
     }
 }

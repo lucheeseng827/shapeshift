@@ -112,6 +112,7 @@ impl Sink for ParquetSink {
             files: vec![self.path.clone()],
             rows: self.rows,
             bytes,
+            merge: None,
         })
     }
 }

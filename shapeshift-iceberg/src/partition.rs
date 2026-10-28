@@ -467,6 +467,19 @@ fn part_val_at(arr: &dyn Array, i: usize) -> PartVal {
     }
 }
 
+/// The Hive-style directory (`data/region=eu/event_at_day=2026-01-14`) a file for this
+/// partition tuple lives under. Cosmetic: readers locate files through the manifest.
+pub(crate) fn partition_dir(fields: &[PartitionField], key: &[PartVal]) -> String {
+    let mut path = String::from("data");
+    for (f, v) in fields.iter().zip(key) {
+        path.push('/');
+        path.push_str(&f.name);
+        path.push('=');
+        path.push_str(&f.path_segment(v));
+    }
+    path
+}
+
 /// One finished data file: its table-relative key, partition values, row count, byte
 /// size, and per-column statistics.
 pub struct PartitionDataFile {
@@ -478,10 +491,17 @@ pub struct PartitionDataFile {
 }
 
 struct OpenPartition {
+    /// Creation order — the index of this file in [`PartitionedWriter::finish`]'s output.
+    slot: u32,
     data_key: String,
     partition: Vec<PartVal>,
     writer: IcebergDataWriter,
 }
+
+/// Where one row landed: the file's slot (its index in [`PartitionedWriter::finish`]'s
+/// output) and the row's 0-based position in that file — exactly the `(file, pos)` a
+/// position delete names.
+pub type Placement = (u32, u64);
 
 /// Routes rows to one data file per distinct partition key. Writes local files under
 /// `base_dir` (the table dir for a local sink, a temp dir for an object-store sink).
@@ -522,8 +542,29 @@ impl PartitionedWriter {
 
     /// Route each row to the data file for its partition key (one file when unpartitioned).
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch_placed(batch, None)
+    }
+
+    /// [`write_batch`](Self::write_batch), also recording each row's [`Placement`] into
+    /// `placed` (indexed by the row's position in `batch`; resized to fit). A merge needs
+    /// this to delete an earlier occurrence of a key the same run writes again.
+    pub fn write_batch_placed(
+        &mut self,
+        batch: &RecordBatch,
+        mut placed: Option<&mut Vec<Placement>>,
+    ) -> Result<()> {
+        if let Some(p) = placed.as_deref_mut() {
+            p.clear();
+            p.resize(batch.num_rows(), (0, 0));
+        }
         if self.fields.is_empty() {
             let op = self.partition_writer(&[])?;
+            if let Some(p) = placed {
+                let base = op.writer.rows_written();
+                for (row, slot) in p.iter_mut().enumerate() {
+                    *slot = (op.slot, base + row as u64);
+                }
+            }
             return op.writer.write_batch(batch);
         }
         // Group row indices by their TRANSFORMED partition key — identity keeps the
@@ -542,6 +583,13 @@ impl PartitionedWriter {
         }
         // Take each group's rows into a sub-batch and write it to that partition's file.
         for (key, rows) in groups {
+            let op = self.partition_writer(&key)?;
+            if let Some(p) = placed.as_deref_mut() {
+                let base = op.writer.rows_written();
+                for (i, &row) in rows.iter().enumerate() {
+                    p[row as usize] = (op.slot, base + i as u64);
+                }
+            }
             let idx = UInt32Array::from(rows);
             let cols = batch
                 .columns()
@@ -549,7 +597,6 @@ impl PartitionedWriter {
                 .map(|c| take(c.as_ref(), &idx, None).map_err(err))
                 .collect::<Result<Vec<_>>>()?;
             let sub = RecordBatch::try_new(batch.schema(), cols)?;
-            let op = self.partition_writer(&key)?;
             op.writer.write_batch(&sub)?;
         }
         Ok(())
@@ -568,9 +615,11 @@ impl PartitionedWriter {
                 self.compression,
                 self.ice_fields.clone(),
             )?;
+            let slot = self.open.len() as u32;
             self.open.insert(
                 key.to_vec(),
                 OpenPartition {
+                    slot,
                     data_key,
                     partition: key.to_vec(),
                     writer,
@@ -581,21 +630,21 @@ impl PartitionedWriter {
     }
 
     fn data_key(&self, key: &[PartVal]) -> String {
-        let mut path = String::from("data");
-        for (f, v) in self.fields.iter().zip(key) {
-            path.push('/');
-            path.push_str(&f.name);
-            path.push('=');
-            path.push_str(&f.path_segment(v));
-        }
-        format!("{path}/{}.parquet", Uuid::new_v4())
+        format!(
+            "{}/{}.parquet",
+            partition_dir(&self.fields, key),
+            Uuid::new_v4()
+        )
     }
 
-    /// Close every partition's file and return their descriptors. Consumes the open
-    /// writers (a second call returns an empty list).
+    /// Close every partition's file and return their descriptors, in slot (creation)
+    /// order — so a [`Placement`]'s slot indexes this list. Consumes the open writers (a
+    /// second call returns an empty list).
     pub fn finish(&mut self) -> Result<Vec<PartitionDataFile>> {
-        let mut out = Vec::with_capacity(self.open.len());
-        for (_, mut op) in std::mem::take(&mut self.open) {
+        let mut open: Vec<OpenPartition> = std::mem::take(&mut self.open).into_values().collect();
+        open.sort_by_key(|op| op.slot);
+        let mut out = Vec::with_capacity(open.len());
+        for mut op in open {
             let rows = op.writer.close()?;
             let stats = op.writer.column_stats();
             let size = std::fs::metadata(self.base_dir.join(&op.data_key))

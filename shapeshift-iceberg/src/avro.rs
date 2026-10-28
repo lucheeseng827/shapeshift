@@ -197,16 +197,47 @@ fn enc_opt_bytes_map(buf: &mut Vec<u8>, entries: &[(i32, Vec<u8>)]) {
     enc_long(buf, 0);
 }
 
+/// What a manifest's files hold: rows (`data`), or row-level deletes. Recorded both in
+/// each entry's `data_file.content` and in the manifest header — and a manifest holds
+/// only one kind, so a snapshot that deletes rows carries a separate delete manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestContent {
+    /// Data files (`content = 0`).
+    Data,
+    /// Position-delete files (`content = 1`): `(file_path, pos)` rows naming the data
+    /// rows a snapshot removes.
+    PositionDeletes,
+}
+
+impl ManifestContent {
+    /// The integer Iceberg records in `data_file.content` and the manifest list.
+    pub fn id(self) -> i32 {
+        match self {
+            ManifestContent::Data => 0,
+            ManifestContent::PositionDeletes => 1,
+        }
+    }
+
+    fn header(self) -> &'static [u8] {
+        match self {
+            ManifestContent::Data => b"data",
+            ManifestContent::PositionDeletes => b"deletes",
+        }
+    }
+}
+
 /// Write the manifest (Avro OCF) listing `data_files` as ADDED entries for
 /// `snapshot_id`, over the identity `partition_fields` (empty = unpartitioned). The
 /// embedded schema's `partition` record and each file's partition tuple are built from
 /// `partition_fields`; `table_schema_json` and the partition spec are embedded as file
-/// metadata, as Iceberg readers expect.
+/// metadata, as Iceberg readers expect. `content` says whether the files are data or
+/// position deletes.
 pub fn write_manifest(
     data_files: &[DataFileMeta],
     partition_fields: &[PartitionField],
     snapshot_id: i64,
     table_schema_json: &str,
+    content: ManifestContent,
     sync: [u8; 16],
 ) -> Vec<u8> {
     let mut body = Vec::new();
@@ -215,10 +246,10 @@ pub fn write_manifest(
         enc_long(&mut body, 1); // status = ADDED
         enc_long(&mut body, 1); // snapshot_id union index 1 (long)
         enc_long(&mut body, snapshot_id);
-        enc_long(&mut body, 0); // sequence_number union index 0 (null)
-        enc_long(&mut body, 0); // file_sequence_number union index 0 (null)
+        enc_long(&mut body, 0); // sequence_number union index 0 (null → inherited)
+        enc_long(&mut body, 0); // file_sequence_number union index 0 (null → inherited)
                                 // data_file record
-        enc_long(&mut body, 0); // content = data
+        enc_long(&mut body, content.id() as i64); // content: 0 data, 1 position deletes
         enc_str(&mut body, &df.path); // file_path
         enc_str(&mut body, "PARQUET"); // file_format
         enc_partition(&mut body, &df.partition); // partition record (one value per field)
@@ -239,7 +270,7 @@ pub fn write_manifest(
         ("partition-spec", spec_fields.as_bytes()),
         ("partition-spec-id", b"0"),
         ("format-version", b"2"),
-        ("content", b"data"),
+        ("content", content.header()),
     ];
     build_ocf(&schema, extra, data_files.len(), &body, sync)
 }
@@ -292,6 +323,13 @@ impl ManifestFileEntry {
         }
     }
 
+    /// The same manifest record, marked as holding `content` — a delete manifest's
+    /// "rows" are its position deletes and its "files" its delete files.
+    pub fn with_content(mut self, content: ManifestContent) -> Self {
+        self.content = content.id();
+        self
+    }
+
     /// Live (non-deleted) rows this manifest contributes to the table.
     pub fn live_rows(&self) -> i64 {
         self.added_rows + self.existing_rows
@@ -333,7 +371,7 @@ pub fn write_manifest_list(manifests: &[ManifestFileEntry], sync: [u8; 16]) -> V
 use shapeshift_core::{Result, ShapeError};
 
 fn read_err(msg: impl std::fmt::Display) -> ShapeError {
-    ShapeError::Sink(format!("reading manifest list: {msg}"))
+    ShapeError::Sink(format!("reading Iceberg manifest metadata: {msg}"))
 }
 
 /// A byte cursor over the Avro OCF subset shapeshift writes.
@@ -469,89 +507,407 @@ pub struct ManifestDataFile {
     pub record_count: i64,
     /// Iceberg entry status: 0 EXISTING, 1 ADDED, 2 DELETED.
     pub status: i32,
-    /// File content: 0 = data (the only kind shapeshift writes).
+    /// File content: 0 = data, 1 = position deletes, 2 = equality deletes.
     pub content: i32,
 }
 
-/// Read a `union {null, long}` — the branch index, then the long if present.
-fn read_opt_long(r: &mut Reader) -> Result<()> {
-    if r.long()? == 1 {
-        let _ = r.long()?;
-    }
-    Ok(())
+/// Parse a manifest OCF back into its data-file entries — the summary view of
+/// [`read_manifest_entries`]. Partitioned and unpartitioned manifests both read: the
+/// layout comes from the schema the file carries.
+pub fn read_manifest_data_files(data: &[u8]) -> Result<Vec<ManifestDataFile>> {
+    Ok(read_manifest_entries(data)?
+        .into_iter()
+        .map(|e| ManifestDataFile {
+            file_path: e.file_path,
+            record_count: e.record_count,
+            status: e.status,
+            content: e.content,
+        })
+        .collect())
 }
 
-/// Skip a `union {null, array<record{key:int, value:(long|bytes)}>}` (an Iceberg
-/// stats map). Handles both positive block counts and the negative-count + byte-size form.
-fn skip_opt_kv_map(r: &mut Reader, value_is_bytes: bool) -> Result<()> {
-    if r.long()? != 1 {
-        return Ok(()); // null branch
+// ---- Schema-driven decoding (manifests) ----
+//
+// A manifest's `data_file.partition` record has one field per partition field, so its
+// byte layout depends on the table — and other engines add optional fields shapeshift
+// never writes. Rather than assume a layout, the reader parses the Avro schema the file
+// carries in its own header and decodes against it. That is what lets a merge recover
+// the exact partition tuple of every existing data file: a delete written into the wrong
+// partition is silently never applied.
+
+/// The parsed shape of an Avro schema — just enough to walk the bytes. Logical types
+/// (`date`, `timestamp-micros`, …) decode as their underlying encoding.
+#[derive(Debug, Clone)]
+enum AvroType {
+    Null,
+    Boolean,
+    Int,
+    Long,
+    Float,
+    Double,
+    Bytes,
+    Str,
+    Record(Vec<(String, AvroType)>),
+    Enum,
+    Array(Box<AvroType>),
+    Map(Box<AvroType>),
+    Union(Vec<AvroType>),
+    Fixed(usize),
+}
+
+fn primitive(name: &str) -> Option<AvroType> {
+    Some(match name {
+        "null" => AvroType::Null,
+        "boolean" => AvroType::Boolean,
+        "int" => AvroType::Int,
+        "long" => AvroType::Long,
+        "float" => AvroType::Float,
+        "double" => AvroType::Double,
+        "bytes" => AvroType::Bytes,
+        "string" => AvroType::Str,
+        _ => return None,
+    })
+}
+
+/// Parse a schema JSON node. Named types (records, enums, fixed) are registered as they
+/// are defined, so a later reference by name resolves to the same shape.
+fn parse_type(
+    v: &serde_json::Value,
+    named: &mut std::collections::HashMap<String, AvroType>,
+) -> Result<AvroType> {
+    use serde_json::Value as J;
+    match v {
+        J::String(s) => match primitive(s) {
+            Some(t) => Ok(t),
+            None => named
+                .get(s.as_str())
+                .cloned()
+                .ok_or_else(|| read_err(format!("unknown avro type `{s}`"))),
+        },
+        J::Array(branches) => Ok(AvroType::Union(
+            branches
+                .iter()
+                .map(|b| parse_type(b, named))
+                .collect::<Result<_>>()?,
+        )),
+        J::Object(o) => {
+            let ty = o
+                .get("type")
+                .ok_or_else(|| read_err("avro schema object has no `type`"))?;
+            let t = match ty.as_str() {
+                Some("record") | Some("error") => {
+                    let fields = o
+                        .get("fields")
+                        .and_then(|f| f.as_array())
+                        .ok_or_else(|| read_err("avro record has no `fields`"))?;
+                    let mut out = Vec::with_capacity(fields.len());
+                    for f in fields {
+                        let name = f["name"]
+                            .as_str()
+                            .ok_or_else(|| read_err("avro record field has no `name`"))?;
+                        out.push((name.to_string(), parse_type(&f["type"], named)?));
+                    }
+                    AvroType::Record(out)
+                }
+                Some("enum") => AvroType::Enum,
+                Some("array") => AvroType::Array(Box::new(parse_type(&o["items"], named)?)),
+                Some("map") => AvroType::Map(Box::new(parse_type(&o["values"], named)?)),
+                Some("fixed") => AvroType::Fixed(
+                    o.get("size")
+                        .and_then(|n| n.as_u64())
+                        .ok_or_else(|| read_err("avro fixed has no `size`"))?
+                        as usize,
+                ),
+                // `{"type":"int","logicalType":"date"}` and friends: a logical type rides
+                // on its underlying encoding.
+                _ => parse_type(ty, named)?,
+            };
+            if let Some(name) = o.get("name").and_then(|n| n.as_str()) {
+                if let Some(ns) = o.get("namespace").and_then(|n| n.as_str()) {
+                    named.insert(format!("{ns}.{name}"), t.clone());
+                }
+                named.insert(name.to_string(), t.clone());
+            }
+            Ok(t)
+        }
+        _ => Err(read_err("malformed avro schema")),
     }
+}
+
+/// A decoded Avro value. A union decodes straight to its chosen branch. Types no
+/// manifest field shapeshift reads can hold are consumed and kept only as `Other`.
+#[derive(Debug, Clone)]
+enum AvroValue {
+    Null,
+    Boolean(bool),
+    Int(i32),
+    Long(i64),
+    Double(f64),
+    Bytes(Vec<u8>),
+    Str(String),
+    Record(Vec<(String, AvroValue)>),
+    Array(Vec<AvroValue>),
+    /// A float, enum, map, or fixed — named by its Avro type.
+    Other(&'static str),
+}
+
+impl AvroValue {
+    /// The Avro type a value decoded from, for error messages.
+    fn kind(&self) -> &'static str {
+        match self {
+            AvroValue::Null => "null",
+            AvroValue::Boolean(_) => "boolean",
+            AvroValue::Int(_) => "int",
+            AvroValue::Long(_) => "long",
+            AvroValue::Double(_) => "double",
+            AvroValue::Bytes(_) => "bytes",
+            AvroValue::Str(_) => "string",
+            AvroValue::Record(_) => "record",
+            AvroValue::Array(_) => "array",
+            AvroValue::Other(kind) => kind,
+        }
+    }
+
+    /// A record's field by name (`None` for an absent field or a non-record).
+    fn get(&self, name: &str) -> Option<&AvroValue> {
+        match self {
+            AvroValue::Record(fields) => fields.iter().find(|(n, _)| n == name).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn as_long(&self) -> Option<i64> {
+        match self {
+            AvroValue::Int(n) => Some(*n as i64),
+            AvroValue::Long(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// Walk an Avro block series (arrays, maps, the OCF header map): a count, then that many
+/// items, until a zero count. A negative count is followed by the block's byte size.
+fn read_blocks(r: &mut Reader, mut item: impl FnMut(&mut Reader) -> Result<()>) -> Result<()> {
     loop {
         let n = r.long()?;
         if n == 0 {
-            break;
+            return Ok(());
         }
         let count = if n < 0 {
             let _byte_size = r.long()?;
-            n.checked_neg()
-                .ok_or_else(|| read_err("bad array block count"))?
+            n.checked_neg().ok_or_else(|| read_err("bad block count"))?
         } else {
             n
         };
         for _ in 0..count {
-            let _k = r.long()?; // key: int
-            if value_is_bytes {
-                let _ = r.bytes()?;
-            } else {
-                let _ = r.long()?; // value: long
-            }
+            item(r)?;
         }
     }
-    Ok(())
 }
 
-/// Parse a manifest OCF (as written by [`write_manifest`]) back into its data-file
-/// entries. **Assumes an unpartitioned manifest** — the partition record then carries no
-/// fields and contributes no bytes. shapeshift only writes unpartitioned data manifests;
-/// callers guard partitioned tables with a record-count check and fall back to a scan.
-pub fn read_manifest_data_files(data: &[u8]) -> Result<Vec<ManifestDataFile>> {
+fn decode(r: &mut Reader, t: &AvroType) -> Result<AvroValue> {
+    Ok(match t {
+        AvroType::Null => AvroValue::Null,
+        AvroType::Boolean => AvroValue::Boolean(r.take(1)?[0] != 0),
+        AvroType::Int => AvroValue::Int(r.int()?),
+        AvroType::Long => AvroValue::Long(r.long()?),
+        AvroType::Float => {
+            r.take(4)?;
+            AvroValue::Other("float")
+        }
+        AvroType::Double => AvroValue::Double(f64::from_le_bytes(r.take(8)?.try_into().unwrap())),
+        AvroType::Bytes => AvroValue::Bytes(r.bytes()?.to_vec()),
+        AvroType::Str => AvroValue::Str(r.string()?),
+        AvroType::Record(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for (name, ft) in fields {
+                out.push((name.clone(), decode(r, ft)?));
+            }
+            AvroValue::Record(out)
+        }
+        AvroType::Enum => {
+            r.int()?;
+            AvroValue::Other("enum")
+        }
+        AvroType::Array(items) => {
+            let mut out = Vec::new();
+            read_blocks(r, |r| {
+                out.push(decode(r, items)?);
+                Ok(())
+            })?;
+            AvroValue::Array(out)
+        }
+        AvroType::Map(values) => {
+            read_blocks(r, |r| {
+                r.bytes()?; // key
+                decode(r, values).map(drop)
+            })?;
+            AvroValue::Other("map")
+        }
+        AvroType::Union(branches) => {
+            let i = r.long()?;
+            let branch = usize::try_from(i)
+                .ok()
+                .and_then(|i| branches.get(i))
+                .ok_or_else(|| read_err(format!("union branch {i} out of range")))?;
+            decode(r, branch)?
+        }
+        AvroType::Fixed(n) => {
+            r.take(*n)?;
+            AvroValue::Other("fixed")
+        }
+    })
+}
+
+/// Decode a whole Avro Object Container File against the schema in its own header.
+/// Only the `null` codec is read — the one shapeshift writes; a compressed file (other
+/// engines often use `deflate`) is refused by name rather than misread.
+fn read_ocf(data: &[u8]) -> Result<Vec<AvroValue>> {
     let mut r = Reader::new(data);
     if r.take(4)? != b"Obj\x01" {
         return Err(read_err("not an Avro object container file (bad magic)"));
     }
-    skip_map(&mut r)?; // header metadata (embedded schema, partition spec, …)
-    r.take(16)?; // header sync marker
-    let mut out = Vec::new();
+    let mut schema: Option<Vec<u8>> = None;
+    let mut codec: Option<Vec<u8>> = None;
+    read_blocks(&mut r, |r| {
+        let k = r.string()?;
+        let v = r.bytes()?;
+        match k.as_str() {
+            "avro.schema" => schema = Some(v.to_vec()),
+            "avro.codec" => codec = Some(v.to_vec()),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let sync = r.take(16)?;
+    if let Some(c) = codec.filter(|c| c.as_slice() != b"null") {
+        return Err(read_err(format!(
+            "avro codec `{}` is not supported — shapeshift reads the uncompressed \
+             manifests it writes",
+            String::from_utf8_lossy(&c)
+        )));
+    }
+    let schema = schema.ok_or_else(|| read_err("no avro.schema in the file header"))?;
+    let schema: serde_json::Value = serde_json::from_slice(&schema).map_err(read_err)?;
+    let ty = parse_type(&schema, &mut std::collections::HashMap::new())?;
+
+    let mut records = Vec::new();
     // Data blocks run to EOF; each is: object count, byte size, objects, sync marker.
     while r.remaining() > 0 {
         let count = r.long()?;
         let _block_bytes = r.long()?;
         for _ in 0..count {
-            // manifest_entry
-            let status = r.int()?;
-            read_opt_long(&mut r)?; // snapshot_id
-            read_opt_long(&mut r)?; // sequence_number
-            read_opt_long(&mut r)?; // file_sequence_number
-                                    // data_file record
-            let content = r.int()?;
-            let file_path = r.string()?;
-            let _file_format = r.string()?;
-            // partition record: unpartitioned → zero fields → zero bytes.
-            let record_count = r.long()?;
-            let _file_size = r.long()?;
-            skip_opt_kv_map(&mut r, false)?; // value_counts  (int → long)
-            skip_opt_kv_map(&mut r, false)?; // null_value_counts
-            skip_opt_kv_map(&mut r, true)?; // lower_bounds  (int → bytes)
-            skip_opt_kv_map(&mut r, true)?; // upper_bounds
-            out.push(ManifestDataFile {
-                file_path,
-                record_count,
-                status,
-                content,
-            });
+            records.push(decode(&mut r, &ty)?);
         }
-        r.take(16)?; // block sync marker
+        if r.take(16)? != sync {
+            return Err(read_err("block sync marker does not match the header"));
+        }
+    }
+    Ok(records)
+}
+
+/// One manifest entry, read back in full: the entry's status and sequence numbers, and
+/// the data (or delete) file it tracks — including its partition tuple and the
+/// per-column bounds a merge prunes files with.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    /// 0 EXISTING, 1 ADDED, 2 DELETED.
+    pub status: i32,
+    pub snapshot_id: Option<i64>,
+    /// `None` = inherited from the manifest list (an entry ADDED in that snapshot).
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    /// 0 data, 1 position deletes, 2 equality deletes.
+    pub content: i32,
+    pub file_path: String,
+    /// One value per partition field, in the partition spec's order (empty when
+    /// unpartitioned).
+    pub partition: Vec<PartVal>,
+    pub record_count: i64,
+    pub file_size: i64,
+    pub lower_bounds: Vec<(i32, Vec<u8>)>,
+    pub upper_bounds: Vec<(i32, Vec<u8>)>,
+}
+
+impl ManifestEntry {
+    /// Whether the entry is live in the snapshot that lists it (not DELETED).
+    pub fn is_live(&self) -> bool {
+        self.status != 2
+    }
+}
+
+fn opt_long(v: Option<&AvroValue>) -> Option<i64> {
+    v.and_then(AvroValue::as_long)
+}
+
+/// An Iceberg `map<int, bytes>` (bounds), written as an array of key/value records.
+fn bounds_map(v: Option<&AvroValue>) -> Vec<(i32, Vec<u8>)> {
+    let Some(AvroValue::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|kv| match (kv.get("key"), kv.get("value")) {
+            (Some(k), Some(AvroValue::Bytes(b))) => Some((k.as_long()? as i32, b.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn part_val(v: &AvroValue) -> Result<PartVal> {
+    Ok(match v {
+        AvroValue::Null => PartVal::Null,
+        AvroValue::Boolean(b) => PartVal::Bool(*b),
+        AvroValue::Int(n) => PartVal::Int(*n),
+        AvroValue::Long(n) => PartVal::Long(*n),
+        AvroValue::Double(d) => PartVal::Double(*d),
+        AvroValue::Str(s) => PartVal::Str(s.clone()),
+        other => {
+            return Err(read_err(format!(
+                "a partition value of Avro type `{}` is not one shapeshift partitions by",
+                other.kind()
+            )))
+        }
+    })
+}
+
+/// Parse a manifest OCF into its entries, decoding against the schema in the file's own
+/// header — so the partition tuple reads correctly for any partition spec.
+pub fn read_manifest_entries(data: &[u8]) -> Result<Vec<ManifestEntry>> {
+    let mut out = Vec::new();
+    for rec in read_ocf(data)? {
+        let df = rec
+            .get("data_file")
+            .ok_or_else(|| read_err("manifest entry has no data_file"))?;
+        let partition = match df.get("partition") {
+            Some(AvroValue::Record(fields)) => fields
+                .iter()
+                .map(|(_, v)| part_val(v))
+                .collect::<Result<Vec<_>>>()?,
+            _ => Vec::new(),
+        };
+        out.push(ManifestEntry {
+            status: rec
+                .get("status")
+                .and_then(AvroValue::as_long)
+                .ok_or_else(|| read_err("manifest entry has no status"))?
+                as i32,
+            snapshot_id: opt_long(rec.get("snapshot_id")),
+            sequence_number: opt_long(rec.get("sequence_number")),
+            file_sequence_number: opt_long(rec.get("file_sequence_number")),
+            // v1 manifests have no `content` — every file in them is data.
+            content: opt_long(df.get("content")).unwrap_or(0) as i32,
+            file_path: match df.get("file_path") {
+                Some(AvroValue::Str(s)) => s.clone(),
+                _ => return Err(read_err("data_file has no file_path")),
+            },
+            partition,
+            record_count: opt_long(df.get("record_count"))
+                .ok_or_else(|| read_err("data_file has no record_count"))?,
+            file_size: opt_long(df.get("file_size_in_bytes")).unwrap_or(0),
+            lower_bounds: bounds_map(df.get("lower_bounds")),
+            upper_bounds: bounds_map(df.get("upper_bounds")),
+        });
     }
     Ok(out)
 }
@@ -593,6 +949,7 @@ mod tests {
             &[],
             42,
             "{\"type\":\"struct\"}",
+            ManifestContent::Data,
             [7u8; 16],
         );
         assert_eq!(&bytes[..4], b"Obj\x01");
@@ -632,6 +989,7 @@ mod tests {
             &[],
             42,
             "{\"type\":\"struct\"}",
+            ManifestContent::Data,
             [7u8; 16],
         );
         let files = read_manifest_data_files(&bytes).unwrap();
@@ -642,6 +1000,91 @@ mod tests {
         assert_eq!(files[0].content, 0);
         assert_eq!(files[1].file_path, "/t/data/b.parquet");
         assert_eq!(files[1].record_count, 5);
+    }
+
+    #[test]
+    fn partitioned_manifest_entries_roundtrip_through_the_header_schema() {
+        use crate::partition::resolve_partition_fields;
+        use crate::IceField;
+        let ice = |id, name: &str, ty: &str| IceField {
+            id,
+            name: name.into(),
+            iceberg_type: ty.into(),
+            required: false,
+        };
+        let fields = vec![
+            ice(1, "id", "long"),
+            ice(2, "region", "string"),
+            ice(3, "at", "timestamp"),
+        ];
+        let parts = resolve_partition_fields(
+            &fields,
+            &[
+                "region".to_string(),
+                "day(at)".to_string(),
+                "bucket(4, id)".to_string(),
+            ],
+        )
+        .unwrap();
+        let file = |path: &str, region: Option<&str>, day: i32| DataFileMeta {
+            path: path.into(),
+            partition: vec![
+                region.map_or(PartVal::Null, |r| PartVal::Str(r.into())),
+                PartVal::Int(day),
+                PartVal::Int(3),
+            ],
+            record_count: 7,
+            file_size: 99,
+            value_counts: vec![(1, 7)],
+            null_counts: vec![(1, 0)],
+            lower_bounds: vec![(1, 10i64.to_le_bytes().to_vec())],
+            upper_bounds: vec![(1, 20i64.to_le_bytes().to_vec())],
+        };
+        let bytes = write_manifest(
+            &[
+                file("/t/a.parquet", Some("eu"), 20_000),
+                file("/t/b.parquet", None, -1),
+            ],
+            &parts,
+            42,
+            "{}",
+            ManifestContent::PositionDeletes,
+            [3u8; 16],
+        );
+        let entries = read_manifest_entries(&bytes).unwrap();
+        assert_eq!(entries.len(), 2);
+        let a = &entries[0];
+        assert_eq!(a.file_path, "/t/a.parquet");
+        assert_eq!(a.content, 1, "a delete manifest's entries say so");
+        assert_eq!(a.status, 1);
+        assert_eq!(a.snapshot_id, Some(42));
+        assert_eq!(a.sequence_number, None, "ADDED entries inherit");
+        assert_eq!(
+            a.partition,
+            vec![
+                PartVal::Str("eu".into()),
+                PartVal::Int(20_000),
+                PartVal::Int(3)
+            ]
+        );
+        assert_eq!(a.record_count, 7);
+        assert_eq!(a.file_size, 99);
+        assert_eq!(a.lower_bounds, vec![(1, 10i64.to_le_bytes().to_vec())]);
+        assert_eq!(a.upper_bounds, vec![(1, 20i64.to_le_bytes().to_vec())]);
+        assert_eq!(entries[1].partition[0], PartVal::Null);
+        assert_eq!(entries[1].partition[1], PartVal::Int(-1));
+    }
+
+    #[test]
+    fn compressed_manifests_are_refused_by_name() {
+        let mut bytes = write_manifest(&[], &[], 1, "{}", ManifestContent::Data, [1u8; 16]);
+        // The codec's value follows its key in the header map; "null" also appears in
+        // the schema JSON, so search from the key.
+        let key = bytes.windows(10).position(|w| w == b"avro.codec").unwrap();
+        let at = key + bytes[key..].windows(4).position(|w| w == b"null").unwrap();
+        bytes[at..at + 4].copy_from_slice(b"zstd");
+        let err = read_manifest_entries(&bytes).unwrap_err().to_string();
+        assert!(err.contains("codec `zstd`"), "{err}");
     }
 
     #[test]

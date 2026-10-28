@@ -302,6 +302,71 @@ keeps the single-static-binary ethos intact.
 
 ---
 
+## 8a. Merge — row-level upsert (`--merge-on`)
+
+`IcebergSink::create_merge` turns a write into an upsert on key columns. It is **merge-on-read**
+with Iceberg v2 **position deletes**, chosen over copy-on-write so a merge's cost follows the size of
+the *delta*, not the table: no existing data file is rewritten.
+
+```text
+write phase (streaming; memory follows the delta's keys and the rows it supersedes)
+  batch ──► PartitionedWriter ──► data/<partition>/<uuid>.parquet     (exactly as an append)
+              │ placement of every row: (file slot, position)
+              ▼
+            MergeTracker: key bytes ──► latest (slot, pos)    a repeat of a key → the earlier
+                          per-key-column min/max              (slot, pos) is "superseded"
+
+finish phase
+  prior manifests ──► live data files + their already-deleted positions
+     for each live data file:
+       manifest key bounds disjoint from the write's key range? ──► skip (pruned)
+       else read ONLY the key columns; a live row whose key the write carries ──► delete (file, pos)
+  superseded positions in this write's own files ──► delete (file, pos)
+  group by partition ──► data/<partition>/delete-<uuid>.parquet   (file_path, pos), sorted
+  delete manifest (content = deletes) + data manifest ──► one snapshot, operation `overwrite`
+```
+
+The decisions that make it correct:
+
+- **Placement is recorded at write time.** The partitioned writer reports where each row landed —
+  its file's slot and its 0-based position in that file. That is exactly what a position delete
+  names, so a key repeated within one write is resolved without re-reading anything: the earlier
+  occurrence's `(slot, pos)` becomes a delete, and the last occurrence wins.
+- **Deletes carry the deleted file's partition.** A reader applies a position delete only to data
+  files in the delete file's own partition, so a delete written into the wrong partition is
+  silently never applied. That is why the manifest reader decodes against the Avro schema each
+  manifest carries (the partition record's layout depends on the spec) instead of assuming one.
+- **Sequence numbers do the scoping.** The delete files and the new data files share the snapshot's
+  sequence number, and a position delete applies to data files with a sequence number less than or
+  equal to its own — so one snapshot's deletes reach both the old files and the ones it just wrote.
+- **Never delete a dead row twice.** Before scanning a file, the merge reads the table's existing
+  position-delete files; a row an earlier merge already removed is neither matched nor deleted
+  again, so `total-position-deletes` stays exact and `inspect`'s live count is
+  `total-records − total-position-deletes`.
+- **Pruning only ever errs toward reading.** A file is skipped only when, for some key column, its
+  manifest `[lower, upper]` bounds cannot overlap the write's `[min, max]`. Missing or malformed
+  bounds never prune.
+- **Null keys match nothing** (SQL `MERGE` semantics) and are appended, counted, and warned about.
+- **Keys are compared exactly.** `int64`, `string`, `date`, `timestamp`, and `bool` keys are encoded
+  to bytes (strings length-prefixed, so composite keys are unambiguous); `float64` is refused.
+
+Memory is the trade: an append holds one row group, but a merge also holds **one entry per distinct
+key in the delta** (the key's bytes plus a few dozen bytes) and the positions it deletes: one per
+earlier repeat of a key in the input, one per prior row it replaces. It also loads the positions
+earlier merges deleted, to skip them; those pile up until a compaction exists. It never holds
+anything per live table row. Like `--append`, a merge assumes a single writer.
+
+**Where the table lives does not change the merge.** Every read of the existing table goes through
+one trait, `TableFiles` — a whole file, a file's size, byte ranges of a file — implemented for local
+disk (`LocalTableFiles`) and for an object store (`StoreFiles`, in `shapeshift-objstore`), and the
+write half (`MergeWriter`) is shared by both sinks. Parquet is never read straight from the source:
+the merge fetches a data file's footer, then — one row group at a time — exactly the byte ranges of
+the key columns' chunks, and parquet decodes from that in-memory `RangeCache`. Against an object
+store that is a `HEAD`, one footer `GET`, and one coalesced ranged `GET` per row group, where
+parquet's own sync reader would issue a request per page header; memory is bounded by one row
+group's key chunks. The object-store sink stages its delete files beside its data files and uploads
+both before the manifests that list them, with `version-hint.text` still published last.
+
 ## 9. The Parquet sink
 
 `ParquetSink` streams RecordBatches to one file via `parquet::arrow::ArrowWriter`, one row group
@@ -459,8 +524,12 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   default), `rescue`, `quarantine`, `error`, or `ignore`. What is *not* here is the stateful half:
   remembering a dataset's shape between runs, propagating a new column into the destination on the
   next run, drift history, alerting. Those need memory and a schedule — an orchestrator's job.
-- **No incremental/CDC, no scheduling, no connectors** — deliberately kept out of the engine
-  (next section).
+- **Upsert** (`--merge-on`, §8a) works on local and object-store tables, assumes a single writer,
+  and leaves position-delete files in place — there is no compaction yet, so read cost grows with
+  every merge until one exists.
+- **No CDC capture, no scheduling, no connectors** — deliberately kept out of the engine
+  (next section). Applying a delta it is handed (`--merge-on`) is the engine's job; deciding which
+  rows changed since the last run is not.
 
 ---
 

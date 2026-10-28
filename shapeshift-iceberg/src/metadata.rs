@@ -1,6 +1,6 @@
 //! Iceberg v2 table metadata (`metadata.json`) and the schema/partition-spec JSON
-//! that also rides inside the manifest. v0.1 emits a single append snapshot over an
-//! unpartitioned spec.
+//! that also rides inside the manifest. Each write adds one snapshot: an `append`, or an
+//! `overwrite` when a merge removed rows with position deletes.
 
 use serde_json::{json, Value};
 
@@ -84,8 +84,49 @@ pub struct MetadataInput<'a> {
     pub sequence_number: i64,
     pub timestamp_ms: i64,
     pub manifest_list_path: &'a str,
+    pub counts: SnapshotCounts,
+}
+
+/// The row and file counts one snapshot's summary records. Data and delete files are
+/// counted apart, as the Iceberg spec's summary keys do: `total-records` counts every
+/// row in a live data file, and `total-position-deletes` the rows deleted out of them,
+/// so a reader's live row count is the difference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotCounts {
+    pub added_data_files: i64,
+    pub added_records: i64,
+    pub added_delete_files: i64,
+    pub added_position_deletes: i64,
+    pub total_data_files: i64,
     pub total_records: i64,
-    pub total_files: i64,
+    pub total_delete_files: i64,
+    pub total_position_deletes: i64,
+}
+
+/// The snapshot `summary`. A snapshot that deletes rows is an `overwrite` — the
+/// operation Iceberg names for one that both adds and removes — otherwise an `append`.
+fn summary_json(c: &SnapshotCounts) -> Value {
+    let operation = if c.added_position_deletes > 0 {
+        "overwrite"
+    } else {
+        "append"
+    };
+    let mut summary = json!({
+        "operation": operation,
+        "added-data-files": c.added_data_files.to_string(),
+        "added-records": c.added_records.to_string(),
+        "total-data-files": c.total_data_files.to_string(),
+        "total-records": c.total_records.to_string(),
+        "total-delete-files": c.total_delete_files.to_string(),
+        "total-position-deletes": c.total_position_deletes.to_string(),
+        "total-equality-deletes": "0",
+    });
+    if c.added_delete_files > 0 {
+        summary["added-delete-files"] = json!(c.added_delete_files.to_string());
+        summary["added-position-delete-files"] = json!(c.added_delete_files.to_string());
+        summary["added-position-deletes"] = json!(c.added_position_deletes.to_string());
+    }
+    summary
 }
 
 /// Build the full Iceberg v2 `metadata.json` document.
@@ -94,16 +135,7 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
         return Err(ShapeError::Sink("iceberg table has no columns".into()));
     }
     let schema = schema_json(inp.fields);
-    let summary = json!({
-        "operation": "append",
-        "added-data-files": inp.total_files.to_string(),
-        "added-records": inp.total_records.to_string(),
-        "total-data-files": inp.total_files.to_string(),
-        "total-records": inp.total_records.to_string(),
-        "total-delete-files": "0",
-        "total-position-deletes": "0",
-        "total-equality-deletes": "0",
-    });
+    let summary = summary_json(&inp.counts);
     let snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,
@@ -138,7 +170,7 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
     }))
 }
 
-/// Inputs for [`append_snapshot`]: one new append snapshot over an existing table.
+/// Inputs for [`append_snapshot`]: one new snapshot over an existing table.
 pub struct AppendInput<'a> {
     /// The table's current `metadata.json`, parsed. Cloned and extended — every field
     /// not touched here (table-uuid, schema, spec, sort order, properties) is preserved.
@@ -151,10 +183,7 @@ pub struct AppendInput<'a> {
     pub sequence_number: i64,
     pub timestamp_ms: i64,
     pub manifest_list_path: &'a str,
-    pub added_records: i64,
-    pub added_files: i64,
-    pub total_records: i64,
-    pub total_files: i64,
+    pub counts: SnapshotCounts,
     /// The (already evolved) Iceberg fields this write's data files were stamped with.
     /// When they differ from the prior current schema — an additive evolution added
     /// columns — a new schema object is appended and `current-schema-id` /
@@ -184,16 +213,7 @@ pub fn append_snapshot(inp: &AppendInput) -> Result<Value> {
     let parent = m["current-snapshot-id"].as_i64();
     let schema_id = advance_schema(&mut m, inp.schema_fields)?;
 
-    let summary = json!({
-        "operation": "append",
-        "added-data-files": inp.added_files.to_string(),
-        "added-records": inp.added_records.to_string(),
-        "total-data-files": inp.total_files.to_string(),
-        "total-records": inp.total_records.to_string(),
-        "total-delete-files": "0",
-        "total-position-deletes": "0",
-        "total-equality-deletes": "0",
-    });
+    let summary = summary_json(&inp.counts);
     let mut snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,

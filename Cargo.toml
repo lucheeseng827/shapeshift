@@ -17,7 +17,7 @@ members = [
 # parquet / simd-json / avro stack resolves independently of the shared workspace.
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/shapeshift"
@@ -53,6 +53,8 @@ arrow-schema = "54"
 arrow-select = "54"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 uuid = { version = "1", features = ["v4"] }
+# Byte buffers for ranged reads: parquet's ChunkReader and object_store both speak `Bytes`.
+bytes = "1"
 # Date/time coercions (to_date / to_timestamp / epoch_*). No `clock` feature —
 # the engine never reads the wall clock; all time is derived from the data.
 chrono = { version = "0.4", default-features = false, features = ["std"] }

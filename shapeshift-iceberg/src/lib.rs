@@ -33,12 +33,16 @@
 //! prefix, exactly like a server-less Hadoop catalog — instead of a `canonicalize`d
 //! local path.
 //!
-//! One append snapshot per run, composing with: **multi-snapshot appends** (`--append`,
+//! One snapshot per run, composing with: **multi-snapshot appends** (`--append`,
 //! with **additive schema evolution** — new optional columns keep prior columns'
-//! field-ids stable), **identity + hidden (transform) partitioning**, and **per-column
-//! statistics** in the manifest.
+//! field-ids stable), **identity + hidden (transform) partitioning**, **per-column
+//! statistics** in the manifest, and **row-level upsert** ([`IcebergSink::create_merge`],
+//! `--merge-on`): the incoming rows are appended and the rows they supersede are removed
+//! with Iceberg v2 position deletes (see the `merge` module).
 
 mod avro;
+mod files;
+mod merge;
 mod metadata;
 mod partition;
 mod stats;
@@ -57,12 +61,15 @@ use uuid::Uuid;
 
 use shapeshift_core::{Compression, Result, ShapeError, Sink, SinkSummary};
 
-use crate::avro::DataFileMeta;
-use crate::metadata::MetadataInput;
+use crate::avro::{DataFileMeta, ManifestContent};
+use crate::metadata::{MetadataInput, SnapshotCounts};
 
 pub use crate::avro::{
-    read_manifest_data_files, read_manifest_list, ManifestDataFile, ManifestFileEntry,
+    read_manifest_data_files, read_manifest_entries, read_manifest_list, ManifestDataFile,
+    ManifestEntry, ManifestFileEntry,
 };
+pub use crate::files::{LocalTableFiles, TableFiles};
+pub use crate::merge::{resolve_key_columns, KeyColumn, MergeContext, MergeOutcome, MergeWriter};
 pub use crate::metadata::{join_location, IceField};
 pub use crate::partition::{
     parse_partition_expr, resolve_partition_fields, PartVal, PartitionDataFile, PartitionField,
@@ -255,6 +262,11 @@ impl IcebergDataWriter {
         Ok(())
     }
 
+    /// Rows written so far — the 0-based position the next row will take in the file.
+    pub fn rows_written(&self) -> u64 {
+        self.rows
+    }
+
     /// The Iceberg field list (ids `1..=N`) derived from the schema.
     pub fn ice_fields(&self) -> &[IceField] {
         &self.ice_fields
@@ -291,6 +303,9 @@ pub struct MetadataArtifacts {
     pub metadata_bytes: Vec<u8>,
     pub version_hint_key: String,
     pub version_hint_bytes: Vec<u8>,
+    /// The delete manifest `(key, bytes)`, when the snapshot deletes rows (a merge).
+    /// Persisted with the other metadata, before the manifest list that references it.
+    pub delete_manifest: Option<(String, Vec<u8>)>,
     pub snapshot_id: i64,
 }
 
@@ -326,6 +341,9 @@ pub struct MetadataBuild<'a> {
     /// The data files written this snapshot — one per partition (one total when
     /// unpartitioned), each with its partition values, row count, size, and stats.
     pub data_files: Vec<PartitionDataFile>,
+    /// Position-delete files written this snapshot (a merge; empty for an append). Each
+    /// file's `rows` is its count of deleted positions.
+    pub delete_files: Vec<PartitionDataFile>,
     pub timestamp_ms: i64,
     /// `Some` → append a new snapshot onto this existing table; `None` → fresh table.
     pub prior: Option<PriorTable>,
@@ -394,6 +412,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
         b.partition_fields,
         snapshot_id,
         &schema_json,
+        ManifestContent::Data,
         *Uuid::new_v4().as_bytes(),
     );
     let manifest_key = format!("metadata/{}-m0.avro", Uuid::new_v4());
@@ -417,13 +436,71 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
         None => Vec::new(),
     };
     entries.push(new_manifest);
+
+    // 2b. A merge's position deletes ride in their own manifest (a manifest holds one
+    //     kind of file). Each delete gets this snapshot's sequence number, so it applies
+    //     to every data file up to and including the ones this snapshot added.
+    let added_delete_files = b.delete_files.len() as i64;
+    let added_position_deletes: i64 = b.delete_files.iter().map(|d| d.rows as i64).sum();
+    let delete_manifest = if b.delete_files.is_empty() {
+        None
+    } else {
+        let metas: Vec<DataFileMeta> = b
+            .delete_files
+            .iter()
+            .map(|df| DataFileMeta {
+                path: join_location(b.base_location, &df.data_key),
+                partition: df.partition.clone(),
+                record_count: df.rows as i64,
+                file_size: df.size,
+                value_counts: df.stats.value_counts.clone(),
+                null_counts: df.stats.null_counts.clone(),
+                lower_bounds: df.stats.lower_bounds.clone(),
+                upper_bounds: df.stats.upper_bounds.clone(),
+            })
+            .collect();
+        let bytes = avro::write_manifest(
+            &metas,
+            b.partition_fields,
+            snapshot_id,
+            &schema_json,
+            ManifestContent::PositionDeletes,
+            *Uuid::new_v4().as_bytes(),
+        );
+        let key = format!("metadata/{}-m1.avro", Uuid::new_v4());
+        entries.push(
+            ManifestFileEntry::added(
+                join_location(b.base_location, &key),
+                bytes.len() as i64,
+                snapshot_id,
+                added_delete_files as i32,
+                added_position_deletes,
+                seq,
+            )
+            .with_content(ManifestContent::PositionDeletes),
+        );
+        Some((key, bytes))
+    };
+
     let manifest_list_bytes = avro::write_manifest_list(&entries, *Uuid::new_v4().as_bytes());
     let manifest_list_key = format!("metadata/snap-{snapshot_id}-1-{}.avro", Uuid::new_v4());
     let manifest_list_uri = join_location(b.base_location, &manifest_list_key);
 
-    // Cumulative table totals across every live manifest in this snapshot.
-    let total_records: i64 = entries.iter().map(|m| m.live_rows()).sum();
-    let total_files: i64 = entries.iter().map(|m| m.live_files()).sum();
+    // Cumulative table totals across every live manifest in this snapshot — data and
+    // delete manifests counted apart (a delete manifest's "rows" are deleted positions).
+    let sum = |content: i32, f: fn(&ManifestFileEntry) -> i64| -> i64 {
+        entries.iter().filter(|m| m.content == content).map(f).sum()
+    };
+    let counts = SnapshotCounts {
+        added_data_files: added_files as i64,
+        added_records: added_rows,
+        added_delete_files,
+        added_position_deletes,
+        total_data_files: sum(0, ManifestFileEntry::live_files),
+        total_records: sum(0, ManifestFileEntry::live_rows),
+        total_delete_files: sum(1, ManifestFileEntry::live_files),
+        total_position_deletes: sum(1, ManifestFileEntry::live_rows),
+    };
 
     // 3. Table metadata (v2) + version hint — fresh doc, or the prior doc extended.
     let (metadata_value, version) = match &b.prior {
@@ -438,8 +515,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
                 sequence_number: seq,
                 timestamp_ms: b.timestamp_ms,
                 manifest_list_path: &manifest_list_uri,
-                total_records,
-                total_files,
+                counts,
             })?,
             1u64,
         ),
@@ -452,10 +528,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
                 sequence_number: seq,
                 timestamp_ms: b.timestamp_ms,
                 manifest_list_path: &manifest_list_uri,
-                added_records: added_rows,
-                added_files: added_files as i64,
-                total_records,
-                total_files,
+                counts,
                 schema_fields: b.ice_fields,
             })?,
             p.version + 1,
@@ -472,6 +545,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
         metadata_bytes,
         version_hint_key: "metadata/version-hint.text".to_string(),
         version_hint_bytes: version.to_string().into_bytes(),
+        delete_manifest,
         snapshot_id,
     })
 }
@@ -680,9 +754,13 @@ pub struct IcebergSink {
     partition_fields: Vec<PartitionField>,
     writer: PartitionedWriter,
     table_uuid: Uuid,
+    compression: Compression,
     /// The existing table to append onto, loaded and validated at `create` time (`None` =
     /// a fresh table). Consumed by `finish` to chain the new snapshot.
     prior: Option<PriorTable>,
+    /// Set for a merge: follows the written keys so `finish` can delete what they
+    /// supersede.
+    merge: Option<MergeWriter>,
 }
 
 impl IcebergSink {
@@ -701,7 +779,51 @@ impl IcebergSink {
         append: bool,
         partition_by: &[String],
     ) -> Result<Self> {
-        let table_dir = table_dir.as_ref().to_path_buf();
+        Self::open(
+            table_dir.as_ref(),
+            schema,
+            compression,
+            append,
+            partition_by,
+            &[],
+        )
+    }
+
+    /// Create a sink that **merges** (upserts) into the table at `table_dir` on the
+    /// `merge_on` key columns, creating the table if there is none. Every written row is
+    /// appended; at `finish`, each row it supersedes is removed with a position delete —
+    /// an existing row whose key this write carries, and an earlier occurrence of a key
+    /// this write carries twice (the last one wins). Schema evolution and partitioning
+    /// follow [`IcebergSink::create`] with `append = true`.
+    pub fn create_merge(
+        table_dir: impl AsRef<Path>,
+        schema: SchemaRef,
+        compression: Compression,
+        partition_by: &[String],
+        merge_on: &[String],
+    ) -> Result<Self> {
+        if merge_on.is_empty() {
+            return Err(ShapeError::Sink("merge_on names no key column".into()));
+        }
+        Self::open(
+            table_dir.as_ref(),
+            schema,
+            compression,
+            true,
+            partition_by,
+            merge_on,
+        )
+    }
+
+    fn open(
+        table_dir: &Path,
+        schema: SchemaRef,
+        compression: Compression,
+        append: bool,
+        partition_by: &[String],
+        merge_on: &[String],
+    ) -> Result<Self> {
+        let table_dir = table_dir.to_path_buf();
         std::fs::create_dir_all(table_dir.join("data")).map_err(sink_err)?;
         std::fs::create_dir_all(table_dir.join("metadata")).map_err(sink_err)?;
 
@@ -726,6 +848,13 @@ impl IcebergSink {
         if let Some(p) = &prior {
             ensure_partition_compatible(&partition_fields, &p.metadata)?;
         }
+        // Key columns resolve against the evolved fields, so a key matches the table's
+        // own field-id. Validated here — before any data is written.
+        let merge = if merge_on.is_empty() {
+            None
+        } else {
+            Some(MergeWriter::new(&ice_fields, merge_on)?)
+        };
 
         let writer = PartitionedWriter::new(
             &table_dir,
@@ -741,14 +870,19 @@ impl IcebergSink {
             partition_fields,
             writer,
             table_uuid: Uuid::new_v4(),
+            compression,
             prior,
+            merge,
         })
     }
 }
 
 impl Sink for IcebergSink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.writer.write_batch(batch)
+        match &mut self.merge {
+            None => self.writer.write_batch(batch),
+            Some(m) => m.write_batch(&mut self.writer, batch),
+        }
     }
 
     fn finish(&mut self) -> Result<SinkSummary> {
@@ -764,6 +898,39 @@ impl Sink for IcebergSink {
         let base_location = abspath(&self.table_dir);
         // Loaded and validated at `create` time (fail-fast); consume it to chain the snapshot.
         let prior = self.prior.take();
+
+        // A merge finds the rows this write supersedes — reading only the key columns
+        // of existing files that could hold one — and writes their position deletes.
+        let (delete_files, merge) = match self.merge.take() {
+            None => (Vec::new(), None),
+            Some(m) => {
+                // Existing files are read where the table's metadata says they are,
+                // re-anchored to this directory if the table has moved.
+                let location = prior
+                    .as_ref()
+                    .and_then(|p| p.metadata["location"].as_str())
+                    .unwrap_or(&base_location);
+                let files = LocalTableFiles::new(&self.table_dir, location);
+                let out = m.finish(
+                    &MergeContext {
+                        staging_dir: &self.table_dir,
+                        base_location: &base_location,
+                        prior: prior.as_ref(),
+                        new_files: &data_files,
+                        partition_fields: &self.partition_fields,
+                        compression: self.compression,
+                    },
+                    &files,
+                )?;
+                (out.delete_files, Some(out.summary))
+            }
+        };
+        files.extend(
+            delete_files
+                .iter()
+                .map(|d| self.table_dir.join(&d.data_key)),
+        );
+
         let table_uuid = self.table_uuid.to_string();
         let art = build_metadata_artifacts(&MetadataBuild {
             base_location: &base_location,
@@ -771,6 +938,7 @@ impl Sink for IcebergSink {
             ice_fields: &self.ice_fields,
             partition_fields: &self.partition_fields,
             data_files,
+            delete_files,
             timestamp_ms: snapshot_timestamp_ms(),
             prior,
         })?;
@@ -783,11 +951,19 @@ impl Sink for IcebergSink {
             Ok(p)
         };
         files.push(write(&art.manifest_key, &art.manifest_bytes)?);
+        if let Some((key, bytes)) = &art.delete_manifest {
+            files.push(write(key, bytes)?);
+        }
         files.push(write(&art.manifest_list_key, &art.manifest_list_bytes)?);
         files.push(write(&art.metadata_key, &art.metadata_bytes)?);
         files.push(write(&art.version_hint_key, &art.version_hint_bytes)?);
 
-        Ok(SinkSummary { files, rows, bytes })
+        Ok(SinkSummary {
+            files,
+            rows,
+            bytes,
+            merge,
+        })
     }
 }
 
@@ -812,8 +988,19 @@ pub struct IcebergInfo {
     pub format_version: i64,
     pub table_uuid: String,
     pub current_snapshot_id: i64,
+    /// Rows in the live data files, including any a position delete removes.
     pub total_records: i64,
+    /// Rows removed by position deletes (a merge). Never double-counted: a merge does not
+    /// delete a row that is already deleted.
+    pub total_position_deletes: i64,
     pub fields: Vec<(String, String)>,
+}
+
+impl IcebergInfo {
+    /// The rows a reader sees: data rows minus the ones deleted.
+    pub fn live_records(&self) -> i64 {
+        self.total_records - self.total_position_deletes
+    }
 }
 
 /// Parse a table's `metadata.json` text into an [`IcebergInfo`] summary. Backend-neutral
@@ -824,12 +1011,16 @@ pub fn parse_metadata_json(text: &str) -> Result<IcebergInfo> {
     let format_version = v["format-version"].as_i64().unwrap_or(0);
     let table_uuid = v["table-uuid"].as_str().unwrap_or("").to_string();
     let current_snapshot_id = v["current-snapshot-id"].as_i64().unwrap_or(0);
-    let total_records = v["snapshots"]
-        .as_array()
-        .and_then(|s| s.last())
-        .and_then(|s| s["summary"]["total-records"].as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let summary_count = |key: &str| -> i64 {
+        v["snapshots"]
+            .as_array()
+            .and_then(|s| s.last())
+            .and_then(|s| s["summary"][key].as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let total_records = summary_count("total-records");
+    let total_position_deletes = summary_count("total-position-deletes");
     // Resolve the CURRENT schema by id — after additive evolution `schemas` keeps the
     // old schema objects too, so `.first()` would report a stale column list.
     let current_schema_id = v["current-schema-id"].as_i64().unwrap_or(0);
@@ -857,6 +1048,7 @@ pub fn parse_metadata_json(text: &str) -> Result<IcebergInfo> {
         table_uuid,
         current_snapshot_id,
         total_records,
+        total_position_deletes,
         fields,
     })
 }
@@ -894,25 +1086,21 @@ fn reanchor(table_dir: &Path, base: &str, path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// The data-file paths referenced by a local table's **current snapshot**, re-anchored
-/// to `table_dir`. Reads only *committed* files (from the manifests), so orphan Parquet
-/// left by an interrupted write is excluded — unlike a raw directory scan.
-///
-/// Returns an error (so the caller can fall back to a directory scan) if the manifests
-/// can't be read, or if the summed data record count doesn't match the snapshot's
-/// `total-records` — a guard that trips for partitioned tables, whose partition tuples
-/// this unpartitioned-manifest reader doesn't decode, so we never silently drop rows.
-pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
-    let table_dir = table_dir.as_ref();
+/// Load a local table's current snapshot — whatever `version-hint.text` points at —
+/// as a [`PriorTable`], resolving its manifest list through the stored `location`.
+fn load_current_local(table_dir: &Path) -> Result<PriorTable> {
     let hint =
         std::fs::read_to_string(table_dir.join("metadata/version-hint.text")).map_err(sink_err)?;
-    let meta_key = current_metadata_key(&hint)?;
-    let text = std::fs::read_to_string(table_dir.join(&meta_key)).map_err(sink_err)?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;
-
-    let base = v["location"].as_str().unwrap_or("");
-    let current = v["current-snapshot-id"].as_i64().unwrap_or(-1);
-    let snapshots = v["snapshots"]
+    let version: u64 = hint
+        .trim()
+        .parse()
+        .map_err(|e| ShapeError::Sink(format!("bad version-hint.text {hint:?}: {e}")))?;
+    let text =
+        std::fs::read_to_string(table_dir.join(current_metadata_key(&hint)?)).map_err(sink_err)?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;
+    let base = metadata["location"].as_str().unwrap_or("");
+    let current = metadata["current-snapshot-id"].as_i64().unwrap_or(-1);
+    let snapshots = metadata["snapshots"]
         .as_array()
         .ok_or_else(|| ShapeError::Sink("table metadata has no snapshots".into()))?;
     let snap = snapshots
@@ -923,20 +1111,91 @@ pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
     let ml_path = snap["manifest-list"]
         .as_str()
         .ok_or_else(|| ShapeError::Sink("snapshot has no manifest-list".into()))?;
-    let total_records: i64 = snap["summary"]["total-records"]
-        .as_str()
+    let ml_bytes = std::fs::read(reanchor(table_dir, base, ml_path)).map_err(sink_err)?;
+    let manifests = read_manifest_list(&ml_bytes)?;
+    Ok(PriorTable {
+        metadata,
+        version,
+        manifests,
+    })
+}
+
+/// One data file of a table's current snapshot, with the rows deleted out of it.
+#[derive(Debug, Clone)]
+pub struct ScanFile {
+    /// The data file, re-anchored to the table's current directory.
+    pub path: String,
+    /// Rows in the file, including deleted ones.
+    pub record_count: i64,
+    /// 0-based positions a position delete removes (sorted). A reader skips these rows.
+    pub deleted_positions: Vec<u64>,
+}
+
+/// The current snapshot's live data files, each with the positions its delete files
+/// remove — everything a reader needs to return exactly the live rows of a table that has
+/// been merged into. Errors on equality deletes (shapeshift never writes them).
+pub fn current_scan_files(table_dir: impl AsRef<Path>) -> Result<Vec<ScanFile>> {
+    let table_dir = table_dir.as_ref();
+    let current = load_current_local(table_dir)?;
+    let location = current.metadata["location"].as_str().unwrap_or_default();
+    let files = LocalTableFiles::new(table_dir, location);
+    let mut live = merge::live_files(&files, &current)?;
+    Ok(live
+        .data
+        .iter()
+        .map(|e| ScanFile {
+            path: files.resolve(&e.file_path).to_string_lossy().into_owned(),
+            record_count: e.record_count,
+            deleted_positions: live.deletes.remove(&e.file_path).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// The data-file paths referenced by a local table's **current snapshot**, re-anchored
+/// to `table_dir`. Reads only *committed* files (from the manifests), so orphan Parquet
+/// left by an interrupted write is excluded — unlike a raw directory scan.
+///
+/// Returns an error (so the caller can fall back) if the manifests can't be read, if the
+/// summed data record count doesn't match the snapshot's `total-records`, or if the table
+/// has **row-level deletes** (a merge): reading those data files whole would resurrect the
+/// rows the deletes remove, so such a table must be read through [`current_scan_files`]
+/// or an Iceberg reader instead.
+pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
+    let table_dir = table_dir.as_ref();
+    let current = load_current_local(table_dir)?;
+    let deletes: i64 = current
+        .manifests
+        .iter()
+        .filter(|m| m.content != 0)
+        .map(ManifestFileEntry::live_files)
+        .sum();
+    if deletes > 0 {
+        return Err(ShapeError::Sink(format!(
+            "the table has {deletes} delete file(s) from a merge; listing its data files \
+             alone would resurrect deleted rows — read it through current_scan_files or an \
+             Iceberg reader (iceberg_scan)"
+        )));
+    }
+    let base = current.metadata["location"].as_str().unwrap_or("");
+    let current_id = current.metadata["current-snapshot-id"].as_i64();
+    let total_records: i64 = current.metadata["snapshots"]
+        .as_array()
+        .and_then(|snaps| {
+            snaps
+                .iter()
+                .find(|s| s["snapshot-id"].as_i64() == current_id)
+                .or_else(|| snaps.last())
+        })
+        .and_then(|s| s["summary"]["total-records"].as_str())
         .and_then(|s| s.parse().ok())
         .unwrap_or(-1);
 
-    let ml_bytes = std::fs::read(reanchor(table_dir, base, ml_path)).map_err(sink_err)?;
-    let manifests = read_manifest_list(&ml_bytes)?;
-
     let mut files = Vec::new();
     let mut rec_sum: i64 = 0;
-    for m in &manifests {
+    for m in &current.manifests {
         let mbytes = std::fs::read(reanchor(table_dir, base, &m.path)).map_err(sink_err)?;
         for df in read_manifest_data_files(&mbytes)? {
-            // content 0 = data; status 2 = DELETED (shapeshift is append-only, so none).
+            // content 0 = data; status 2 = DELETED.
             if df.content == 0 && df.status != 2 {
                 rec_sum += df.record_count;
                 files.push(
@@ -1005,6 +1264,7 @@ mod tests {
                 size: 123,
                 stats: Stats::default(),
             }],
+            delete_files: Vec::new(),
             timestamp_ms: 1_700_000_000_000,
             prior: None,
         })
@@ -1044,6 +1304,7 @@ mod tests {
                 size: 0,
                 stats: Stats::default(),
             }],
+            delete_files: Vec::new(),
             timestamp_ms: 0,
             prior: None,
         });
