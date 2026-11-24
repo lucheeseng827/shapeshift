@@ -10,6 +10,171 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+### Upgrading
+
+YAML/JSON specs are unchanged. The CLI changes in two places: a run refused by the commit
+guard exits 75, and a write without `--append` onto an existing table lands as its next
+version. Its text reports are unchanged; scripts that parse them can move to
+`--summary-json`. The rest affects Rust embedders.
+
+- `ManifestEntry` gained `value_counts` and `null_counts` (read back so a rewritten
+  manifest keeps every statistic), and `SnapshotCounts` gained the `removed_*` counts and
+  `replace`; build either with `..Default::default()` where you can.
+- A new snapshot no longer carries forward a manifest with no live file in it (the
+  record a compaction leaves of the delete files it removed).
+- **`ShapeError` gained `Conflict`** (the commit guard refused a commit; safe to retry).
+  An exhaustive `match` on `ShapeError` needs an arm for it. `MetadataArtifacts` gained
+  `version`, `MetadataBuild` gained `replaces` (`None` unless a fresh table replaces an
+  existing one), and `ExpireCommit` gained `version`. An object-store caller that
+  persists `MetadataArtifacts` itself must now create the metadata file only if absent
+  (`PutMode::Create`) to keep the guard.
+- **`TableFiles` now requires `Sync`** (several threads read through it at once) and
+  gained `readers()`, how many files to read at once (default 1). `StoreFiles::new(store,
+  base_key, location)` is now `StoreFiles::open(url, location)`: it builds an HTTP client of
+  its own that only its own runtime drives. (A pooled keep-alive connection belongs to the
+  runtime that opened it; reused from another runtime while that one is idle, its request
+  is never sent and waits for the client's timeout.)
+- `SinkSummary` gained `table_version` and `snapshot_id` (what a table sink committed;
+  `None` for Parquet), and `CompactSummary` and `ExpireSummary` gained `version` (the
+  table version committed). Struct literals need the new fields; the latter two derive
+  `Default`.
+- **CLI: a run refused by the commit guard exits with status 75** (`EX_TEMPFAIL`), not 1.
+- **A write without `--append` onto an existing table** now commits a fresh table as the
+  table's next version, instead of rewriting `v1.metadata.json` in place. Readers see the
+  same result; nothing is overwritten. A table that 0.3 or earlier rewrote that way can
+  carry older `v2…` files that do not continue from its `v1`; they are ignored on read,
+  and the next write reports them with the steps to move them aside.
+
+### Added
+
+- **A table write can say where its rows came from, in each data file's footer.**
+  `IcebergSink::set_footer` (and `PartitionedWriter::set_footer`, `IcebergDataWriter::set_footer`)
+  takes a `FileFooter`: a function from a file's row count to key-value pairs, which every data
+  file the write produces carries in its Parquet footer, made as that file closes. Any Parquet
+  reader sees them. A merge's delete files carry none, and a compaction writes its new files
+  without them: a compacted file holds rows of many writes. Nothing changes for a write that
+  does not set one.
+- **Compactions read ahead of their writer, and a small file is one request.** A compaction read
+  every file it rewrites — footer, then each row group — one request after another. Up to 8
+  readers (`SHAPESHIFT_READERS` overrides; local tables use up to 4) now each take the next file
+  and fetch it ahead of the one writer, which still writes the rows in table order, so the files
+  written are the same; about 16 MiB of fetched bytes waits for it (the row group it needs next is
+  always fetched). A column chunk the footer's read already holds is not fetched again: that read
+  takes a file's last 64 KiB, so a smaller file is one request, for merges too. **Measured**
+  through `s3_proxy.py` at 20 ms per request on a 336-file partitioned table: compact 54.5 s →
+  6.8 s (1,473 requests → 769), merge 11.8 s → 6.4 s (1,374 → 718); unpartitioned, compact
+  3.29 s → 1.24 s. Peak RSS unchanged on those tables; up to 16 MiB more with big files (a
+  19 MiB file: 31.9 → 44.1 MiB locally).
+- **Object-store writes: one request per file, 8 in flight, and bulk deletes.** A table write
+  uploaded every data and delete file as a multipart upload (create, part, complete) one after
+  another. A file that fits in a part (8 MiB) is now one `PUT`, and the data files, delete files,
+  manifests and manifest list go up 8 at a time — at most 16 MiB of file bytes in memory, what one
+  multipart upload held before — then the guarded metadata file. A Parquet `--output` under 8 MiB
+  is one `PUT` too. Expiry hands every key to the store's many-delete call (S3: one
+  `DeleteObjects` request per thousand keys) and retries what it did not confirm one by one.
+  **Measured** through `s3_proxy.py` at 20 ms per request on a 336-file partitioned table: append
+  3.12 → 0.50 s, merge 18.2 → 12.7 s, expire of 771 files 58.5 → 5.2 s (773 requests → 3); peak RSS
+  unchanged.
+- **Merges read an object-store table several files at a time, and without `HEAD`s.** A
+  merge waited on the store once per request: for every manifest, delete file and data file it
+  read, one after another. The manifests, the delete files and the data files to scan are now
+  each read 8 at a time (`SHAPESHIFT_READERS` overrides; local tables use up to 4), and every
+  result is used in table order, so the delete files are the same whichever read finishes
+  first. A file is opened at the size its manifest records, so its footer is the first request
+  (a wrong recorded size costs one size lookup, then reads at the true one). **Measured**
+  through a proxy adding 20 ms to every request (see BENCHMARKS): a merge into a 21-file table
+  9.31 s → 1.84 s with 41 fewer requests; into a 336-file partitioned table 116.5 s → 18.0 s.
+  Same rows replaced, same peak RSS. Compaction reads its manifests and delete files through
+  the same pool, and expiry's planning its manifest lists and manifests (each once, however
+  many snapshots carry it; the plan is the same whatever the reader count): expiring 771
+  files of the 336-file table 5.11 s → 1.02 s, its plan 4.97 s → 0.87 s. CI's S3 checks now run through
+  `examples/merge/s3_proxy.py`, which keeps connections open as S3 does (the S3 mock closes
+  them, which once hid a compaction that stalled 30 s on a reused connection), and the
+  DuckDB model-check fails any run that had to retry a request.
+- **`--summary-json` on `shape`, `compact` and `expire`.** stdout carries one JSON
+  document on one line in place of the text report: for `shape` the row counts, the
+  rejects sidecar, the table version, snapshot and metadata file committed, and the merge
+  and drift summaries; for `compact` and `expire` their counts and the version committed
+  (null when there was nothing to do). A failed run prints
+  `{"ok": false, "error": {"kind", "message"}}` instead, with the exit status unchanged —
+  75 and `kind: "conflict"` when the commit guard refused it. Snapshot ids are strings (they
+  overflow a double); every document carries `summary_version: 1`, which only a renamed,
+  removed or redefined field bumps. **Verified** beyond its CLI tests: the DuckDB
+  model-check now runs every write with it and fails when a summary disagrees with the table
+  (the snapshot it names is not the newest, a merge's key counts differ from the model, an
+  expiry names other snapshots than the ones that went — each caught with a deliberately
+  wrong summary), and `race_writers.py` fails unless the versions concurrent runs report are
+  1..N, each claimed by exactly one run.
+- **The commit guard: concurrent writers can no longer lose each other's snapshots.**
+  A commit creates `metadata/v{N+1}.metadata.json` only if no other writer has — locally a
+  temp file hard-linked into place (which refuses to replace), on S3/GCS/Azure a
+  conditional put (`If-None-Match: *`). Of two writers that built on the same version,
+  the second gets `ShapeError::Conflict` (CLI exit 75), having removed every file it
+  staged; running it again builds on the winner. An object-store commit that errors is
+  checked against the stored metadata first — a 5xx or timeout can hide a put that landed —
+  so a write never takes back files its own committed snapshot names; when the outcome
+  stays unknown, its files are left in place. A write that fails because a compaction
+  and an expiry removed the files it was reading is reported the same way. The hint is
+  replaced atomically (temp + rename) after the commit and never moved backwards, and
+  readers and writers follow committed versions past a stale hint — but only true
+  successors, whose `metadata-log` names the version before. `append`, `--merge-on`,
+  `compact` and `expire` are all guarded. **Verified** by
+  [`examples/merge/race_writers.py`](./examples/merge/race_writers.py): writers merging
+  into one table while a janitor compacts and expires it, retrying on exit 75 — DuckDB
+  reads exactly what every writer's last round says, on local disk, `file://` and S3
+  (moto honours `If-None-Match`), across seeds with up to 6 writers and 200 retries. The
+  same race on a build without the guard lost 400-odd of ~580 rows whose writers had
+  exited 0, and some runs crashed reading a half-written version hint. 6 crate tests (a
+  two-writer race; merges racing a compaction and an expiry; a stale hint; a leftover
+  file; a rewrite without `--append`), each guard rule shown to fail without it.
+- **`shapeshift expire <table>`: let old snapshots go, and the files only they read.**
+  Every commit keeps the table's whole history on disk, and a compaction keeps its inputs
+  for the snapshots before it. `expire` drops the snapshots older than `--older-than`
+  (default `5d`, Iceberg's own; `s`/`m`/`h`/`d`/`w`), except the current one, any a ref
+  names, and the newest `--retain-last` (default 1) of the current history. It publishes
+  the shorter history first, then deletes every manifest list, manifest, data and delete
+  file only the expired snapshots referenced — never a file a retained snapshot reads as
+  live, and never one whose path is outside the table's location (a copied table can name
+  the original's files; those are counted and left). `--dry-run` reports and changes
+  nothing. Works on object-store URLs too (`shapeshift_objstore::expire_iceberg`; the
+  library entry points are `expire_table` and `plan_expiry`). Old `metadata.json` files are
+  kept. **Verified**: the DuckDB model-check expires after every compaction, keeping the
+  newest 1-3 snapshots, and time-travels every snapshot before it goes and every one left
+  after, on local, `file://` and S3 (moto); a build that deletes files a retained snapshot
+  needs fails it on a missing manifest. **Measured**: 30 merges and a compaction left a
+  1M-row table at 27.1 MiB in 190 files; one expiry (0.01 s) brought it to 10.3 MiB in 38.
+- **`shapeshift compact <table>`: apply every delete and pack small files, in one
+  snapshot.** Every merge leaves a table more expensive to read: one more data file, one
+  more delete file every reader must apply, one more manifest. Compaction rewrites
+  **every data file that carries a delete** without its deleted rows, so afterwards the
+  table has **no delete files**, and packs **small files** together per partition into
+  files of up to `--target-file-size` (default `512MiB`, Iceberg's own; `0` only applies
+  deletes). The commit is one Iceberg **`replace`** snapshot whose manifest list names a
+  **single data manifest**: the files it wrote (ADDED), the ones it kept (EXISTING, with
+  the sequence numbers they were first committed with), and the ones it removed
+  (DELETED), plus a manifest recording the delete files it removed. Earlier snapshots are
+  untouched, so time travel reads exactly what it did. Columns a file predates (additive
+  schema evolution) are written as null. Nothing to do commits nothing. Reads go through
+  the same seam as a merge, so `compact s3://…` (with `--features object_store`) runs the
+  same code; the library entry points are `compact_table` and
+  `shapeshift_objstore::compact_iceberg`.
+  **Verified against DuckDB 2.0**: the model-check now compacts after every second merge
+  and after the last, at a random target (pack everything, deletes only, or 16 KiB bins),
+  and requires the same rows, no live delete file, merges that keep working on the
+  compacted files, and time travel to every snapshot before and after — on local,
+  `file://` and S3 (moto) tables. A build that kept the deleted rows fails it at the
+  first compaction. **Measured**: after 30 daily merges into a 1M-row table, a DuckDB
+  scan took 71 ms (31 data files, 30 delete files, 61 manifests); after a 0.7 s
+  compaction that peaked at 23 MiB, 9 ms (7 ms before any merge), and the next merge
+  0.15 s instead of 0.28 s.
+
+### Fixed
+
+- **A failed object-store upload no longer leaves the files already sent behind.** A write
+  whose upload fails, or whose commit the guard refuses, removes every object it put.
+
 ## [0.3.0] - 2026-10-28
 
 ### Upgrading
@@ -587,7 +752,8 @@ build musl-static and ships as a single binary.
 - **Not in the engine:** no incremental / CDC, no scheduling, and no connectors — those
   belong to an orchestrator.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.1...v0.1.2

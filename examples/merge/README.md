@@ -80,7 +80,13 @@ reader. Six randomized scenarios each run a sequence of merges:
   reads back.
 
 After every merge, the script compares `iceberg_scan` with a plain-Python model of the
-rules above. At the end it time-travels to every snapshot and checks each one.
+rules above. It compacts the table along the way (see [Compact](#compact)). At the end it
+time-travels to every snapshot and checks each one.
+
+Every write runs with `--summary-json`, and the summary is checked against the table too:
+the snapshot a merge, compaction or expiry says it committed must be DuckDB's newest, a
+merge's key counts (updated, inserted, replaced, repeated, null) must be the model's, and an
+expiry must name exactly the snapshots that are gone.
 
 ```sh
 cargo build -p shapeshift-cli
@@ -101,7 +107,8 @@ scenarios there. Any S3-compatible server works for a local check; here is moto:
 ```sh
 cargo build -p shapeshift-cli --features object_store
 .venv/bin/moto_server -H 127.0.0.1 -p 5555 &   # moto and boto3 come with requirements.txt
-export AWS_ENDPOINT=http://127.0.0.1:5555 AWS_ALLOW_HTTP=true \
+.venv/bin/python examples/merge/s3_proxy.py --listen 5556 --upstream 5555 --delay-ms 1 &
+export AWS_ENDPOINT=http://127.0.0.1:5556 AWS_ALLOW_HTTP=true \
        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
 .venv/bin/python -c "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:5555').create_bucket(Bucket='lake')"
 .venv/bin/python examples/merge/verify_duckdb.py --bin target/debug/shapeshift --tables s3://lake/verify
@@ -111,11 +118,80 @@ DuckDB reads the tables back through `httpfs` with the same `AWS_*` settings.
 `--tables file:///abs/dir` runs the object-store code path on local disk, with no
 server.
 
+[`s3_proxy.py`](./s3_proxy.py) makes moto behave like S3 on the wire. moto closes each
+connection after its response; S3 keeps it open, and a client that reuses a pooled
+connection the wrong way only hangs against S3. Through the proxy it hangs here too, and any
+request the binary had to retry fails the check. `--delay-ms` adds latency to every request,
+so a run's request count costs what it would against a real store, and `GET /__stats` counts
+the requests by kind (HEAD, GET, ranged GET, PUT, POST, DELETE) and the most in flight.
+
+## Compact
+
+Each merge leaves one more data file and one more delete file for every reader to apply.
+`compact` rewrites the files carrying deletes without their deleted rows, packs small files
+per partition, and commits the result as one `replace` snapshot:
+
+```sh
+shapeshift compact orders
+```
+
+```text
+compacted orders → snapshot 4021474057372123141 (replace)
+  rewrote 2 data file(s) (3.4 KiB) into 1 (1.7 KiB); kept 0 as they were
+  applied 2 position delete(s) from 1 delete file(s) — the table has none left
+  5 live row(s) rewritten across 1 partition(s); earlier snapshots still read their own files
+```
+
+`inspect` then shows `total-records: 5` with nothing removed by deletes, DuckDB reads the
+same five rows, and time travel to snapshots 1 and 2 still returns what it did. Run it again
+and it reports `nothing to compact`. `--target-file-size 0` only applies deletes and packs
+nothing.
+
+Compaction keeps the old files for the snapshots before it. `expire` lets those go:
+
+```sh
+shapeshift expire orders --older-than 0s
+```
+
+```text
+expired 2 snapshot(s) of orders; kept 1
+  deleted 2 data file(s), 1 delete file(s), 3 manifest(s), 2 manifest list(s) — 12.8 KiB
+```
+
+Without `--older-than` it expires snapshots older than five days. `--retain-last N` keeps the
+newest N however old, and `--dry-run` reports without changing anything.
+
+`verify_duckdb.py` compacts too: after every second merge and after the last
+(`--compact-every N`, `0` to skip), at a randomly picked target, and checks the rows, that
+no delete file is left live, the merges that follow, and time travel to every snapshot.
+After each compaction it expires all but the newest 1-3 snapshots and checks that DuckDB
+lists exactly those, reads the model, and time-travels to each.
+
+## Concurrent writers
+
+[`race_writers.py`](./race_writers.py) starts several writers merging into one table at once
+(each over its own keys, a round at a time) while a janitor runs `compact` and `expire` in a
+loop. A writer that exits 75 — the commit guard refused it, nothing was published — runs the
+same round again; its `--summary-json` must say `conflict`. At the end DuckDB must read exactly
+what each writer's last round says, and the table versions the successful runs reported must be
+1..N, each claimed by exactly one run:
+
+```sh
+.venv/bin/python examples/merge/race_writers.py --bin target/debug/shapeshift
+# ok  582 rows exactly as the writers left them: 40 writer commits, 67 retried after a conflict, ...
+```
+
+`--tables` takes a URL prefix as `verify_duckdb.py` does. `--negative-control` runs a binary
+built before the guard (and before `--summary-json`, so it reads the text report) and succeeds
+only if writes were lost.
+
 ## Limits
 
-- One writer at a time, like `--append`.
-- Delete files accumulate until a compaction command exists. `inspect` shows how many
-  rows they hide.
+- Concurrent writers are refused, not merged: the second of two that built on the same version
+  exits 75 and must run again (`race_writers.py` checks exactly that).
+- Delete files accumulate until the table is compacted. `inspect` shows how many rows they
+  hide.
+- `expire` keeps the old `metadata.json` files, one per commit.
 - Memory grows with the delta, not with the table: an entry per distinct key, plus every position
   the merge deletes (each earlier repeat of a key in the input is one) and the positions earlier
   merges deleted.

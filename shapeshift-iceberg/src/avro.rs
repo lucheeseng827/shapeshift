@@ -226,6 +226,52 @@ impl ManifestContent {
     }
 }
 
+/// How a manifest entry stands in the snapshot whose manifest list names the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryStatus {
+    /// Live, added by an earlier snapshot.
+    Existing,
+    /// Live, added by this snapshot.
+    Added,
+    /// Removed by this snapshot. Readers skip it; it records what the snapshot removed.
+    Deleted,
+}
+
+impl EntryStatus {
+    fn id(self) -> i64 {
+        match self {
+            EntryStatus::Existing => 0,
+            EntryStatus::Added => 1,
+            EntryStatus::Deleted => 2,
+        }
+    }
+}
+
+/// One manifest entry to write: a file and how it stands in the snapshot.
+pub struct EntryOut<'a> {
+    pub status: EntryStatus,
+    /// The snapshot that added the file (an EXISTING entry) or that adds or removes it
+    /// (an ADDED or DELETED entry).
+    pub snapshot_id: i64,
+    /// The file's data sequence number. `None` inherits the manifest's, which the spec
+    /// allows only for an entry ADDED by the manifest's own snapshot. A carried EXISTING
+    /// or DELETED entry must keep the number it was first committed with, since a
+    /// position delete applies only to data files at or below its own number.
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    pub file: &'a DataFileMeta,
+}
+
+fn enc_opt_long(buf: &mut Vec<u8>, v: Option<i64>) {
+    match v {
+        None => enc_long(buf, 0), // union index 0 → null
+        Some(n) => {
+            enc_long(buf, 1); // union index 1 → long
+            enc_long(buf, n);
+        }
+    }
+}
+
 /// Write the manifest (Avro OCF) listing `data_files` as ADDED entries for
 /// `snapshot_id`, over the identity `partition_fields` (empty = unpartitioned). The
 /// embedded schema's `partition` record and each file's partition tuple are built from
@@ -240,15 +286,39 @@ pub fn write_manifest(
     content: ManifestContent,
     sync: [u8; 16],
 ) -> Vec<u8> {
+    let entries: Vec<EntryOut> = data_files
+        .iter()
+        .map(|file| EntryOut {
+            status: EntryStatus::Added,
+            snapshot_id,
+            sequence_number: None,
+            file_sequence_number: None,
+            file,
+        })
+        .collect();
+    write_manifest_entries(&entries, partition_fields, table_schema_json, content, sync)
+}
+
+/// Write a manifest (Avro OCF) of `entries`, each with its own status, snapshot and
+/// sequence numbers — what a snapshot that rewrites files needs: the files it adds, the
+/// live files it carries, and the files it removes, in one manifest. Otherwise as
+/// [`write_manifest`].
+pub fn write_manifest_entries(
+    entries: &[EntryOut],
+    partition_fields: &[PartitionField],
+    table_schema_json: &str,
+    content: ManifestContent,
+    sync: [u8; 16],
+) -> Vec<u8> {
     let mut body = Vec::new();
-    for df in data_files {
+    for e in entries {
+        let df = e.file;
         // manifest_entry
-        enc_long(&mut body, 1); // status = ADDED
-        enc_long(&mut body, 1); // snapshot_id union index 1 (long)
-        enc_long(&mut body, snapshot_id);
-        enc_long(&mut body, 0); // sequence_number union index 0 (null → inherited)
-        enc_long(&mut body, 0); // file_sequence_number union index 0 (null → inherited)
-                                // data_file record
+        enc_long(&mut body, e.status.id());
+        enc_opt_long(&mut body, Some(e.snapshot_id));
+        enc_opt_long(&mut body, e.sequence_number);
+        enc_opt_long(&mut body, e.file_sequence_number);
+        // data_file record
         enc_long(&mut body, content.id() as i64); // content: 0 data, 1 position deletes
         enc_str(&mut body, &df.path); // file_path
         enc_str(&mut body, "PARQUET"); // file_format
@@ -272,7 +342,7 @@ pub fn write_manifest(
         ("format-version", b"2"),
         ("content", content.header()),
     ];
-    build_ocf(&schema, extra, data_files.len(), &body, sync)
+    build_ocf(&schema, extra, entries.len(), &body, sync)
 }
 
 /// One `manifest_file` record — a manifest referenced by a snapshot's manifest list.
@@ -825,6 +895,8 @@ pub struct ManifestEntry {
     pub partition: Vec<PartVal>,
     pub record_count: i64,
     pub file_size: i64,
+    pub value_counts: Vec<(i32, i64)>,
+    pub null_counts: Vec<(i32, i64)>,
     pub lower_bounds: Vec<(i32, Vec<u8>)>,
     pub upper_bounds: Vec<(i32, Vec<u8>)>,
 }
@@ -834,10 +906,42 @@ impl ManifestEntry {
     pub fn is_live(&self) -> bool {
         self.status != 2
     }
+
+    /// The file as a manifest records it: path, partition, counts and column statistics.
+    /// Carrying it into a new manifest keeps everything a reader prunes with.
+    pub fn file_meta(&self) -> DataFileMeta {
+        DataFileMeta {
+            path: self.file_path.clone(),
+            partition: self.partition.clone(),
+            record_count: self.record_count,
+            file_size: self.file_size,
+            value_counts: self.value_counts.clone(),
+            null_counts: self.null_counts.clone(),
+            lower_bounds: self.lower_bounds.clone(),
+            upper_bounds: self.upper_bounds.clone(),
+        }
+    }
 }
 
 fn opt_long(v: Option<&AvroValue>) -> Option<i64> {
     v.and_then(AvroValue::as_long)
+}
+
+/// An Iceberg `map<int, long>` (value or null counts), written as an array of key/value
+/// records.
+fn counts_map(v: Option<&AvroValue>) -> Vec<(i32, i64)> {
+    let Some(AvroValue::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|kv| {
+            Some((
+                kv.get("key")?.as_long()? as i32,
+                kv.get("value")?.as_long()?,
+            ))
+        })
+        .collect()
 }
 
 /// An Iceberg `map<int, bytes>` (bounds), written as an array of key/value records.
@@ -905,6 +1009,8 @@ pub fn read_manifest_entries(data: &[u8]) -> Result<Vec<ManifestEntry>> {
             record_count: opt_long(df.get("record_count"))
                 .ok_or_else(|| read_err("data_file has no record_count"))?,
             file_size: opt_long(df.get("file_size_in_bytes")).unwrap_or(0),
+            value_counts: counts_map(df.get("value_counts")),
+            null_counts: counts_map(df.get("null_value_counts")),
             lower_bounds: bounds_map(df.get("lower_bounds")),
             upper_bounds: bounds_map(df.get("upper_bounds")),
         });
@@ -1073,6 +1179,71 @@ mod tests {
         assert_eq!(a.upper_bounds, vec![(1, 20i64.to_le_bytes().to_vec())]);
         assert_eq!(entries[1].partition[0], PartVal::Null);
         assert_eq!(entries[1].partition[1], PartVal::Int(-1));
+    }
+
+    #[test]
+    fn carried_entries_keep_their_status_snapshot_sequence_and_stats() {
+        let file = |path: &str| DataFileMeta {
+            path: path.into(),
+            partition: vec![],
+            record_count: 7,
+            file_size: 99,
+            value_counts: vec![(1, 7), (2, 7)],
+            null_counts: vec![(1, 0), (2, 3)],
+            lower_bounds: vec![(1, 10i64.to_le_bytes().to_vec())],
+            upper_bounds: vec![(1, 20i64.to_le_bytes().to_vec())],
+        };
+        let (added, kept, gone) = (
+            file("/t/new.parquet"),
+            file("/t/kept.parquet"),
+            file("/t/old.parquet"),
+        );
+        let entry = |status, snapshot_id, seq, file| EntryOut {
+            status,
+            snapshot_id,
+            sequence_number: seq,
+            file_sequence_number: seq,
+            file,
+        };
+        let bytes = write_manifest_entries(
+            &[
+                entry(EntryStatus::Added, 9, None, &added),
+                entry(EntryStatus::Existing, 4, Some(2), &kept),
+                entry(EntryStatus::Deleted, 9, Some(3), &gone),
+            ],
+            &[],
+            "{}",
+            ManifestContent::Data,
+            [5u8; 16],
+        );
+        let entries = read_manifest_entries(&bytes).unwrap();
+        let got: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.status,
+                    e.snapshot_id,
+                    e.sequence_number,
+                    e.file_sequence_number,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, Some(9), None, None),
+                (0, Some(4), Some(2), Some(2)),
+                (2, Some(9), Some(3), Some(3)),
+            ]
+        );
+        assert!(!entries[2].is_live());
+        // A carried entry round-trips everything a reader prunes with.
+        let back = entries[1].file_meta();
+        assert_eq!(back.path, "/t/kept.parquet");
+        assert_eq!(back.value_counts, kept.value_counts);
+        assert_eq!(back.null_counts, kept.null_counts);
+        assert_eq!(back.lower_bounds, kept.lower_bounds);
+        assert_eq!(back.upper_bounds, kept.upper_bounds);
     }
 
     #[test]

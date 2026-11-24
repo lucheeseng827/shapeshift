@@ -44,7 +44,7 @@ sibling modules forge/recall/evald). The member list is a closed set of six crat
 | `shapeshift-json` | Streaming JSON source over the simd-json SIMD lexer: `JsonlReader` (one object/line, bounded RAM) and `JsonArrayReader` (streamed element-at-a-time, bounded RAM). | simd-json 0.14 | read |
 | `shapeshift-parquet` | `ParquetSink` (RecordBatch → Parquet, one row group per batch, Snappy default) + `inspect()` read-back. | parquet 54 `["arrow","snap"]` | write |
 | `shapeshift-iceberg` | `IcebergSink`: a self-contained Apache **Iceberg v2** table (no catalog server), **append-to-existing / multi-snapshot** (`--append`) + `inspect()`. Owns the hand-rolled Avro encoder **and reader** (the reader carries a prior snapshot's manifests forward on append), and a **backend-agnostic table builder** (`IcebergDataWriter` + `build_metadata_artifacts`, paths anchored at a base location) the object-store sink reuses. | parquet 54, uuid v4 | write |
-| `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table (data + manifests + metadata) in S3/GCS/Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. The driver that reuses other drivers (`parquet`, `iceberg`); opt-in behind the CLI's `object_store` feature. | object_store 0.14, tokio (current-thread) | write (remote) |
+| `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table (data + manifests + metadata, put 8 at a time) in S3/GCS/Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. The driver that reuses other drivers (`parquet`, `iceberg`); opt-in behind the CLI's `object_store` feature. | object_store 0.14, tokio (current-thread) | write (remote) |
 | `shapeshift-cli` | The single `shapeshift` binary. Orchestrates source → shaper → sink and owns the CLI surface. | clap 4 (derive), anyhow, tracing | driver |
 
 **Why this shape.** `core` is the I/O-free brain: it can be inference-tested, coercion-tested,
@@ -353,19 +353,202 @@ The decisions that make it correct:
 Memory is the trade: an append holds one row group, but a merge also holds **one entry per distinct
 key in the delta** (the key's bytes plus a few dozen bytes) and the positions it deletes: one per
 earlier repeat of a key in the input, one per prior row it replaces. It also loads the positions
-earlier merges deleted, to skip them; those pile up until a compaction exists. It never holds
-anything per live table row. Like `--append`, a merge assumes a single writer.
+earlier merges deleted, to skip them; those pile up until the table is compacted (§8b). It never
+holds anything per live table row. A merge that loses a race to another writer is refused by the
+commit guard (§8d) and run again.
 
 **Where the table lives does not change the merge.** Every read of the existing table goes through
 one trait, `TableFiles` — a whole file, a file's size, byte ranges of a file — implemented for local
 disk (`LocalTableFiles`) and for an object store (`StoreFiles`, in `shapeshift-objstore`), and the
 write half (`MergeWriter`) is shared by both sinks. Parquet is never read straight from the source:
 the merge fetches a data file's footer, then — one row group at a time — exactly the byte ranges of
-the key columns' chunks, and parquet decodes from that in-memory `RangeCache`. Against an object
-store that is a `HEAD`, one footer `GET`, and one coalesced ranged `GET` per row group, where
-parquet's own sync reader would issue a request per page header; memory is bounded by one row
-group's key chunks. The object-store sink stages its delete files beside its data files and uploads
-both before the manifests that list them, with `version-hint.text` still published last.
+the key columns' chunks, and parquet decodes from that in-memory `RangeCache`. The file's size comes
+from its manifest entry (`file_size_in_bytes`), so against an object store a data file costs one
+footer `GET` and one coalesced ranged `GET` per row group — no `HEAD`, unless the recorded size
+proves wrong and the footer cannot be found at it — where parquet's own sync reader would issue a
+request per page header. The footer's read takes the file's last 64 KiB, so a smaller file arrives
+whole with it, and a column chunk that read already holds is not fetched again: a small file is
+one `GET`.
+
+**Reads overlap.** A store answers each request in tens of milliseconds however many are in flight,
+so reading one file after another leaves the merge waiting. The manifests, the delete files, and the
+data files the merge must scan are each read by a small pool of threads — `TableFiles::readers`: 8
+for an object store, up to 4 for local disk, `SHAPESHIFT_READERS` to override — and every result is
+used in table order, so the delete files a merge writes do not depend on which read finished first.
+Memory is bounded by one row group's key chunks *per reader*. The threads share `StoreFiles`' one
+current-thread tokio runtime (whichever blocks on it first drives the I/O for all), and `StoreFiles`
+has an HTTP client of its own that nothing else uses: a pooled keep-alive connection belongs to the
+runtime it was opened on, and one reused from another runtime while its own is idle never sends its
+request.
+
+**Writes overlap too.** The object-store sink stages its delete files beside its data files, and
+puts them, the manifests and the manifest list as one batch — 8 requests in flight, at most 16 MiB
+of file bytes in memory (two 8 MiB parts, what one multipart upload held when uploads went one at a
+time) — since nothing names those objects until the metadata file does. A file that fits in a part
+is one `PUT`; a larger one is a multipart upload. Then the guarded metadata file, then
+`version-hint.text`. If any put fails or the commit is refused, every object of the batch is
+deleted again, so a failed write leaves nothing behind. Expiry deletes the same way, 8 at a time.
+
+## 8b. Compaction — `shapeshift compact`
+
+Merge-on-read makes every merge cheap and every read a little dearer: one more data file, one more
+delete file every reader loads and applies, one more manifest (two, with the delete manifest).
+`compact` (the `compact` module of `shapeshift-iceberg`) pays that back in one snapshot.
+
+```text
+current snapshot ──► live data files + the positions their delete files remove
+  group by partition, in manifest order
+    a file carrying a delete ─────────────► always rewritten
+    a clean file below the target size ───► packed, if its partition has another to pack it with
+    any other file ───────────────────────► kept
+  bins of up to --target-file-size (by each input's live share of its bytes)
+    each bin ──► read every column, one row group at a time; drop the deleted positions;
+                 lay the rows out as the current schema (a column a file predates → null)
+             ──► data/<partition>/<uuid>.parquet   (a bin with no live row writes nothing)
+  (readers fetch the bins' files ahead of the one writer, in order — see below)
+one data manifest:   ADDED (new files) · EXISTING (kept, original sequence numbers) · DELETED (inputs)
+one delete manifest: DELETED (every delete file)       ──► one snapshot, operation `replace`
+```
+
+The decisions that make it correct:
+
+- **Every file carrying a delete is rewritten, so every delete file can go.** A delete file names
+  the data files it applies to by path; once each of them is rewritten, the delete file applies to
+  nothing live. The table ends with **no delete files**, `total-position-deletes` is 0, and
+  `current_data_files` lists the table again.
+- **Kept files keep their sequence numbers.** An entry a snapshot carries rather than adds must
+  state its data sequence number explicitly (only an ADDED entry may inherit the manifest's). A
+  delete written by a later merge applies to data files at or below its own number, and the kept
+  files' numbers are below any later delete's, so later merges still reach them. The new files take
+  the compaction's own number.
+- **The snapshot is a `replace`.** The rows are unchanged; only the files holding them change. Its
+  summary records what it removed (`deleted-data-files`, `removed-delete-files`,
+  `removed-position-deletes`) beside the usual totals.
+- **One data manifest, whatever came before.** Every live entry is rewritten into it, so a reader
+  of the new snapshot opens one data manifest however many merges built the table. The delete
+  manifest records the delete files the snapshot removed and holds nothing live, so the next write
+  does not carry it forward.
+- **Earlier snapshots are left alone.** Their manifests and files are not touched, so time travel
+  reads what it read before. Deleting the files only they read is snapshot expiry (§8c), a
+  separate operation.
+- **A file is checked as it is rewritten.** The rows read from a file must equal its manifest's
+  `record_count`, and a column it stores must have the type the table says. A mismatch stops the
+  compaction before anything is committed, and the files it already wrote are removed.
+
+**Reads ahead, writes in order.** One writer copies the bins' files in table order, so the files it
+writes do not depend on how the reads were scheduled. Ahead of it, `TableFiles::readers` readers (8
+against an object store) each take the next file, across bins: its footer, then its row groups in
+order. What they fetch waits for the writer in table order, about 16 MiB of it (`read_ahead` in
+the `files` module), and the row group the writer needs next is always fetched, however large, so
+the budget can slow reading but never stop it. A failed read is returned when the writer reaches
+it; a reader that panics stops the others rather than leaving the writer waiting.
+
+Memory is one output row group, the row group being copied, about 16 MiB of fetched bytes read
+ahead, and the deleted positions of the table (the same list a merge loads). Reads go through
+`TableFiles`, as a merge's do, so a local table and an object-store table compact with the same
+code; the object-store variant stages the new files and uploads them before the metadata that names
+them, `version-hint.text` last. A compaction runs longest of any commit, so it is the likeliest to
+lose a race; the commit guard (§8d) refuses it and its files are removed.
+
+## 8c. Snapshot expiry — `shapeshift expire`
+
+Every commit keeps the whole history: each snapshot's manifest list, its manifests, and every file
+they name stay on disk, so any snapshot can be time-travelled to. A compaction makes that
+expensive: it rewrites the table's live rows and keeps its inputs for the snapshots before it.
+`expire` (the `expire` module of `shapeshift-iceberg`) lets the old history go.
+
+```text
+keep: the current snapshot · every snapshot a ref names · the newest N of the current
+      snapshot's ancestry (--retain-last) · every snapshot at or after the cutoff (--older-than)
+read every snapshot's manifest list, then every manifest they name (once each; no data file)
+needed  = retained snapshots' manifest lists + their manifests + the files those list as live
+delete  = everything expired snapshots reference − needed − anything outside the table
+publish v{N+1}.metadata.json without the expired snapshots, then version-hint.text
+then    delete, one file at a time (a file already gone counts as deleted)
+```
+
+The decisions that make it safe:
+
+- **Needed means live in a retained snapshot.** A file a retained snapshot lists only as removed
+  (a DELETED entry, as a compaction writes) is not read by it, so it can go. A file listed as live
+  by any retained snapshot stays, whichever snapshot wrote it. Paths are compared exactly as
+  recorded: shapeshift writes each file's path once and carries it verbatim.
+- **Never outside the table.** A file is deleted only if its recorded path lies under the
+  table's `location` or under where the table is now. A copy of a table can name another
+  table's files (paths are absolute); expiring the copy must not delete the original's, so such
+  paths are counted and left.
+- **Commit first, delete after.** The metadata without the expired snapshots is published before
+  any file is deleted. A crash in between leaves files nothing references, never a table that
+  names a missing file.
+- **The metadata keeps its shape.** The current snapshot and sequence numbers are unchanged;
+  `refs` keep the references whose snapshot survives; `snapshot-log` keeps its newest entries up
+  to the first expired one, so it stays the current snapshot's unbroken history; the superseded
+  metadata file goes into `metadata-log`. Retained snapshots can still name an expired parent, as
+  Iceberg allows.
+- **Old `metadata.json` files are kept.** Each commit leaves one; they are small, and deleting
+  them is a separate retention setting in Iceberg as well.
+
+Memory is the manifest entries of the table's history, read once; no data file is opened. The
+reads go through the merge's reader pool (§8a: 8 at a time against an object store, where they are
+what planning costs), and the plan is built from them in table order, so it does not depend on which
+read finished first. Against an object store the metadata is put, then the files go to the store's many-delete call (on S3 one
+`DeleteObjects` request per thousand keys; any key it does not confirm is retried alone). If another
+writer commits after the plan is made, the commit guard (§8d) refuses the expiry before anything is
+deleted. A reader still on an expired snapshot loses its files.
+
+## 8d. Concurrent writers — the commit guard
+
+Every commit — an append, a merge, a compaction, an expiry — builds on the version it loaded and
+publishes the next one. Without a guard, two writers that loaded version N both write
+`v{N+1}.metadata.json`, and the second silently replaces the first: its snapshot, and every row in
+it, is gone, while its writer reported success. Measured, not assumed: four writers merging into one
+table while a janitor compacted and expired it lost 400-odd of ~580 rows their writers had been
+told were committed, and other runs crashed on a half-written `version-hint.text`.
+
+```text
+commit(N+1):
+  data files, delete files, manifests, manifest list      fresh names; nothing can collide
+  create metadata/v{N+1}.metadata.json — only if absent   THE commit point
+      local:  write .v{N+1}.<uuid>.tmp, fsync, hard_link → the name (fails if it exists)
+      store:  put with PutMode::Create (S3: If-None-Match: *; GCS, Azure: their preconditions)
+      taken by a successor of N  → ShapeError::Conflict, everything above is removed, CLI exit 75
+      taken by anything else     → a leftover from an earlier table: an error that says how to clear it
+  version-hint.text := N+1 — atomically (temp + rename), and only if no N+2 exists yet
+read(version):
+  hint (0 if missing), then v+1, v+2, … while each file exists and its metadata-log names the one before
+```
+
+The decisions that make it hold:
+
+- **The metadata file is the commit, the hint is a hint.** Creating `v{N+1}` is atomic and
+  exclusive, so exactly one writer wins each version. The hint is written after, so a crash or a
+  slower writer can leave it behind; readers and writers walk forward past it, so a committed
+  snapshot is never lost behind a stale hint and a writer never wedges on one.
+- **Only successors count.** A later file is followed only if its `metadata-log` names the version
+  before it. shapeshift 0.3 and earlier rewrote `v1` in place on a write without `--append`,
+  leaving older `v2`… beside it; those never continue from the rewritten `v1`, so they are not
+  mistaken for commits. A write without `--append` now replaces the table *as the next version*,
+  recording its predecessor, so it never needs to overwrite anything.
+- **The loser leaves nothing.** A refused writer deletes the data, delete and manifest files it
+  staged (locally, or in one many-delete call in a store). Its run reported nothing as committed,
+  and running it again rebuilds it on the winner's version.
+- **An error is not a refusal.** On a store a commit's error can hide a put that landed: a 5xx
+  after the store applied it is retried and the retry fails as "already exists", and a timeout
+  can come back for a put that went through. So the metadata key is read back; holding this
+  write's exact bytes, the commit stands. Holding another writer's, it is refused as above. If the
+  outcome stays unknown, the error is returned and the staged files are left in place: an orphan
+  costs storage, a deleted file of a committed snapshot breaks every reader.
+- **A failure after the table moved on is a conflict.** A merge reads the files of the version it
+  loaded; a compaction plus an expiry committed meanwhile can delete them. The resulting
+  missing-file error is reported as `Conflict` — the retry, not the I/O, is the remedy.
+- **Retrying is the caller's job.** The engine refuses rather than serialises: exit status 75
+  (`EX_TEMPFAIL`) tells an orchestrator to run the step again. Serialising writers belongs to a
+  catalog.
+- **The store must honour the precondition.** AWS S3 (since 2024), GCS, Azure, MinIO and R2 do;
+  a store that ignores `If-None-Match` accepts both puts and cannot be guarded.
+
+`examples/merge/race_writers.py` checks it end to end with real processes, on local disk and over
+the S3 protocol, and its `--negative-control` mode demonstrates the loss on a build without it.
 
 ## 9. The Parquet sink
 
@@ -423,7 +606,10 @@ lenient policy:
 Both are appended to `<output>.rejects.jsonl` as one JSON object per line —
 `{"line","error","raw"}` — keyed by source line. The run completes and the summary line reports
 the counts. Strict mode (`schema: strict`) converts these into aborts. Logs go to stderr at the
-`-v`/`-vv` level; the summary and command output go to stdout.
+`-v`/`-vv` level; the summary and command output go to stdout — as text, or under
+`--summary-json` (`shape`, `compact`, `expire`) as one versioned JSON document built from the
+`SinkSummary` / `CompactSummary` / `ExpireSummary` and the shaper's drift report, which also
+carries a failed run's error and its kind.
 
 ### Schema drift — the third loss channel
 
@@ -524,9 +710,10 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   default), `rescue`, `quarantine`, `error`, or `ignore`. What is *not* here is the stateful half:
   remembering a dataset's shape between runs, propagating a new column into the destination on the
   next run, drift history, alerting. Those need memory and a schedule — an orchestrator's job.
-- **Upsert** (`--merge-on`, §8a) works on local and object-store tables, assumes a single writer,
-  and leaves position-delete files in place — there is no compaction yet, so read cost grows with
-  every merge until one exists.
+- **Upsert** (`--merge-on`, §8a) works on local and object-store tables, refuses (rather than
+  serialises) a concurrent writer (§8d), and leaves position-delete files in place, so read cost grows with every merge until the table
+  is compacted (`compact`, §8b). Compaction keeps every earlier snapshot's files until
+  `expire` (§8c) lets the old snapshots go; old `metadata.json` files are kept.
 - **No CDC capture, no scheduling, no connectors** — deliberately kept out of the engine
   (next section). Applying a delta it is handed (`--merge-on`) is the engine's job; deciding which
   rows changed since the last run is not.
@@ -542,7 +729,8 @@ which composes tools like shapeshift as steps. Keeping that boundary sharp is wh
 stay a pure, I/O-free-core, single static binary that anyone can self-host with no row cap and no
 telemetry.
 
-The engine's contract to an orchestrator is exactly the CLI surface and the `SinkSummary` it
+The engine's contract to an orchestrator is exactly the CLI surface — its flags, its exit
+statuses (75: refused by the commit guard, run it again) and the `--summary-json` document it
 prints; nothing more couples them, so capability added at the orchestration layer never needs to
 change — or cap — the engine.
 

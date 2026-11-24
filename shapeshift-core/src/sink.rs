@@ -20,6 +20,10 @@ pub struct SinkSummary {
     pub bytes: u64,
     /// What a merge (`merge_on`) did, for a sink that merged; `None` for a plain write.
     pub merge: Option<MergeSummary>,
+    /// For a table sink: the table version this write committed (`v{N}.metadata.json`).
+    pub table_version: Option<u64>,
+    /// For a table sink: the snapshot this write committed.
+    pub snapshot_id: Option<i64>,
 }
 
 /// What one merge (upsert on a key) did to the table. Every count is exact: the rows a

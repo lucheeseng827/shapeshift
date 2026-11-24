@@ -85,6 +85,11 @@ pub struct MetadataInput<'a> {
     pub timestamp_ms: i64,
     pub manifest_list_path: &'a str,
     pub counts: SnapshotCounts,
+    /// The metadata file of an earlier table at this location that this fresh table
+    /// replaces (a write without `append` onto an existing table), recorded as its
+    /// `metadata-log` predecessor. The next version continues from the current one, so a
+    /// reader looking past the version hint can tell a successor from a leftover.
+    pub replaces_metadata_file: Option<&'a str>,
 }
 
 /// The row and file counts one snapshot's summary records. Data and delete files are
@@ -97,16 +102,27 @@ pub struct SnapshotCounts {
     pub added_records: i64,
     pub added_delete_files: i64,
     pub added_position_deletes: i64,
+    /// Data files the snapshot removes, and every row they held (deleted ones included).
+    pub removed_data_files: i64,
+    pub removed_records: i64,
+    /// Delete files the snapshot removes, and the positions they deleted.
+    pub removed_delete_files: i64,
+    pub removed_position_deletes: i64,
     pub total_data_files: i64,
     pub total_records: i64,
     pub total_delete_files: i64,
     pub total_position_deletes: i64,
+    /// The snapshot rewrites files without changing the table's rows (a compaction).
+    pub replace: bool,
 }
 
-/// The snapshot `summary`. A snapshot that deletes rows is an `overwrite` — the
+/// The snapshot `summary`. A compaction is a `replace`: the rows stay the same, only the
+/// files holding them change. A snapshot that deletes rows is an `overwrite` — the
 /// operation Iceberg names for one that both adds and removes — otherwise an `append`.
 fn summary_json(c: &SnapshotCounts) -> Value {
-    let operation = if c.added_position_deletes > 0 {
+    let operation = if c.replace {
+        "replace"
+    } else if c.added_position_deletes > 0 {
         "overwrite"
     } else {
         "append"
@@ -125,6 +141,15 @@ fn summary_json(c: &SnapshotCounts) -> Value {
         summary["added-delete-files"] = json!(c.added_delete_files.to_string());
         summary["added-position-delete-files"] = json!(c.added_delete_files.to_string());
         summary["added-position-deletes"] = json!(c.added_position_deletes.to_string());
+    }
+    if c.removed_data_files > 0 {
+        summary["deleted-data-files"] = json!(c.removed_data_files.to_string());
+        summary["deleted-records"] = json!(c.removed_records.to_string());
+    }
+    if c.removed_delete_files > 0 {
+        summary["removed-delete-files"] = json!(c.removed_delete_files.to_string());
+        summary["removed-position-delete-files"] = json!(c.removed_delete_files.to_string());
+        summary["removed-position-deletes"] = json!(c.removed_position_deletes.to_string());
     }
     summary
 }
@@ -166,7 +191,10 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
         "refs": { "main": { "snapshot-id": inp.snapshot_id, "type": "branch" } },
         "snapshots": [snapshot],
         "snapshot-log": [ { "timestamp-ms": inp.timestamp_ms, "snapshot-id": inp.snapshot_id } ],
-        "metadata-log": [],
+        "metadata-log": match inp.replaces_metadata_file {
+            Some(file) => json!([{ "timestamp-ms": inp.timestamp_ms, "metadata-file": file }]),
+            None => json!([]),
+        },
     }))
 }
 
@@ -199,10 +227,9 @@ pub struct AppendInput<'a> {
 /// schemas stay in `schemas`, so old snapshots remain readable — and the partition spec
 /// is carried forward unchanged (the caller checks compatibility first).
 ///
-/// Roadmap — retention: `snapshots`, `snapshot-log`, and `metadata-log` only ever grow
-/// here (every append clones the whole prior `metadata.json` and re-parses it), so a table
-/// appended to indefinitely accumulates unbounded history. Snapshot / metadata-log
-/// expiration (the retention that real catalogs perform) is future catalog-side work.
+/// Retention: `snapshots`, `snapshot-log`, and `metadata-log` only ever grow here (every
+/// append clones the whole prior `metadata.json`); [`remove_snapshots`] is how an expiry
+/// shortens them.
 pub fn append_snapshot(inp: &AppendInput) -> Result<Value> {
     let mut m = inp.prior.clone();
     if !m.is_object() {
@@ -251,6 +278,86 @@ pub fn append_snapshot(inp: &AppendInput) -> Result<Value> {
         json!({ "timestamp-ms": prior_ts, "metadata-file": prior_meta_file }),
     );
 
+    Ok(m)
+}
+
+/// Inputs for [`remove_snapshots`]: the same table with fewer snapshots.
+pub struct RemoveInput<'a> {
+    /// The table's current `metadata.json`, parsed.
+    pub prior: &'a Value,
+    pub base_location: &'a str,
+    pub prior_version: u64,
+    /// The snapshots to keep. Must include the current one.
+    pub keep: &'a std::collections::HashSet<i64>,
+    pub timestamp_ms: i64,
+}
+
+/// The table's metadata without the snapshots not in `keep`. The current snapshot, the
+/// sequence numbers and the schemas are unchanged. `refs` keep only the references whose
+/// snapshot survives; `snapshot-log` keeps its newest entries up to the first one whose
+/// snapshot is gone (the log is the current snapshot's unbroken history, as Iceberg's own
+/// expiry leaves it); the superseded metadata file is recorded in the `metadata-log`.
+pub fn remove_snapshots(inp: &RemoveInput) -> Result<Value> {
+    let mut m = inp.prior.clone();
+    if !m.is_object() {
+        return Err(ShapeError::Sink(
+            "prior iceberg metadata is not a JSON object".into(),
+        ));
+    }
+    // An entry without an id is kept: it names nothing the expiry removed.
+    let kept =
+        |v: &Value, key: &str| !matches!(v[key].as_i64(), Some(id) if !inp.keep.contains(&id));
+    if let Some(current) = m["current-snapshot-id"].as_i64() {
+        if !inp.keep.contains(&current) {
+            return Err(ShapeError::Sink(
+                "internal error: an expiry would remove the current snapshot".into(),
+            ));
+        }
+    }
+    let snapshots: Vec<Value> = m["snapshots"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|s| kept(s, "snapshot-id"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    m["snapshots"] = Value::Array(snapshots);
+
+    let log: Vec<Value> = m["snapshot-log"].as_array().cloned().unwrap_or_default();
+    let mut suffix: Vec<Value> = log
+        .into_iter()
+        .rev()
+        .take_while(|e| kept(e, "snapshot-id"))
+        .collect();
+    suffix.reverse();
+    m["snapshot-log"] = Value::Array(suffix);
+
+    if let Some(refs) = m["refs"].as_object() {
+        let refs: serde_json::Map<String, Value> = refs
+            .iter()
+            .filter(|(_, r)| kept(r, "snapshot-id"))
+            .map(|(k, r)| (k.clone(), r.clone()))
+            .collect();
+        m["refs"] = Value::Object(refs);
+    }
+
+    let prior_ts = inp.prior["last-updated-ms"]
+        .as_i64()
+        .unwrap_or(inp.timestamp_ms);
+    m["last-updated-ms"] = json!(inp.timestamp_ms);
+    push_array(
+        &mut m,
+        "metadata-log",
+        json!({
+            "timestamp-ms": prior_ts,
+            "metadata-file": join_location(
+                inp.base_location,
+                &format!("metadata/v{}.metadata.json", inp.prior_version)
+            ),
+        }),
+    );
     Ok(m)
 }
 

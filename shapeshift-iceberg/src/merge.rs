@@ -25,14 +25,18 @@
 //! **Wherever the table lives.** Every read of the existing table goes through
 //! [`TableFiles`], and a data file's key columns are fetched one row group at a time
 //! (see the `files` module). A local table and an object-store table therefore run the
-//! same merge; only the byte source differs.
+//! same merge; only the byte source differs. Manifests, delete files and the data files
+//! to scan are each read several at a time, and every result is used in table order, so
+//! the delete files a merge writes do not depend on which read finished first.
 //!
-//! **Single writer.** Like `--append`, a merge assumes nothing else commits to the table
-//! while it runs; serialising concurrent writers is a catalog's job.
+//! **Concurrent writers.** A merge builds on the version it loaded; if another writer
+//! commits first, the commit guard refuses this one (see the crate root), and it is run
+//! again. Serialising writers instead is a catalog's job.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -47,7 +51,7 @@ use uuid::Uuid;
 use shapeshift_core::{Compression, MergeSummary, Result, ShapeError};
 
 use crate::avro::{read_manifest_entries, ManifestEntry};
-use crate::files::{RangedParquet, TableFiles};
+use crate::files::{read_each, RangedParquet, TableFiles};
 use crate::partition::{
     partition_dir, PartVal, PartitionDataFile, PartitionField, PartitionedWriter, Placement,
 };
@@ -285,10 +289,10 @@ impl KeyRange {
 }
 
 /// Where the latest occurrence of a key in this write landed, and whether the key
-/// matched a row already in the table.
+/// matched a row already in the table (set by whichever scan finds that row).
 struct Latest {
     slot: u32,
-    matched: bool,
+    matched: AtomicBool,
     pos: u64,
 }
 
@@ -379,7 +383,7 @@ impl MergeTracker {
                         key,
                         Latest {
                             slot,
-                            matched: false,
+                            matched: AtomicBool::new(false),
                             pos,
                         },
                     );
@@ -406,14 +410,16 @@ impl MergeTracker {
     /// rows whose key this write carries, marking those keys as updates. `deleted` is the
     /// file's already-deleted positions (sorted): a row a previous merge removed is not
     /// live, so it is neither matched nor deleted twice. Only the footer and, one row
-    /// group at a time, the key columns' chunks are fetched.
+    /// group at a time, the key columns' chunks are fetched. Several files are scanned at
+    /// once, so this only reads the tracker (marking a key matched is atomic).
     fn scan_file<F: TableFiles>(
-        &mut self,
+        &self,
         files: &F,
-        path: &str,
+        entry: &ManifestEntry,
         deleted: &[u64],
     ) -> Result<Vec<u64>> {
-        let pq = RangedParquet::open(files, path)?;
+        let path = entry.file_path.as_str();
+        let pq = RangedParquet::open(files, path, u64::try_from(entry.file_size).ok())?;
         let schema = pq.schema().clone();
         // Locate each key column by its Iceberg field-id (the name is the fallback for a
         // file written without ids). A file without a key column predates it, so every
@@ -441,6 +447,7 @@ impl MergeTracker {
         let mask = ProjectionMask::roots(pq.parquet_schema(), sorted.iter().copied());
 
         let mut hits = Vec::new();
+        let mut scratch = Vec::new();
         let mut pos: u64 = 0;
         let mut next_deleted = deleted.iter().peekable();
         for rg in 0..pq.num_row_groups() {
@@ -459,11 +466,11 @@ impl MergeTracker {
                     if next_deleted.next_if(|&&d| d == here).is_some() {
                         continue;
                     }
-                    if !encode_row(&arrs, row, &mut self.scratch) {
+                    if !encode_row(&arrs, row, &mut scratch) {
                         continue;
                     }
-                    if let Some(l) = self.latest.get_mut(self.scratch.as_slice()) {
-                        l.matched = true;
+                    if let Some(l) = self.latest.get(scratch.as_slice()) {
+                        l.matched.store(true, Ordering::Relaxed);
                         hits.push(here);
                     }
                 }
@@ -484,18 +491,20 @@ impl MergeTracker {
         // rather than report every file as "pruned".
         if let Some(prior) = cx.prior.filter(|_| !self.latest.is_empty()) {
             let live = live_files(files, prior)?;
-            for entry in &live.data {
-                if !self.may_hold(entry) {
-                    pruned += 1;
-                    continue;
-                }
-                scanned += 1;
+            let (candidates, skipped): (Vec<&ManifestEntry>, Vec<&ManifestEntry>) =
+                live.data.iter().partition(|e| self.may_hold(e));
+            pruned = skipped.len() as u64;
+            scanned = candidates.len() as u64;
+            let tracker = &self;
+            let found = read_each(files, &candidates, |entry| {
                 let deleted = live
                     .deletes
                     .get(&entry.file_path)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let positions = self.scan_file(files, &entry.file_path, deleted)?;
+                tracker.scan_file(files, entry, deleted)
+            })?;
+            for (entry, positions) in candidates.into_iter().zip(found) {
                 if !positions.is_empty() {
                     prior_rows_replaced += positions.len() as u64;
                     targets.push(Target {
@@ -525,7 +534,11 @@ impl MergeTracker {
         }
 
         let delete_files = write_delete_files(cx, targets)?;
-        let keys_updated = self.latest.values().filter(|l| l.matched).count() as u64;
+        let keys_updated = self
+            .latest
+            .values()
+            .filter(|l| l.matched.load(Ordering::Relaxed))
+            .count() as u64;
         let distinct_keys = self.latest.len() as u64;
         let summary = MergeSummary {
             key_columns: self.keys.iter().map(|k| k.name.clone()).collect(),
@@ -581,6 +594,8 @@ struct Target {
 pub(crate) struct LiveFiles {
     /// Live data-file entries.
     pub data: Vec<ManifestEntry>,
+    /// Live position-delete-file entries.
+    pub delete_files: Vec<ManifestEntry>,
     /// Deleted positions per data-file path (sorted, deduplicated), from the live
     /// position-delete files.
     pub deletes: HashMap<String, Vec<u64>>,
@@ -589,14 +604,24 @@ pub(crate) struct LiveFiles {
 /// Read a table's live data files and the positions its delete files remove. Refuses a
 /// table carrying equality deletes: shapeshift neither writes nor applies them, so it
 /// could not tell which rows are live.
+///
+/// Every returned entry has its snapshot id and sequence numbers filled in: an entry
+/// that left them null inherits its manifest's, as the spec says. A snapshot that
+/// carries the entry into a manifest of its own must then write them out explicitly.
 pub(crate) fn live_files<F: TableFiles>(files: &F, prior: &PriorTable) -> Result<LiveFiles> {
     let mut data = Vec::new();
     let mut delete_files = Vec::new();
-    for m in &prior.manifests {
-        for entry in read_manifest_entries(&files.read(&m.path)?)? {
+    let manifests = read_each(files, &prior.manifests, |m| {
+        read_manifest_entries(&files.read(&m.path)?)
+    })?;
+    for (m, entries) in prior.manifests.iter().zip(manifests) {
+        for mut entry in entries {
             if !entry.is_live() {
                 continue;
             }
+            entry.snapshot_id.get_or_insert(m.added_snapshot_id);
+            entry.sequence_number.get_or_insert(m.sequence_number);
+            entry.file_sequence_number.get_or_insert(m.sequence_number);
             match entry.content {
                 0 => data.push(entry),
                 1 => delete_files.push(entry),
@@ -611,23 +636,31 @@ pub(crate) fn live_files<F: TableFiles>(files: &F, prior: &PriorTable) -> Result
         }
     }
     let mut deletes: HashMap<String, Vec<u64>> = HashMap::new();
-    for d in &delete_files {
-        read_position_deletes(files, &d.file_path, &mut deletes)?;
+    let read = read_each(files, &delete_files, |d| read_position_deletes(files, d))?;
+    for per_file in read {
+        for (path, mut positions) in per_file {
+            deletes.entry(path).or_default().append(&mut positions);
+        }
     }
     for positions in deletes.values_mut() {
         positions.sort_unstable();
         positions.dedup();
     }
-    Ok(LiveFiles { data, deletes })
+    Ok(LiveFiles {
+        data,
+        delete_files,
+        deletes,
+    })
 }
 
-/// Read a position-delete file's `(file_path, pos)` rows into `out`.
+/// Read a position-delete file's `(file_path, pos)` rows, grouped by data file.
 fn read_position_deletes<F: TableFiles>(
     files: &F,
-    path: &str,
-    out: &mut HashMap<String, Vec<u64>>,
-) -> Result<()> {
-    let pq = RangedParquet::open(files, path)?;
+    entry: &ManifestEntry,
+) -> Result<HashMap<String, Vec<u64>>> {
+    let path = entry.file_path.as_str();
+    let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+    let pq = RangedParquet::open(files, path, u64::try_from(entry.file_size).ok())?;
     let all = ProjectionMask::all();
     let mut batches = Vec::new();
     for rg in 0..pq.num_row_groups() {
@@ -662,7 +695,7 @@ fn read_position_deletes<F: TableFiles>(
                 .push(positions.value(i) as u64);
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// The Arrow schema of a position-delete file, carrying Iceberg's reserved field-ids.
@@ -831,6 +864,121 @@ mod tests {
         assert!(s.may_overlap(b"a", b"n"));
         assert!(!s.may_overlap(b"a", b"l"));
         assert!(!s.may_overlap(b"q", b"z"));
+    }
+
+    /// A local table read `readers` files at a time, whatever the machine, counting
+    /// size lookups.
+    struct Readers<'a>(
+        &'a crate::LocalTableFiles,
+        usize,
+        std::sync::atomic::AtomicU64,
+    );
+
+    impl TableFiles for Readers<'_> {
+        fn read(&self, path: &str) -> Result<Vec<u8>> {
+            self.0.read(path)
+        }
+        fn size(&self, path: &str) -> Result<u64> {
+            self.2.fetch_add(1, Ordering::Relaxed);
+            self.0.size(path)
+        }
+        fn read_ranges(
+            &self,
+            path: &str,
+            ranges: &[std::ops::Range<u64>],
+        ) -> Result<Vec<bytes::Bytes>> {
+            self.0.read_ranges(path, ranges)
+        }
+        fn readers(&self) -> usize {
+            self.1
+        }
+    }
+
+    #[test]
+    fn a_merge_finds_the_same_rows_however_many_files_it_reads_at_once() {
+        use shapeshift_core::Sink;
+        let dir = std::env::temp_dir().join(format!("ss-merge-readers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = |ids: Vec<i64>, v: i64| {
+            let vs = vec![v; ids.len()];
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(vs)),
+                ],
+            )
+            .unwrap()
+        };
+        // Eight merges of overlapping keys: eight data files, seven delete files.
+        for round in 0..8i64 {
+            let ids: Vec<i64> = (0..400).map(|i| (i * 7 + round * 131) % 1500).collect();
+            let mut sink = crate::IcebergSink::create_merge(
+                &dir,
+                schema.clone(),
+                Compression::Snappy,
+                &[],
+                &["id".to_string()],
+            )
+            .unwrap();
+            sink.write_batch(&batch(ids, round)).unwrap();
+            sink.finish().unwrap();
+        }
+
+        let prior = crate::load_current_local(&dir).unwrap();
+        let location = prior.metadata["location"].as_str().unwrap().to_string();
+        let local = crate::LocalTableFiles::new(&dir, &location);
+        let fields = crate::table_fields(&prior.metadata).unwrap();
+        let delta = batch((0..1500).step_by(3).collect(), 99);
+        let run = |readers: usize| {
+            let keys = resolve_key_columns(&fields, &["id".into()]).unwrap();
+            let mut tracker = MergeTracker::new(keys);
+            let placed: Vec<Placement> = (0..delta.num_rows() as u64).map(|i| (0, i)).collect();
+            tracker.observe(&delta, &placed).unwrap();
+            let staging = dir.join(format!("staging-{readers}"));
+            let cx = MergeContext {
+                staging_dir: &staging,
+                base_location: &location,
+                prior: Some(&prior),
+                new_files: &[],
+                partition_fields: &[],
+                compression: Compression::Snappy,
+            };
+            let files = Readers(&local, readers, Default::default());
+            let out = tracker.finish(&cx, &files).unwrap();
+            // Every file opened at the size its manifest records: no lookups.
+            assert_eq!(files.2.load(Ordering::Relaxed), 0);
+            let mut rows: Vec<(String, i64)> = Vec::new();
+            for f in &out.delete_files {
+                let file = File::open(staging.join(&f.data_key)).unwrap();
+                for b in
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                {
+                    let b = b.unwrap();
+                    let paths = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    let pos = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                    rows.extend(
+                        (0..b.num_rows()).map(|i| (paths.value(i).to_string(), pos.value(i))),
+                    );
+                }
+            }
+            (out.summary, rows)
+        };
+        let one = run(1);
+        assert_eq!(one.0.data_files_scanned, 8);
+        assert!(one.0.keys_updated > 0 && one.0.prior_rows_replaced == one.0.keys_updated);
+        assert_eq!(one.1.len() as u64, one.0.prior_rows_replaced);
+        for readers in [2, 3, 8, 64] {
+            assert_eq!(run(readers), one, "{readers} readers");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

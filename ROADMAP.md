@@ -33,7 +33,7 @@ presented as a promise for another; run the harness yourself to compare.
 | **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; a REST catalog is out of scope |
 | **3 — Reach & format coverage** | Object-store output, optional zstd fat build, streaming json-array, a real benchmark suite | ✅ **shipped** — object-store output (Parquet _and_ Iceberg), the zstd fat build (`--features zstd`), streaming json-array, and the measured benchmark suite ([`benchmarks/`](./benchmarks/)) |
 | **4 — Trustworthy against a moving source** | Schema drift detection and mitigation: what the schema silently dropped, and five policies for what to do about it | ✅ **shipped** — `drift.policy` (`ignore`/`warn`/`rescue`/`quarantine`/`error`), a per-path report with the columns to add, measured at ~6% on a clean run |
-| **5 — Row-level writes** | Upsert on a key, then the hygiene and reach that make it production-grade: compaction, object-store merge, change-feed deletes | 🟡 **in progress (0.3)** — `--merge-on` upsert into local **and object-store** tables is in the tree, DuckDB-verified (over S3 too); compaction and change-feed deletes are next |
+| **5 — Row-level writes** | Upsert on a key, then the hygiene and reach that make it production-grade: compaction, object-store merge, change-feed deletes | 🟡 **in progress** — `--merge-on` upsert into local **and object-store** tables (0.3), **`compact`**, **`expire`** and the **commit guard** (0.4.0), DuckDB-verified (over S3 too); change-feed deletes are next |
 
 Phases 2, 3, and 4 are independent of each other and can interleave — each only depends on the v0.1
 core. Phase 5 builds on Phase 2's multi-snapshot write path.
@@ -193,7 +193,8 @@ This phase makes the table a first-class, evolvable Iceberg v2 dataset.
       verifiable table for an unreadable one.
 - **Out of scope: REST catalog + catalog-managed relocation + multi-writer append.** An external
       Iceberg REST catalog re-anchors a moved table's paths (so *any* engine reads it with no reader
-      flag) and serialises concurrent appends; the engine does not implement one.
+      flag) and serialises concurrent appends; the engine does not implement one. (The engine's own
+      commit guard, Phase 5, refuses the second of two writers rather than serialising them.)
 
 ## Phase 3 — Reach & format coverage *(shipped)*
 
@@ -293,14 +294,34 @@ between runs (each merge reads what it needs from the table itself).
       spec.
 - [x] **Object-store merge** — the same merge for an `s3://` / `gs://` / `az://` table. Every read
       of the existing table goes through one seam, so local and object-store merges run the same
-      code; a data file the merge must scan costs one `HEAD`, a footer `GET`, and one ranged `GET`
-      per row group for the key columns' chunks. Verified over the S3 protocol against an
-      S3-compatible server, with DuckDB reading back through `httpfs`.
-- [ ] **Compaction** — `shapeshift compact`: rewrite data files that carry deletes (and merge small
-      files) in one `replace` snapshot, so read cost stops growing with every merge. Plus snapshot
-      expiry: today every write keeps the whole history.
-- [ ] **A commit guard** — refuse to publish `v{N+1}.metadata.json` if another writer got there
-      first, so two concurrent writers fail loudly instead of one silently losing.
+      code; a data file the merge must scan costs a footer `GET` and one ranged `GET` per row group
+      for the key columns' chunks (its size comes from the manifest). Manifests, delete files and
+      data files are read 8 at a time, so a merge waits on the store's latency once per batch rather
+      than once per request. Writes likewise: a file that fits in 8 MiB is one `PUT`, a table
+      write puts its objects 8 at a time, a compaction reads 8 files ahead of its writer, a file
+      under 64 KiB is one request, and expiry reads its plan 8 files at a time and deletes in
+      bulk. Verified over the S3 protocol against an S3-compatible server behind a keep-alive
+      proxy, with DuckDB reading back through `httpfs`.
+- [x] **Compaction** — `shapeshift compact`: rewrites every data file that carries a delete (so no
+      delete file survives) and packs small files per partition, in one `replace` snapshot over a
+      single data manifest; kept files keep their sequence numbers, and earlier snapshots still
+      time-travel. Local and object-store tables. In the DuckDB model-check after every second
+      merge; after 30 merges into a 1M-row table it took a DuckDB scan from 71 ms back to 9 ms.
+- [x] **Snapshot expiry** — `shapeshift expire`: drops snapshots older than `--older-than`
+      (default 5 days) outside the newest `--retain-last`, publishes the shorter history, then
+      deletes every file only they read — never a file a retained snapshot reads live, never one
+      outside the table. `--dry-run`. In the DuckDB model-check after every compaction; after 30
+      merges and a compaction it took a 1M-row table from 27.1 MiB in 190 files to 10.3 MiB in 38.
+- [x] **A commit guard** — a commit creates `v{N+1}.metadata.json` only if no other writer did (a
+      refusing hard link locally, a conditional put on object stores); the loser exits 75 with
+      nothing left behind, and a re-run builds on the winner. Readers and writers follow committed
+      versions past a stale `version-hint.text`, but only successors. Checked by
+      `examples/merge/race_writers.py` (concurrent writers plus compaction and expiry, local and
+      S3); a build without it lost most of the rows its writers were told were committed.
+- [x] **`--summary-json`** — `shape`, `compact` and `expire` print one versioned JSON document
+      (counts, the table version and snapshot committed, or the error and its kind) so an
+      orchestrator step reads a run's result instead of parsing text; the model-check holds each
+      summary to what DuckDB reads.
 - [ ] **Change-feed deletes** — a spec predicate that marks a row as a delete (`op: d` in a CDC
       envelope), so one merge applies inserts, updates, and deletes.
 - [ ] **Writing into tables other engines created** — compressed (`deflate`) manifests and a
@@ -313,8 +334,8 @@ between runs (each merge reads what it needs from the table itself).
 
 Everything above is the engine. The items below are deliberately **not** in it: each needs state,
 a schedule, or a network surface the engine does not have. They belong to an orchestrator that runs
-shapeshift as a step, and the engine's only contract to one is the CLI surface and the `SinkSummary`
-it prints ([ARCHITECTURE §14](./ARCHITECTURE.md)).
+shapeshift as a step, and the engine's only contract to one is the CLI surface: its exit statuses
+and the `--summary-json` document it prints ([ARCHITECTURE §14](./ARCHITECTURE.md)).
 
 - **Scheduling** — run a spec on a cadence or trigger. Compose shapeshift as a step under an
   orchestrator (such as **dagron**) rather than growing a scheduler inside the engine.

@@ -527,10 +527,11 @@ rows (10 MB): 50,000 updates to keys already in the table and 50,000 new keys. T
 - Read back with DuckDB 2.0 `iceberg_scan`: 1,050,000 rows, every id distinct, 50,000 carrying the
   update.
 - **On an object store the cost is requests, so this counts them** (timings against a local S3 mock
-  would say nothing about S3). The same merge into the same 1M-row table, stored on an
-  S3-compatible server (moto), read the existing data file with exactly **1 `HEAD` + 21 ranged
-  `GET`s**: the footer, then one per row group (20 groups of 50,000 rows), each carrying only the
-  `id` column's chunk. That was 6.0 MB of the 8.7 MB file — on this narrow table the key column
+  would say nothing about S3; the next section adds S3-like latency). The same merge into the same
+  1M-row table, stored on an S3-compatible server (moto), read the existing data file with exactly
+  **21 ranged `GET`s**: the footer, then one per row group (20 groups of 50,000 rows), each carrying
+  only the `id` column's chunk. (It also cost a `HEAD` until the file's size was taken from its
+  manifest.) That was 6.0 MB of the 8.7 MB file — on this narrow table the key column
   *is* most of the bytes (unique `int64` ids barely compress; the other four columns are
   near-constant). On a table with a wide payload column the same read fetched under a quarter of
   the file (`files::tests` in `shapeshift-iceberg`).
@@ -540,6 +541,206 @@ rows (10 MB): 50,000 updates to keys already in the table and 50,000 new keys. T
 - Correctness is checked separately, by
   [`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py) (randomized deltas against a
   plain-Python model, every snapshot time-travelled through DuckDB).
+
+### Merging into an object-store table: reads in parallel
+
+Against a store every request waits for a round trip, whatever else is in flight, and a merge used
+to make its requests one after another: every manifest, every delete file, every data file it had
+to scan. It now reads each of those three groups **8 at a time**, and opens a file at the size its
+manifest records instead of asking the store first. This measures both against an S3-compatible
+server (moto) behind [`examples/merge/s3_proxy.py`](./examples/merge/s3_proxy.py), which adds
+**20 ms to every request** — roughly the first-byte latency of a small in-region S3 GET — keeps connections
+open as S3 does, and counts the requests. Same machine as above, release builds of the commit
+before and the commit with the change.
+
+Each run builds a fresh table directly against moto: 100,000 rows, then 20 merges of 5,000 rows
+(4,000 updates at random keys, 1,000 new). The measured merge is a 21st of the same shape, through
+the proxy. Every file holds keys from across the whole range, so the merge scans all of them.
+
+| table | before | 1 reader, no `HEAD`s | 8 readers (default) | 16 readers | requests (before → after) |
+|---|---|---|---|---|---|
+| unpartitioned: 21 data files, 20 delete files, 41 manifests | 9.31 s | 8.28 s | **1.84 s** | — | 181 → 140: 41 `HEAD`s gone |
+| `bucket(16, id)`: 336 data files, 320 delete files, 41 manifests | 116.5 s | — | **18.0 s** | 12.2 s | 2,131 → 1,475: 656 `HEAD`s gone |
+
+(Unpartitioned: median of 3 runs each, alternating, all within 0.1 s. Partitioned: one run each.)
+
+- **The waiting overlaps.** With 8 requests in flight, a merge waits on the store once per eight
+  reads instead of once per read: 5× faster on the small table, 6.5× on the large one. The writes
+  were still made one at a time here; the next section overlaps them too.
+- **Peak RSS did not move** (46.1 MiB in every configuration): a reader holds one row group's key
+  chunks, and a delta file's are small. On tables with very large row groups, eight readers hold
+  eight of them; `SHAPESHIFT_READERS` lowers (or raises) the count.
+- **The same rows.** Every run replaced the same 3,926 rows; the DuckDB model-check passes with 1
+  reader and with 8, locally, over `file://` and over S3 through the proxy, and a crate test checks
+  that 1, 2, 3, 8 and 64 readers write identical delete files.
+- **Local tables gain less**, since a local read does not wait: the same 100,000-row merge into the
+  1M-row table, interleaved, median of 3 — one data file 0.436 → 0.447 s (one file cannot be split
+  across readers; within noise), eight `bucket(8, id)` files 0.435 → 0.349 s with 4 readers
+  (+1.8 MiB RSS).
+
+### Writing to an object-store table: one request per file, 8 in flight
+
+A table write used to upload every file — data files, delete files — as a multipart upload (three
+requests: create, the part, complete) one after another, and an expiry deleted one object per
+request. Now a file that fits in a part (8 MiB) is one `PUT`; the data files, delete files,
+manifests and manifest list go up **8 at a time**, with at most 16 MiB of file bytes in memory (what
+one multipart upload held before: its part buffer and a copy); and an expiry hands every key to the
+store's many-delete call — on S3 one `DeleteObjects` request per thousand keys. Same harness as
+above (moto behind `s3_proxy.py` at 20 ms per request, the 20-merge table built fresh for each
+binary), now timing each write path in turn on the same table: one more merge, an append of 5,000
+new rows, a compaction, then `expire --older-than 0s`. Before = the commit with the parallel reads.
+
+| `bucket(16, id)` table | before | after | write requests (before → after) |
+|---|---|---|---|
+| merge (336 files scanned) | 18.2 s | **12.7 s** | 101 → 37 |
+| append (16 data files) | 3.12 s | **0.50 s** | 52 → 20 |
+| compact | 60.9 s | 58.2 s | 53 → 21 |
+| expire (771 files) | 58.5 s | **5.2 s** | 773 → 3 |
+
+| unpartitioned table | before | after | write requests (before → after) |
+|---|---|---|---|
+| merge | 1.85 s | **1.54 s** | 11 → 7 |
+| append | 0.55 s | **0.41 s** | 7 → 5 |
+| compact | 3.77 s | 3.60 s | 8 → 6 |
+| expire (111 files) | 12.7 s | **5.2 s** | 113 → 3 |
+
+- **A small file is one request, not three,** and the requests overlap: the partitioned append's
+  52 writes in a row became 20, 8 at a time.
+- **An expiry's deletes collapse into one request** for up to a thousand files. What is left of its
+  5 s is planning — reading the manifest list and manifests of every snapshot, still one after
+  another here (75 reads); the next section overlaps those too.
+- **Compaction is bound by reading what it rewrites**: every live data file, row group by row
+  group, one file after another (1,473 reads on the partitioned table). Its uploads were never the
+  cost. The compaction section below reads ahead of its writer.
+- **Memory**: peak RSS was identical in every row above (45.3 MiB partitioned, 45.4 MiB
+  unpartitioned) — those files are small. With large files (three 16.9 MiB data files, so
+  multipart uploads), 10 runs each to `file://`: median 45.8 → 46.6 MiB, within a run-to-run spread
+  of 37–60 MiB that shaping dominates.
+- **A failed write leaves nothing behind**: if an upload fails, everything the write put is
+  deleted again (before, only a refused commit cleaned up; a failed upload left the files already
+  sent).
+
+### Planning an expiry on an object store: reads in parallel
+
+Planning reads every snapshot's manifest list, then every manifest they name; the expiry above
+made those reads one after another, and they were 5 s of its 5.2. They now go through the merge's
+reader pool: **8 at a time**, each file once, however many snapshots carry it. Same harness (moto
+behind `s3_proxy.py` at 20 ms per request), each binary on a fresh copy of the table the section
+above ends on — 100,000 rows, 21 merges, an append and a compaction (24 snapshots), built directly
+against moto — then through the proxy, `expire --older-than 0s --dry-run` (the plan alone) and the
+real `expire --older-than 0s`. Before = the commit with the parallel writes.
+
+| table | plan (`--dry-run`) | `expire` | `expire` requests (both builds) | files deleted |
+|---|---|---|---|---|
+| `bucket(16, id)` (2 runs each) | 4.97, 4.99 s → **0.87, 0.86 s** | 5.11, 5.12 s → **1.02, 1.05 s** | 75 reads + 3 writes | 771 |
+| unpartitioned (median of 3) | 5.08 s → **0.88 s** | 5.23 s → **1.06 s** | 75 reads + 3 writes | 111 |
+
+- **The same requests, overlapped**: both builds made the same 74 reads to plan (75 for the real
+  run), up to 8 in flight after against 1 before, and deleted the same files. A crate test requires
+  an identical plan from 1, 2, 3, 8 and 64 readers, every manifest list and manifest read exactly
+  once.
+- **An expiry is now about a second at this latency**: its commit and bulk delete take 0.15–0.2 s,
+  the rest is planning reads, 8 at a time. Peak RSS was identical (45.0 MiB partitioned, 45.1 MiB
+  unpartitioned): the plan already held every manifest's entries.
+- **Local tables** plan through the same pool (up to 4 readers); their expiry took 0.01 s already.
+
+### Compacting an object-store table: reading ahead of the writer
+
+A compaction reads every file it rewrites — footer, then each row group — and writes the live rows
+in table order. It made those reads one after another, so against a store it spent its time
+waiting: 1,473 requests, 55 s on the partitioned table above. Now up to 8 readers each take the next
+file, across bins, and fetch its footer and row groups ahead of the one writer, which still writes
+in table order; about 16 MiB of fetched bytes waits for it. And a column chunk the footer's read already holds (it
+takes a file's last 64 KiB) is not fetched again, so a file smaller than that is one request — for
+merges too. Same harness: moto behind `s3_proxy.py` at 20 ms per request, each binary on a fresh
+copy of the 20-merge table, timing each write path in turn. Before = `main` with the parallel
+expiry planning; two runs each, alternating.
+
+| `bucket(16, id)` table | before | after | reads (before → after) |
+|---|---|---|---|
+| compact (336 files rewritten) | 54.5, 55.0 s | **6.8, 6.7 s** | 1,473 → 769 |
+| merge (336 files scanned) | 11.8, 11.9 s | **6.4, 6.4 s** | 1,374 → 718 |
+| append | 0.43, 0.43 s | 0.44, 0.42 s | 5 → 5 |
+| expire | 0.96, 0.98 s | 0.97, 1.00 s | 75 → 75 |
+
+| unpartitioned table | before | after | reads (before → after) |
+|---|---|---|---|
+| compact (21 files into one) | 3.29, 3.33 s | **1.24, 1.27 s** | 138 → 114 |
+| merge | 1.37, 1.41 s | **1.22, 1.22 s** | 129 → 107 |
+
+- **The waiting overlaps, and the small files cost one request.** The partitioned table's delta
+  files and delete files are a few KiB each; a footer read now brings the whole file, which takes
+  704 requests off the compaction and 656 off the merge. The compaction's remaining 769 reads go 8 at a time: 8×
+  faster in all. The unpartitioned table compacts into one file, so the gain there is the reading
+  ahead within that one bin.
+- **The files written are the same.** One writer copies the rows in table order whatever the
+  readers do; a crate test compacts one table with 1, 2, 3, 8 and 64 readers, into one file and
+  into many bins, and requires identical files. The DuckDB model-check passes locally, over
+  `file://` and over S3 through the proxy, and the concurrent-writer race over S3 (2 compactions
+  and 3 expiries among 4 writers) loses no row.
+- **Memory**: peak RSS did not move on these tables (45.0 MiB partitioned, 45.2 MiB
+  unpartitioned) — their files are small. With a big file it does, by up to the 16 MiB read-ahead:
+  a 1M-row table (one 19.3 MiB data file) after 10 merges of 20,000 rows, 11 files rewritten —
+  locally 31.9 → 44.1 MiB (median of 3; 0.60 → 0.54 s, within run-to-run noise), over S3 at
+  20 ms 36.1 → 42.0 MiB, 2.55 → 1.73 s for the same 87 reads.
+
+### Compaction (`compact`): what merges cost readers, and what compacting gives back
+
+Merge-on-read makes each merge cheap and each read dearer. This measures both halves on the
+machine above (4 vCPU Intel Xeon @ 2.10 GHz, glibc release build). The table starts as the same
+1,000,000-row, one-file table and takes **30 daily merges** of 20,000 rows each: 15,000 updates at
+random existing keys and 5,000 new keys. The read is DuckDB 2.0's
+`select count(*), sum(amount) from iceberg_scan('t')`, median of 5.
+
+| table state | live rows | live data files | live delete files | manifests | DuckDB scan |
+|---|---|---|---|---|---|
+| base | 1,000,000 | 1 | 0 | 1 | 7 ms |
+| after 10 merges | 1,050,000 | 11 | 10 | 21 | 30 ms |
+| after 20 merges | 1,100,000 | 21 | 20 | 41 | 41 ms |
+| after 30 merges | 1,150,000 | 31 | 30 | 61 | 71 ms |
+| **after `compact`** | 1,150,000 | **1** | **0** | **2** | **9 ms** |
+
+- **A merged table's read cost grows with its merge count, not its size.** 15% more rows made the
+  scan ten times slower: each merge adds a data file, a delete file every reader must load and
+  apply, and two manifests.
+- **One compaction takes it back to where it started.** It rewrote all 31 data files
+  (13.9 MiB, 450,000 deleted positions applied) into one 9.7 MiB file in **0.72 s** (median of
+  3) at a **peak RSS of 23 MiB**: memory is an input row group, an output row group, and the list
+  of deleted positions, never the table. The two manifests left are the new data manifest and
+  the record of the removed delete files, which the next write drops.
+- **It pays the writers back too.** The same 20,000-row merge took 0.28 s against the 30-merge
+  table, which it has to read all 31 files' keys and 30 delete files for, and 0.15 s against the
+  compacted one.
+- (Peak RSS is measured from a small parent process. A child forked from a process that already
+  holds DuckDB reports the parent's pages as its own until `exec`, which once showed this
+  compaction as 139 MiB.)
+- Correctness is checked by the same model-check, which compacts after every second merge
+  (§ above): same rows, no live delete file, time travel to every snapshot.
+
+### Expiry (`expire`): what history costs on disk
+
+Same machine, same workload, but the table is built in place (a fresh 1M-row shape, then the 30
+merges) so every file it names lives under it. Sizes are every file under the table directory.
+
+| step | on disk | files | what changed |
+|---|---|---|---|
+| fresh table, 1M rows | 8.3 MiB | 5 | one data file |
+| after 30 merges | 17.4 MiB | 185 | 30 data files, 30 delete files, 60 manifests, 30 manifest lists, 30 more metadata files |
+| after `compact` | 27.1 MiB | 190 | the rewritten 9.7 MiB file is *added*; every earlier snapshot still reads its own files |
+| **after `expire --older-than 0s`** | **10.3 MiB** | **38** | 31 snapshots expired; 31 data files, 30 delete files, 61 manifests and 31 manifest lists deleted (16.6 MiB) |
+
+- **Compaction alone costs storage; compaction then expiry returns it.** What is left is the one
+  9.7 MiB data file the table's 1,150,000 rows live in, its manifest and manifest list, and the
+  33 `metadata.json` files the commits wrote (about 0.6 MiB here), which expiry keeps.
+- **Expiry is a metadata walk.** 0.01 s and 12.5 MiB peak: it reads every snapshot's manifest list
+  and every manifest once, opens no data file, and deletes one file per call.
+- DuckDB read the expired table back: 1,150,000 rows, every id distinct.
+- **A merge-only history frees little.** Merges carry their manifests forward and the newest
+  snapshot still reads every data and delete file, so expiring merge snapshots deletes only
+  their manifest lists; the rows the deletes hide are freed only after a `compact`.
+- The model-check expires after every compaction (keeping the newest 1-3 snapshots), time-travels
+  every snapshot before it goes and every one left after, on local, `file://` and S3 (moto).
+  A build that deletes files a retained snapshot still reads fails it with a missing manifest.
 
 ---
 

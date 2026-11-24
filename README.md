@@ -9,6 +9,18 @@ CPU that does it. It is a single static **Apache-2.0** Rust binary (or an embedd
 no JVM, no catalog server, no Python, no row cap, no telemetry. It is the honest answer to per-row
 (MAR) billing — the shaping **data-plane**, and nothing else.
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/lucheeseng827/shapeshift?sort=semver)](https://github.com/lucheeseng827/shapeshift/releases)
+[![Docker pulls](https://img.shields.io/docker/pulls/mancube/shapeshift)](https://hub.docker.com/r/mancube/shapeshift)
+[![Image size](https://img.shields.io/docker/image-size/mancube/shapeshift?sort=semver&label=image)](https://hub.docker.com/r/mancube/shapeshift)
+[![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/shapeshift)
+
+**Status: released.** The current release is **0.4.0**. Each tagged release publishes:
+- a static `shapeshift` binary for Linux x86_64 (musl), with its SHA-256, on the
+  [release page](https://github.com/lucheeseng827/shapeshift/releases);
+- the multi-arch image (`linux/amd64`, `linux/arm64`) `mancube/shapeshift`, tagged with
+  the version and `latest`: the same static binary on `scratch`.
+
 ## The gap
 
 Managed ELT — Fivetran and its peers — bills by **MAR (Monthly Active Rows)**: every distinct
@@ -303,14 +315,155 @@ append them; when the updates touch only recent keys, files holding older keys a
 Memory grows with the **delta**, not the table: unlike an append, a merge holds an entry per distinct
 key in the delta and every position it deletes, one per earlier repeat of a key in the input among
 them (33 MiB peak for 100,000 keys, against 14 MiB for the append). It also loads the positions
-earlier merges deleted, which pile up until a compaction exists.
+earlier merges deleted, which pile up until the table is compacted.
 
 It works the same on an **object-store table** (`-o s3://bucket/db/orders`, in a build with
 `--features object_store`): the existing table is read with ranged GETs — for each data file the
-merge must scan, its footer and then, per row group, its key columns' chunks only.
+merge must scan, its footer and then, per row group, its key columns' chunks only (the file's size
+comes from the manifest, so no `HEAD`). A store makes each request wait tens of milliseconds, so
+the merge reads **8 files at a time**: through a proxy adding 20 ms per request, a merge into a
+336-file partitioned table took 18.0 s instead of 116.5 s. `SHAPESHIFT_READERS=N` changes the
+count (local tables use up to 4); each reader holds at most one row group's key chunks, so raise
+it for a table of many files and lower it for one with very large row groups.
 
-Limits, stated plainly: one writer at a time, like `--append`; and delete files accumulate until a
-compaction command exists — `inspect` shows how many rows they hide.
+Limits, stated plainly: every merge leaves a delete file that every reader must apply until the
+table is compacted (`inspect` shows how many rows they hide); and concurrent writers are safe but
+not merged — of two that built on the same version, the second is refused (exit status 75) and
+must run again (see [Concurrent writers](#concurrent-writers--the-commit-guard)).
+
+### Compact — pay the merges back
+
+Each merge makes the table a little more expensive to read: more data files, one more delete
+file, one more manifest. `shapeshift compact` pays that back in one snapshot:
+
+```sh
+shapeshift compact orders
+# compacted orders → snapshot 4021474057372123141 (replace)
+#   rewrote 2 data file(s) (3.4 KiB) into 1 (1.7 KiB); kept 0 as they were
+#   applied 2 position delete(s) from 1 delete file(s) — the table has none left
+#   5 live row(s) rewritten across 1 partition(s); earlier snapshots still read their own files
+```
+
+- **Every data file that carries a delete is rewritten** without its deleted rows, so the table
+  has **no delete files** afterwards.
+- **Small files are packed**, per partition, into files of up to `--target-file-size` (default
+  `512MiB`, Iceberg's own default). `--target-file-size 0` packs nothing and only applies deletes.
+- The commit is one Iceberg **`replace`** snapshot: the rows are unchanged, only the files holding
+  them. Its manifest list names a single data manifest, however many the merges built up.
+- **Time travel still works.** Earlier snapshots keep their files, so a compaction briefly
+  *adds* storage; `expire` (below) is what deletes the files only history reads.
+- Nothing to do (no delete files, no partition with two small files) commits nothing.
+- It works on an object-store URL too, in a build with `--features object_store`.
+
+Measured ([BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)): after 30 daily merges into a
+1M-row table, a DuckDB `iceberg_scan` took **71 ms** (31 data files, 30 delete files, 61
+manifests); after a 0.7 s compaction, **9 ms**, against 7 ms before any merge. The next merge
+took 0.15 s instead of 0.28 s. The compaction peaked at 23 MiB.
+
+### Expire — let history go
+
+Every write keeps the table's whole history on disk, so any snapshot can be time-travelled to.
+`shapeshift expire` lets the old part go:
+
+```sh
+shapeshift expire orders --older-than 0s --dry-run   # what would go
+shapeshift expire orders                              # snapshots older than 5 days
+# expired 2 snapshot(s) of orders; kept 1
+#   deleted 2 data file(s), 1 delete file(s), 3 manifest(s), 2 manifest list(s) — 12.8 KiB
+```
+
+- **What stays:** the current snapshot, any snapshot a ref names, the newest `--retain-last`
+  (default 1) of the current history, and every snapshot newer than `--older-than` (default
+  `5d`, Iceberg's own default; `s`, `m`, `h`, `d`, `w`).
+- **What goes:** every file an expired snapshot references — manifest lists, manifests, data and
+  delete files — except the ones a retained snapshot still reads. A merge-only history frees
+  little (later snapshots still read every data file); after a `compact`, it frees what the
+  compaction replaced.
+- **Never outside the table:** a file whose path is not under the table's location is left in
+  place and counted (a copied table can name the original's files).
+- **Commit first, delete after:** the shorter history is published before anything is deleted,
+  so an interrupted run leaves unreferenced files behind, never a table naming a missing one.
+- `--dry-run` reports and changes nothing. It works on an object-store URL too.
+
+Measured on the same 30-merge table: **17.4 MiB in 185 files** after the merges, 27.1 MiB once
+compacted (the compaction keeps its inputs), **10.3 MiB in 38 files** after `expire --older-than
+0s` (0.01 s), which deleted 31 data files, 30 delete files and 92 manifests and manifest lists.
+The 8.3 MiB table it started from plus the 1.4 MiB of rows the merges added account for most of
+that; the old `metadata.json` files (one per commit) are kept.
+
+### Concurrent writers — the commit guard
+
+Several processes may write one table at once: a nightly merge, an hourly append, a `compact`
+and an `expire` from an orchestrator. A commit is the creation of the next
+`metadata/v{N+1}.metadata.json`, and it succeeds **only if no other writer created it first**
+(locally a hard link that refuses to replace, on S3/GCS/Azure a conditional put). Of two writers
+that built on the same version, the second is refused:
+
+```text
+$ shapeshift shape -i day2.jsonl -o orders --to iceberg --merge-on id
+Error: commit conflict: another writer committed version 7 of the table while this one ran;
+nothing of this write was published, and its files were removed. Run it again
+$ echo $?
+75
+```
+
+- **Nothing is lost, nothing is half-written.** The refused writer removes every file it staged.
+  A commit whose outcome is unclear (a timeout on S3) is checked against what the store holds,
+  and if it still can't be told apart, its files stay rather than risk a committed snapshot's.
+  Exit status 75 (`EX_TEMPFAIL`) means "run it again"; any other failure means something else.
+- **A write that started before a compaction or expiry** that removed the files it was reading
+  is refused the same way, not reported as a missing file.
+- **`version-hint.text` is only a hint.** It is replaced atomically after the commit, never moved
+  backwards, and readers and writers look past it for later versions — but only for a true
+  successor, whose `metadata-log` names the version before it.
+- A write **without `--append`** onto an existing table replaces it as the next version instead of
+  rewriting `v1` in place (what 0.3 and earlier did). A file left over from that old behaviour is
+  reported with the steps to clear it, rather than retried forever.
+
+Verified by [`examples/merge/race_writers.py`](./examples/merge/race_writers.py): four writers
+merging into one table while a janitor compacts and expires it, each retrying on 75 — DuckDB
+reads exactly what every writer's last round says, on local disk and over S3. The same race on
+a build without the guard lost 400-odd of ~580 rows whose writers had been told they committed.
+
+### Script it — `--summary-json`
+
+`shape`, `compact` and `expire` take `--summary-json`: instead of the text report, stdout carries
+exactly **one JSON document on one line**, so a script or an orchestrator step reads what the run
+did without parsing prose. Logs and the text error still go to stderr.
+
+```console
+$ shapeshift shape -i day2.jsonl -o orders --to iceberg --merge-on id --summary-json > run.json
+$ jq -c '.ok, .rows, .table, .merge' run.json
+true
+{"in":4,"out":4,"parse_errors":0,"rejected":0}
+{"metadata":"orders/metadata/v2.metadata.json","snapshot_id":"3235405580007588266","version":2}
+{"data_files_pruned":0,"data_files_scanned":1,"delete_files":1,"distinct_keys":2,"duplicates_in_input":1,"key_columns":["id"],"keys_inserted":1,"keys_updated":1,"null_key_rows":1,"position_deletes":2,"prior_rows_replaced":1}
+```
+
+(The same `day2.jsonl` as in [Upsert](#upsert--merge-on-a-key). Keys come out sorted; their
+order is not part of the contract.)
+
+| Command | Fields besides `summary_version`, `command`, `ok` |
+|---|---|
+| `shape` | `dataset`; `output` {`format`, `path`, `compression`}; `rows` {`in`, `out`, `rejected`, `parse_errors`}; `row_groups`; `bytes`; `rejects` {`path`, `rows`} or null; `table` {`version`, `snapshot_id`, `metadata`} (null for Parquet); `merge` (null unless `--merge-on`); `drift` (null under `--on-drift ignore`; `report` is the `.drift.json` path, null when nothing drifted) |
+| `compact` | `table`; `committed`; `version` and `snapshot_id` (null when there was nothing to compact); `data_files` {`rewritten`, `written`, `kept`}; `delete_files_removed`; `position_deletes_applied`; `rows_rewritten`; `bytes` {`rewritten`, `written`}; `partitions_compacted`; `options` {`target_file_size`, `compression`} |
+| `expire` | `table`; `dry_run`; `committed`; `version` (null unless committed); `snapshots` {`expired` (oldest first), `retained`}; `deleted` {`data_files`, `delete_files`, `manifests`, `manifest_lists`, `bytes`} — in a dry run, what a real run would delete; `files_outside_table`; `files_not_deleted`; `options` {`older_than_ms`, `retain_last`} |
+
+- **Snapshot ids are strings.** They are 64-bit, past what a JSON number holds exactly in
+  JavaScript and in many other JSON tools; table versions and counts are numbers.
+- **A failed run prints a document too**, `{"summary_version": 1, "command": …, "ok": false,
+  "error": {"kind": …, "message": …}}`, with the usual exit status: 75 and `kind: "conflict"`
+  for a run the commit guard refused (run it again), 1 for anything else. `kind` names the
+  engine error — `spec`, `schema`, `record`, `drift`, `arrow`, `sink`, `source` — or `other`.
+  A command line clap cannot parse is still rejected with exit status 2 and its usage text.
+- **`summary_version` is the contract.** A field may be added within version 1; renaming or
+  removing one, or changing what it means, bumps it.
+
+[`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py) runs every write this way
+and holds the summary to what DuckDB reads: the snapshot it names must be the table's newest, a
+merge's key counts must match the model, and an expiry must name exactly the snapshots that went.
+[`race_writers.py`](./examples/merge/race_writers.py) checks that the versions concurrent runs
+report are 1..N, each claimed by exactly one run.
 
 ## Prove the MAR savings
 
@@ -401,8 +554,8 @@ fn main() -> shapeshift_core::Result<()> {
 | `shapeshift-core` | The engine, **no I/O backend deps**: the dataset transform Spec model, JSON schema inference, the named `Transform` library, the `Shaper` (JSON value → Arrow `RecordBatch`), the `Sink` trait, and the MAR cost arithmetic. |
 | `shapeshift-json` | Streaming JSON source on the **simd-json** SIMD lexer. `TapeJsonlReader` and `TapeJsonArrayReader` parse each record onto a **reusable tape** — a flat node buffer whose strings point back into the read buffer — so a record costs no allocation, whichever framing produced it; both reach the shape loop through one `TapeSource`. `JsonlReader` and `JsonArrayReader` (**streamed** — a depth/string-aware scanner yields one element at a time) supply the `serde_json::Value` model for anything that must *keep* a record, such as schema inference over the sample. All bounded-RAM, all preserving the raw bad record on a parse error. |
 | `shapeshift-parquet` | `ParquetSink` (Arrow → Parquet, one row group flushed per batch; Snappy default) + `inspect()` read-back. |
-| `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), **upsert** (`--merge-on`, position deletes), per-column statistics, and identity + hidden partitioning (`--partition-by`) + `inspect()`. Reads manifests against the schema each one carries. Exposes a backend-agnostic table builder the object-store sink reuses. |
-| `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table in S3 / GCS / Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. Opt-in behind the CLI's `object_store` feature, so the default musl-static binary links no cloud SDKs. |
+| `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), **upsert** (`--merge-on`, position deletes), **compaction** (`compact`, a `replace` snapshot), **snapshot expiry** (`expire`), per-column statistics, and identity + hidden partitioning (`--partition-by`) + `inspect()`. Reads manifests against the schema each one carries. Exposes a backend-agnostic table builder the object-store sink reuses. |
+| `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table in S3 / GCS / Azure — a `PUT` per object (bounded-RAM multipart past 8 MiB), 8 in flight, paths anchored at the destination. Opt-in behind the CLI's `object_store` feature, so the default musl-static binary links no cloud SDKs. |
 | `shapeshift-serve` | `shapeshift serve` — a local web console over the shaper (infer · shape · inspect · cost). The HTTP server is **hand-rolled on `std::net`** (no async runtime, no web framework) and the UI is embedded static files, so it stays a single static binary. Opt-in behind the CLI's `serve` feature; the default binary is unchanged. |
 | `shapeshift-cli` | The single `shapeshift` binary. |
 
@@ -558,10 +711,15 @@ it does that one job completely.
 
 ## Status
 
-> **v0.2.0.** The full loop — infer → shape → Parquet **and** Iceberg v2 — runs end-to-end and both
-> outputs are DuckDB-verified (`read_parquet` and `iceberg_scan`, identical rows and aggregates). It is
-> ~11,400 Rust LOC across the 6 core crates (plus the opt-in `serve` console) with **98 tests passing** (95 `#[test]` + 3 doctests); `cargo clippy
-> --workspace --all-targets -- -D warnings` and `cargo fmt --check` are both clean.
+> **v0.4.0** (2026-11-24). The full loop — infer → shape → Parquet **and** Iceberg v2 — runs
+> end-to-end, with upsert (`--merge-on`) into local and object-store tables, and both outputs are
+> DuckDB-verified (`read_parquet` and `iceberg_scan`, identical rows and aggregates; merges by a
+> randomized model-check). 0.4 adds the table hygiene that keeps a merged-into table cheap to read
+> and safe to write: `compact`, `expire`, the commit guard, `--summary-json`, and object-store reads
+> and writes that overlap. It is ~16,500 Rust LOC across the 6 core crates (plus the opt-in `serve`
+> console) with **181 tests passing** (178 `#[test]` + 3 doctests, with the `object_store` and
+> `serve` features); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
+> are both clean.
 
 ### Done
 
@@ -574,9 +732,21 @@ it does that one job completely.
 - [x] `shapeshift cost` — honest MAR comparison you price yourself (negative when it doesn't amortize).
 - [x] `shapeshift inspect` — auto-detects a Parquet file or an Iceberg table dir.
 - [x] Parse-error **reject sidecar** (`<output>.rejects.jsonl`); the run never aborts on a bad line.
-- [x] **Upsert** (`--merge-on`, unreleased — lands in 0.3): replace rows by key with Iceberg v2
+- [x] **Upsert** (`--merge-on`, 0.3): replace rows by key with Iceberg v2
       position deletes; last occurrence wins; key-bound file pruning; DuckDB-verified by a
       randomized model-check.
+- [x] **`shapeshift compact`** (0.4): applies every delete and packs small
+      files per partition in one `replace` snapshot over a single data manifest; earlier
+      snapshots still time-travel. Local and object-store tables; in the same model-check.
+- [x] **Commit guard** (0.4): a commit creates the next metadata file only
+      if no other writer did; the loser exits 75 having left nothing behind; readers follow
+      committed versions past a stale hint. Checked with real concurrent writers.
+- [x] **`shapeshift expire`** (0.4): drops snapshots past `--older-than`
+      outside the newest `--retain-last`, then deletes the files only they read (never outside
+      the table); `--dry-run`. Local and object-store tables; in the same model-check.
+- [x] **`--summary-json`** (0.4) on `shape`, `compact` and `expire`: one
+      versioned JSON document on stdout — the run's counts, the table version and snapshot it
+      committed, or the error and its kind — so scripts stop parsing the text report.
 - [x] **Schema drift detection & mitigation** — undeclared fields and silently-nulled coercions are
       counted, reported (`<output>.drift.json`, with the column declarations that would keep them),
       and handled by policy: `warn` (default), `rescue`, `quarantine`, `error`, or `ignore`.
@@ -623,11 +793,26 @@ it does that one job completely.
   (copy-anywhere relocation, multi-writer) is out of scope — use an external one.
 - Integer timestamps read as epoch-milliseconds, integer dates as epoch-days; `timestamp` is zone-less
   (Iceberg `timestamp`, not `timestamptz`).
-- **Upsert** (`--merge-on`) assumes a single writer and accumulates delete files until compaction
-  exists. Rows are matched by key; deleting a row because a change feed says so (`op: d`) is not
-  supported yet.
+- **Concurrent writers** are guarded, not coordinated: a writer that loses a race exits 75 and
+  must run again (an orchestrator's retry). The guard needs a store that honours conditional
+  writes (`If-None-Match` on S3). Rows are matched by key; deleting a row because a change feed
+  says so (`op: d`) is not supported yet. `expire` keeps every old `metadata.json` (one small
+  file per commit).
 - No CDC capture, no scheduling, no connectors — those belong to an orchestrator. The engine is
   Apache-2.0 and fully self-hostable, with no row cap and no telemetry.
+
+## Which tool for which job
+
+shapeshift is one of three tools that each do one job and meet at files and HTTP:
+
+| If you want to… | Use |
+|---|---|
+| land JSON your systems emit as Parquet or Iceberg tables, appended or upserted | **shapeshift** |
+| open a table or file, query or profile it, and keep an answer as a new table | **Lakeleto** |
+| show it as a live dashboard, shared or embedded in your app | **dagpane** |
+
+Each works on its own; none needs the others installed. shapeshift writes and does not query: to
+look at what it landed, open the table in Lakeleto or any Iceberg reader (DuckDB, Spark, Trino).
 
 ---
 

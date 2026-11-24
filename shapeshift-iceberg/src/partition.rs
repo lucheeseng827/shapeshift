@@ -30,7 +30,7 @@ use uuid::Uuid;
 use shapeshift_core::{Compression, Result, SchemaRef, ShapeError};
 
 use crate::stats::Stats;
-use crate::{IceField, IcebergDataWriter};
+use crate::{FileFooter, IceField, IcebergDataWriter};
 
 fn err(e: impl std::fmt::Display) -> ShapeError {
     ShapeError::Sink(e.to_string())
@@ -514,6 +514,7 @@ pub struct PartitionedWriter {
     ice_fields: Vec<IceField>,
     fields: Vec<PartitionField>,
     open: HashMap<Vec<PartVal>, OpenPartition>,
+    footer: Option<FileFooter>,
 }
 
 impl PartitionedWriter {
@@ -531,6 +532,7 @@ impl PartitionedWriter {
             ice_fields,
             fields,
             open: HashMap::new(),
+            footer: None,
         };
         // Unpartitioned tables always have exactly one data file — create it eagerly so a
         // zero-row shape still writes a valid (empty) table, as before partitioning.
@@ -538,6 +540,15 @@ impl PartitionedWriter {
             w.partition_writer(&[])?;
         }
         Ok(w)
+    }
+
+    /// Have every data file carry `footer`'s key-value pairs: the files already open and
+    /// every one opened later.
+    pub fn set_footer(&mut self, footer: FileFooter) {
+        for op in self.open.values_mut() {
+            op.writer.set_footer(footer.clone());
+        }
+        self.footer = Some(footer);
     }
 
     /// Route each row to the data file for its partition key (one file when unpartitioned).
@@ -609,12 +620,15 @@ impl PartitionedWriter {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(err)?;
             }
-            let writer = IcebergDataWriter::create_with_fields(
+            let mut writer = IcebergDataWriter::create_with_fields(
                 &path,
                 self.schema.clone(),
                 self.compression,
                 self.ice_fields.clone(),
             )?;
+            if let Some(footer) = &self.footer {
+                writer.set_footer(footer.clone());
+            }
             let slot = self.open.len() as u32;
             self.open.insert(
                 key.to_vec(),

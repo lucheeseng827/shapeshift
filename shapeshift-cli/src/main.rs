@@ -12,7 +12,7 @@ use serde_json::Value;
 use shapeshift_core::{
     estimate_mar, infer_columns, ColumnSpec, Compression, DatasetSpec, DriftPolicy, DriftReport,
     MarInputs, MergeSummary, OutputFormat, OutputSpec, PushOutcome, Record, RecordBatch,
-    SchemaMode, Shaper, Sink, SinkSummary, SourceFormat, SourceSpec,
+    SchemaMode, ShapeError, Shaper, Sink, SinkSummary, SourceFormat, SourceSpec,
 };
 use shapeshift_iceberg::IcebergSink;
 use shapeshift_json::{
@@ -41,6 +41,11 @@ enum Cmd {
     Shape(ShapeArgs),
     /// Inspect a Parquet file or Iceberg table (schema + row count).
     Inspect(InspectArgs),
+    /// Compact an Iceberg table: apply every delete and pack small files, in one
+    /// `replace` snapshot.
+    Compact(CompactArgs),
+    /// Expire old snapshots of an Iceberg table and delete the files only they read.
+    Expire(ExpireArgs),
     /// Price a shape against a managed vendor's MAR (Monthly Active Rows) rate.
     Cost(CostArgs),
     /// Serve a local web console over the shaper (infer/shape/inspect/cost).
@@ -190,6 +195,11 @@ struct ShapeArgs {
     /// thread. On by default (`auto`); never changes the output, only who waits.
     #[arg(long, value_enum, default_value_t = CliPipeline::Auto)]
     pipeline: CliPipeline,
+    /// Print one JSON summary to stdout instead of the text report (`summary_version: 1`;
+    /// see the README). On failure stdout carries a JSON error instead; the exit status
+    /// is unchanged.
+    #[arg(long)]
+    summary_json: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -222,6 +232,88 @@ impl CliPipeline {
 struct InspectArgs {
     /// A Parquet file or an Iceberg table directory.
     path: PathBuf,
+}
+
+#[derive(Parser)]
+struct CompactArgs {
+    /// The Iceberg table: a directory, or an `s3://` / `gs://` / `az://` / `file://` URL
+    /// (in a build with `--features object_store`).
+    table: String,
+    /// Files smaller than this are packed together within their partition, into files
+    /// of up to about this size (`512MiB`, `64M`, `1048576`). `0` packs nothing: only
+    /// the files carrying deletes are rewritten.
+    #[arg(long, default_value = "512MiB", value_parser = parse_size)]
+    target_file_size: u64,
+    /// Codec of the rewritten files.
+    #[arg(long, value_enum, default_value_t = CliCompression::Snappy)]
+    compression: CliCompression,
+    /// Print one JSON summary to stdout instead of the text report (`summary_version: 1`;
+    /// see the README). On failure stdout carries a JSON error instead; the exit status
+    /// is unchanged.
+    #[arg(long)]
+    summary_json: bool,
+}
+
+#[derive(Parser)]
+struct ExpireArgs {
+    /// The Iceberg table: a directory, or an `s3://` / `gs://` / `az://` / `file://` URL
+    /// (in a build with `--features object_store`).
+    table: String,
+    /// Expire snapshots committed longer ago than this (`5d`, `12h`, `30m`, `0s`).
+    /// Iceberg's own default is five days.
+    #[arg(long, default_value = "5d", value_parser = parse_duration_ms)]
+    older_than: i64,
+    /// Always keep the newest N snapshots of the current history, however old.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    retain_last: u32,
+    /// Report what would be expired and deleted, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Print one JSON summary to stdout instead of the text report (`summary_version: 1`;
+    /// see the README). On failure stdout carries a JSON error instead; the exit status
+    /// is unchanged.
+    #[arg(long)]
+    summary_json: bool,
+}
+
+/// A duration in milliseconds: a number and a unit (`s`, `m`, `h`, `d`, `w`).
+fn parse_duration_ms(s: &str) -> std::result::Result<i64, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: i64 = num
+        .parse()
+        .map_err(|_| format!("`{s}` is not a duration (try 5d, 12h, 30m or 0s)"))?;
+    let unit_ms: i64 = match unit.trim() {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 7 * 86_400_000,
+        _ => return Err(format!("`{s}`: give a unit (s, m, h, d or w)")),
+    };
+    n.checked_mul(unit_ms)
+        .ok_or_else(|| format!("`{s}` is too long"))
+}
+
+/// A byte size: a number with an optional binary suffix (`K`/`KiB`, `M`/`MiB`,
+/// `G`/`GiB`; `B` and a trailing `B` are optional).
+fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("`{s}` is not a size (try 512MiB, 64M or 1048576)"))?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        _ => return Err(format!("`{s}`: unknown size unit (use K, M or G)")),
+    };
+    n.checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("`{s}` is too large"))
 }
 
 #[cfg(feature = "serve")]
@@ -278,14 +370,72 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match cli.cmd {
+    // Under `--summary-json`, stdout carries exactly one JSON document: the summary, or
+    // the error when the run fails.
+    let json_command = match &cli.cmd {
+        Cmd::Shape(a) if a.summary_json => Some("shape"),
+        Cmd::Compact(a) if a.summary_json => Some("compact"),
+        Cmd::Expire(a) if a.summary_json => Some("expire"),
+        _ => None,
+    };
+    let result = match cli.cmd {
         Cmd::Infer(a) => cmd_infer(a),
         Cmd::Shape(a) => cmd_shape(a),
         Cmd::Inspect(a) => cmd_inspect(a),
+        Cmd::Compact(a) => cmd_compact(a),
+        Cmd::Expire(a) => cmd_expire(a),
         Cmd::Cost(a) => cmd_cost(a),
         #[cfg(feature = "serve")]
         Cmd::Serve(a) => cmd_serve(a),
+    };
+    let Err(e) = &result else {
+        return result;
+    };
+    // Another writer committed first: nothing of this run was published, and running it
+    // again will work. Its own exit status lets an orchestrator retry it and nothing else.
+    let conflict = matches!(
+        e.downcast_ref::<ShapeError>(),
+        Some(ShapeError::Conflict(_))
+    );
+    if let Some(command) = json_command {
+        println!("{}", error_json(command, e));
+        eprintln!("Error: {e:?}");
+        std::process::exit(if conflict { EXIT_CONFLICT } else { 1 });
     }
+    if conflict {
+        eprintln!("Error: {e}");
+        std::process::exit(EXIT_CONFLICT);
+    }
+    result
+}
+
+/// Exit status of a run refused by the commit guard (`EX_TEMPFAIL`: try again).
+const EXIT_CONFLICT: i32 = 75;
+
+/// Version of the `--summary-json` documents. Fields may be added within a version;
+/// renaming or removing one, or changing its meaning, bumps it.
+const SUMMARY_VERSION: u32 = 1;
+
+/// The `--summary-json` document of a failed run. `kind` names the engine error
+/// (`conflict` is the one worth retrying), or `other` for anything else.
+fn error_json(command: &str, e: &anyhow::Error) -> Value {
+    let kind = match e.downcast_ref::<ShapeError>() {
+        Some(ShapeError::Spec(_)) => "spec",
+        Some(ShapeError::Schema(_)) => "schema",
+        Some(ShapeError::Record(_)) => "record",
+        Some(ShapeError::Drift(_)) => "drift",
+        Some(ShapeError::Arrow(_)) => "arrow",
+        Some(ShapeError::Sink(_)) => "sink",
+        Some(ShapeError::Conflict(_)) => "conflict",
+        Some(ShapeError::Source(_)) => "source",
+        None => "other",
+    };
+    serde_json::json!({
+        "summary_version": SUMMARY_VERSION,
+        "command": command,
+        "ok": false,
+        "error": { "kind": kind, "message": format!("{e:#}") },
+    })
 }
 
 #[cfg(feature = "serve")]
@@ -509,7 +659,7 @@ impl ShapeLoop<'_> {
                         tracing::warn!("could not write the drift report: {w}");
                     }
                 }
-                return Err(anyhow!("{e}"));
+                return Err(e.into());
             }
         };
         match outcome {
@@ -530,7 +680,7 @@ impl ShapeLoop<'_> {
             }
         }
         if self.shaper.pending() >= self.rg {
-            if let Some(batch) = self.shaper.flush().map_err(|e| anyhow!("{e}"))? {
+            if let Some(batch) = self.shaper.flush().map_err(anyhow::Error::from)? {
                 self.sink.write_batch(batch)?;
                 self.batches += 1;
             }
@@ -579,10 +729,10 @@ struct DirectSink(Box<dyn Sink + Send>);
 
 impl ShapeWriter for DirectSink {
     fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        self.0.write_batch(&batch).map_err(|e| anyhow!("{e}"))
+        self.0.write_batch(&batch).map_err(anyhow::Error::from)
     }
     fn finish(&mut self) -> Result<SinkSummary> {
-        self.0.finish().map_err(|e| anyhow!("{e}"))
+        self.0.finish().map_err(anyhow::Error::from)
     }
 }
 
@@ -659,10 +809,10 @@ impl PipelinedSink {
             let mut sink = sink;
             for msg in &rx {
                 match msg {
-                    WriterMsg::Batch(b) => sink.write_batch(&b).map_err(|e| anyhow!("{e}"))?,
+                    WriterMsg::Batch(b) => sink.write_batch(&b).map_err(anyhow::Error::from)?,
                     // Asked to commit: close the footer / write the table metadata.
                     WriterMsg::Finish => {
-                        return sink.finish().map(Some).map_err(|e| anyhow!("{e}"))
+                        return sink.finish().map(Some).map_err(anyhow::Error::from)
                     }
                 }
             }
@@ -686,7 +836,7 @@ impl PipelinedSink {
                 let WriterState::Inline(sink) = &mut self.state else {
                     unreachable!("just matched Inline")
                 };
-                return sink.write_batch(&batch).map_err(|e| anyhow!("{e}"));
+                return sink.write_batch(&batch).map_err(anyhow::Error::from);
             }
             // A second row group: there is real work to overlap now.
             let WriterState::Inline(sink) = std::mem::replace(&mut self.state, WriterState::Done)
@@ -719,7 +869,7 @@ impl PipelinedSink {
     fn collect(&mut self, last: Option<WriterMsg>) -> Result<Option<SinkSummary>> {
         match std::mem::replace(&mut self.state, WriterState::Done) {
             WriterState::Inline(mut sink) => match last {
-                Some(_) => sink.finish().map(Some).map_err(|e| anyhow!("{e}")),
+                Some(_) => sink.finish().map(Some).map_err(anyhow::Error::from),
                 None => Ok(None),
             },
             WriterState::Threaded { tx, handle } => {
@@ -834,7 +984,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         Some(p) => {
             let text =
                 std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            DatasetSpec::parse(&text).map_err(|e| anyhow!("{e}"))?
+            DatasetSpec::parse(&text).map_err(anyhow::Error::from)?
         }
         None => {
             let input = a
@@ -896,7 +1046,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     if let Some(c) = &a.rescue_column {
         spec.drift.rescue_column = c.clone();
     }
-    spec.validate().map_err(|e| anyhow!("{e}"))?;
+    spec.validate().map_err(anyhow::Error::from)?;
 
     // 3. Resolve the input path.
     let input =
@@ -928,7 +1078,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     } else {
         (Vec::new(), None)
     };
-    let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(|e| anyhow!("{e}"))?;
+    let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(anyhow::Error::from)?;
     let schema = shaper.schema();
 
     // 5. Resolve the output + create the sink.
@@ -942,7 +1092,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         OutputFormat::Parquet => {
             let file = resolve_parquet_path(&spec.output.path, &spec.dataset);
             let s = ParquetSink::create(&file, schema.clone(), spec.output.compression)
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(anyhow::Error::from)?;
             (Box::new(s), file)
         }
         OutputFormat::Iceberg if output_is_url => {
@@ -975,7 +1125,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                     &spec.output.partition_by,
                 )
             }
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(anyhow::Error::from)?;
             (Box::new(s), dir)
         }
     };
@@ -1062,7 +1212,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     }
 
     let (rows_in, rows_out, rows_rejected, parse_errors, mut batches) = run.into_totals();
-    if let Some(batch) = shaper.flush().map_err(|e| anyhow!("{e}"))? {
+    if let Some(batch) = shaper.flush().map_err(anyhow::Error::from)? {
         sink.write_batch(batch)?;
         batches += 1;
     }
@@ -1073,7 +1223,28 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     }
     let summary: SinkSummary = sink.finish()?;
 
-    // 7. Report.
+    // 7. Report. The full drift report goes beside the output either way.
+    let drift = shaper.into_drift_report();
+    let drift_report = match &drift {
+        Some(report) if !report.is_clean() => {
+            write_drift_report(&drift_path, &spec.dataset, report)?;
+            Some(drift_path.as_path())
+        }
+        _ => None,
+    };
+    if a.summary_json {
+        let rejects = (parse_errors + rows_rejected > 0).then_some(reject_path.as_path());
+        let doc = shape_json(
+            &spec,
+            &primary,
+            [rows_in, rows_out, rows_rejected, parse_errors, batches],
+            &summary,
+            rejects,
+            drift.as_ref().map(|r| (r, drift_report)),
+        );
+        println!("{doc}");
+        return Ok(());
+    }
     println!(
         "shaped `{}` → {} ({:?})",
         spec.dataset,
@@ -1106,14 +1277,88 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     if let Some(m) = &summary.merge {
         print_merge(m);
     }
-    if let Some(report) = shaper.into_drift_report() {
-        if !report.is_clean() {
-            print_drift(&report);
-            write_drift_report(&drift_path, &spec.dataset, &report)?;
-            println!("full drift report → {}", drift_path.display());
-        }
+    if let (Some(report), Some(path)) = (&drift, drift_report) {
+        print_drift(report);
+        println!("full drift report → {}", path.display());
     }
     Ok(())
+}
+
+/// The `--summary-json` document of a shape run. Snapshot ids are strings: they are
+/// 64-bit, past what a JSON number holds exactly in most parsers.
+fn shape_json(
+    spec: &DatasetSpec,
+    primary: &Path,
+    [rows_in, rows_out, rejected, parse_errors, row_groups]: [u64; 5],
+    summary: &SinkSummary,
+    rejects: Option<&Path>,
+    drift: Option<(&DriftReport, Option<&Path>)>,
+) -> Value {
+    let table = summary.table_version.map(|version| {
+        let metadata = summary
+            .files
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".metadata.json"));
+        serde_json::json!({
+            "version": version,
+            "snapshot_id": summary.snapshot_id.map(|id| id.to_string()),
+            "metadata": metadata.map(|p| p.display().to_string()),
+        })
+    });
+    serde_json::json!({
+        "summary_version": SUMMARY_VERSION,
+        "command": "shape",
+        "ok": true,
+        "dataset": spec.dataset,
+        "output": {
+            "format": spec.output.format,
+            "path": primary.display().to_string(),
+            "compression": spec.output.compression,
+        },
+        "rows": {
+            "in": rows_in,
+            "out": rows_out,
+            "rejected": rejected,
+            "parse_errors": parse_errors,
+        },
+        "row_groups": row_groups,
+        "bytes": summary.bytes,
+        "rejects": rejects.map(|p| serde_json::json!({
+            "path": p.display().to_string(),
+            "rows": rejected + parse_errors,
+        })),
+        "table": table,
+        "merge": summary.merge.as_ref().map(merge_json),
+        // Present whenever drift was checked (any policy but `ignore`), so a clean run
+        // reads differently from an unchecked one.
+        "drift": drift.map(|(r, report)| serde_json::json!({
+            "policy": r.policy,
+            "rows_scanned": r.rows_scanned,
+            "rows_with_drift": r.rows_with_drift,
+            "rows_quarantined": r.rows_quarantined,
+            "rows_rescued": r.rows_rescued,
+            "new_fields": r.new_fields.keys().collect::<Vec<_>>(),
+            "type_mismatches": r.type_mismatches.keys().collect::<Vec<_>>(),
+            "truncated": r.truncated,
+            "report": report.map(|p| p.display().to_string()),
+        })),
+    })
+}
+
+fn merge_json(m: &MergeSummary) -> Value {
+    serde_json::json!({
+        "key_columns": m.key_columns,
+        "distinct_keys": m.distinct_keys,
+        "keys_updated": m.keys_updated,
+        "keys_inserted": m.keys_inserted,
+        "prior_rows_replaced": m.prior_rows_replaced,
+        "duplicates_in_input": m.duplicates_in_input,
+        "null_key_rows": m.null_key_rows,
+        "data_files_scanned": m.data_files_scanned,
+        "data_files_pruned": m.data_files_pruned,
+        "delete_files": m.delete_files,
+        "position_deletes": m.position_deletes,
+    })
 }
 
 /// Summarize a merge: what the key matched, what it replaced, and what it cost to find.
@@ -1281,7 +1526,7 @@ fn objstore_parquet_sink(
     compression: Compression,
 ) -> Result<Box<dyn Sink + Send>> {
     let s = shapeshift_objstore::ObjectStoreParquetSink::create(url, schema, compression)
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from)?;
     Ok(Box::new(s))
 }
 
@@ -1315,7 +1560,7 @@ fn objstore_iceberg_sink(
     } else {
         ObjectStoreIcebergSink::create_merge(url, schema, compression, partition_by, merge_on)
     }
-    .map_err(|e| anyhow!("{e}"))?;
+    .map_err(anyhow::Error::from)?;
     Ok(Box::new(s))
 }
 
@@ -1338,13 +1583,54 @@ fn objstore_iceberg_sink(
 /// like the sinks.
 #[cfg(feature = "object_store")]
 fn objstore_inspect_iceberg(url: &str) -> Result<shapeshift_iceberg::IcebergInfo> {
-    shapeshift_objstore::inspect_iceberg(url).map_err(|e| anyhow!("{e}"))
+    shapeshift_objstore::inspect_iceberg(url).map_err(anyhow::Error::from)
 }
 
 #[cfg(not(feature = "object_store"))]
 fn objstore_inspect_iceberg(url: &str) -> Result<shapeshift_iceberg::IcebergInfo> {
     bail!(
         "inspecting an object-store table ({url}) needs a build with `--features object_store` \
+         (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
+/// Compact an Iceberg table living in an object store. Feature-gated like the sinks.
+#[cfg(feature = "object_store")]
+fn objstore_compact_iceberg(
+    url: &str,
+    options: &shapeshift_iceberg::CompactOptions,
+) -> Result<shapeshift_iceberg::CompactSummary> {
+    shapeshift_objstore::compact_iceberg(url, options).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_compact_iceberg(
+    url: &str,
+    _options: &shapeshift_iceberg::CompactOptions,
+) -> Result<shapeshift_iceberg::CompactSummary> {
+    bail!(
+        "compacting an object-store table ({url}) needs a build with `--features object_store` \
+         (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
+/// Expire snapshots of an Iceberg table living in an object store. Feature-gated like the
+/// sinks.
+#[cfg(feature = "object_store")]
+fn objstore_expire_iceberg(
+    url: &str,
+    options: &shapeshift_iceberg::ExpireOptions,
+) -> Result<shapeshift_iceberg::ExpireSummary> {
+    shapeshift_objstore::expire_iceberg(url, options).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_expire_iceberg(
+    url: &str,
+    _options: &shapeshift_iceberg::ExpireOptions,
+) -> Result<shapeshift_iceberg::ExpireSummary> {
+    bail!(
+        "expiring an object-store table ({url}) needs a build with `--features object_store` \
          (kept out of the default musl-static binary so it never links the cloud SDKs)"
     )
 }
@@ -1387,10 +1673,10 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
         let info = objstore_inspect_iceberg(&path_str)?;
         print_iceberg_info(&path_str, &info);
     } else if a.path.is_dir() {
-        let info = shapeshift_iceberg::inspect(&a.path).map_err(|e| anyhow!("{e}"))?;
+        let info = shapeshift_iceberg::inspect(&a.path).map_err(anyhow::Error::from)?;
         print_iceberg_info(&a.path.display().to_string(), &info);
     } else {
-        let info = shapeshift_parquet::inspect(&a.path).map_err(|e| anyhow!("{e}"))?;
+        let info = shapeshift_parquet::inspect(&a.path).map_err(anyhow::Error::from)?;
         println!("parquet file: {}", a.path.display());
         println!("  rows: {}", info.rows);
         println!("  row-groups: {}", info.row_groups);
@@ -1400,6 +1686,217 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_compact(a: CompactArgs) -> Result<()> {
+    let options = shapeshift_iceberg::CompactOptions {
+        target_file_size: a.target_file_size,
+        compression: a.compression.into(),
+        ..shapeshift_iceberg::CompactOptions::default()
+    };
+    let s = if looks_like_url(&a.table) {
+        objstore_compact_iceberg(&a.table, &options)?
+    } else {
+        let dir = PathBuf::from(&a.table);
+        if !dir.join("metadata/version-hint.text").exists() {
+            bail!(
+                "no Iceberg table at {} (no metadata/version-hint.text)",
+                dir.display()
+            );
+        }
+        shapeshift_iceberg::compact_table(&dir, &options).map_err(anyhow::Error::from)?
+    };
+    if a.summary_json {
+        println!("{}", compact_json(&a, &s));
+    } else {
+        print_compact(&a.table, &s);
+    }
+    Ok(())
+}
+
+fn compact_json(a: &CompactArgs, s: &shapeshift_iceberg::CompactSummary) -> Value {
+    serde_json::json!({
+        "summary_version": SUMMARY_VERSION,
+        "command": "compact",
+        "ok": true,
+        "table": a.table,
+        "committed": s.snapshot_id.is_some(),
+        "version": s.version,
+        "snapshot_id": s.snapshot_id.map(|id| id.to_string()),
+        "data_files": {
+            "rewritten": s.data_files_rewritten,
+            "written": s.data_files_written,
+            "kept": s.data_files_kept,
+        },
+        "delete_files_removed": s.delete_files_removed,
+        "position_deletes_applied": s.position_deletes_applied,
+        "rows_rewritten": s.rows_rewritten,
+        "bytes": { "rewritten": s.bytes_rewritten, "written": s.bytes_written },
+        "partitions_compacted": s.partitions_compacted,
+        "options": {
+            "target_file_size": a.target_file_size,
+            "compression": Compression::from(a.compression),
+        },
+    })
+}
+
+fn print_compact(table: &str, s: &shapeshift_iceberg::CompactSummary) {
+    let Some(id) = s.snapshot_id else {
+        println!(
+            "nothing to compact in {table}: no delete files, and no partition with two or \
+             more files below the target size ({} data file(s) left as they are)",
+            s.data_files_kept
+        );
+        return;
+    };
+    println!("compacted {table} → snapshot {id} (replace)");
+    println!(
+        "  rewrote {} data file(s) ({}) into {} ({}); kept {} as they were",
+        s.data_files_rewritten,
+        human_bytes(s.bytes_rewritten),
+        s.data_files_written,
+        human_bytes(s.bytes_written),
+        s.data_files_kept
+    );
+    println!(
+        "  applied {} position delete(s) from {} delete file(s) — the table has none left",
+        s.position_deletes_applied, s.delete_files_removed
+    );
+    println!(
+        "  {} live row(s) rewritten across {} partition(s); earlier snapshots still read their own files",
+        s.rows_rewritten, s.partitions_compacted
+    );
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn cmd_expire(a: ExpireArgs) -> Result<()> {
+    let options = shapeshift_iceberg::ExpireOptions {
+        older_than_ms: shapeshift_iceberg::snapshot_timestamp_ms().saturating_sub(a.older_than),
+        retain_last: a.retain_last as usize,
+        dry_run: a.dry_run,
+    };
+    let s = if looks_like_url(&a.table) {
+        objstore_expire_iceberg(&a.table, &options)?
+    } else {
+        let dir = PathBuf::from(&a.table);
+        if !dir.join("metadata/version-hint.text").exists() {
+            bail!(
+                "no Iceberg table at {} (no metadata/version-hint.text)",
+                dir.display()
+            );
+        }
+        shapeshift_iceberg::expire_table(&dir, &options).map_err(anyhow::Error::from)?
+    };
+    if a.summary_json {
+        println!("{}", expire_json(&a, &s));
+    } else {
+        print_expire(&a, &s);
+    }
+    Ok(())
+}
+
+/// In a dry run, `deleted` counts what a real run would delete.
+fn expire_json(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) -> Value {
+    serde_json::json!({
+        "summary_version": SUMMARY_VERSION,
+        "command": "expire",
+        "ok": true,
+        "table": a.table,
+        "dry_run": a.dry_run,
+        "committed": s.committed,
+        "version": s.version,
+        "snapshots": {
+            "expired": s.expired_snapshots.iter().map(i64::to_string).collect::<Vec<_>>(),
+            "retained": s.retained_snapshots,
+        },
+        "deleted": {
+            "data_files": s.data_files_deleted,
+            "delete_files": s.delete_files_deleted,
+            "manifests": s.manifests_deleted,
+            "manifest_lists": s.manifest_lists_deleted,
+            "bytes": s.bytes_deleted,
+        },
+        "files_outside_table": s.files_outside_table,
+        "files_not_deleted": s.files_not_deleted,
+        "options": { "older_than_ms": a.older_than, "retain_last": a.retain_last },
+    })
+}
+
+fn print_expire(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) {
+    if s.expired_snapshots.is_empty() {
+        println!(
+            "nothing to expire in {}: {} snapshot(s), none older than {} outside the newest {}",
+            a.table,
+            s.retained_snapshots,
+            human_duration(a.older_than),
+            a.retain_last
+        );
+        return;
+    }
+    let (expire, delete) = if a.dry_run {
+        ("would expire", "would delete")
+    } else {
+        ("expired", "deleted")
+    };
+    println!(
+        "{expire} {} snapshot(s) of {}; kept {}{}",
+        s.expired_snapshots.len(),
+        a.table,
+        s.retained_snapshots,
+        if a.dry_run {
+            " (dry run: nothing changed)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  {delete} {} data file(s), {} delete file(s), {} manifest(s), {} manifest list(s) — {}",
+        s.data_files_deleted,
+        s.delete_files_deleted,
+        s.manifests_deleted,
+        s.manifest_lists_deleted,
+        human_bytes(s.bytes_deleted)
+    );
+    if s.files_outside_table > 0 {
+        println!(
+            "  left {} file(s) in place: their paths are outside the table's location",
+            s.files_outside_table
+        );
+    }
+    if s.files_not_deleted > 0 {
+        println!(
+            "  warning: {} file(s) could not be deleted; no snapshot references them any more",
+            s.files_not_deleted
+        );
+    }
+}
+
+fn human_duration(ms: i64) -> String {
+    for (unit, size) in [
+        ("w", 7 * 86_400_000),
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+    ] {
+        if ms >= size && ms % size == 0 {
+            return format!("{}{unit}", ms / size);
+        }
+    }
+    format!("{}s", ms / 1000)
 }
 
 fn cmd_cost(a: CostArgs) -> Result<()> {

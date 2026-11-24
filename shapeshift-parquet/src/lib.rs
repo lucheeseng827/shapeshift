@@ -109,6 +109,8 @@ impl Sink for ParquetSink {
         w.close().map_err(sink_err)?;
         let bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         Ok(SinkSummary {
+            table_version: None,
+            snapshot_id: None,
             files: vec![self.path.clone()],
             rows: self.rows,
             bytes,

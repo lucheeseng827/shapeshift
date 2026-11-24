@@ -323,6 +323,11 @@ spec field for a single run without editing the file:
 With no `-s/--spec`, `shape` infers a spec on the fly (then `--input` and `--output` are required),
 which is equivalent to running `infer` and immediately shaping with the result.
 
+Flags that only change how a run reports, not what it writes, have no spec field: `--summary-json`
+prints one JSON document (`summary_version: 1`) on stdout in place of the text report — the
+counts, the table version and snapshot committed, the merge and drift summaries, or the error
+and its kind. The README's "Script it" section lists its fields.
+
 ---
 
 ## 12. Example specs
@@ -436,9 +441,10 @@ table directory).
   evolution** — new *optional* columns are welcomed (existing columns keep their field-ids, old
   rows read the new column as null); dropping, renaming, or re-typing a column, or adding a
   *required* column, is refused, and the partition spec must match — all checked at `create`
-  time (before any data is written). Appends are
-  **single-writer**: `version-hint.text` is published with no lock, so concurrent writers to one
-  table would clobber each other — multi-writer commits need a catalog (roadmap REST catalog).
+  time (before any data is written). Concurrent writers are **guarded**: a commit creates the
+  next `metadata.json` only if no other writer did, and the loser fails with a commit conflict
+  (CLI exit status 75) having published nothing — run it again. Serialising writers instead of
+  refusing them needs a catalog (roadmap REST catalog).
 - `compression: zstd` is **off by default** (the musl-static binary links no C codecs) — it returns
   a clear error there; use `snappy`/`uncompressed`, or build with `--features zstd` (the opt-in fat
   build) to enable it for both Parquet and Iceberg.
@@ -450,9 +456,10 @@ table directory).
   `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
   tables); **catalog-managed** relocation (re-anchoring paths so any engine reads with no flag, plus
   multi-writer commits) is left to an external Iceberg REST catalog.
-- `merge_on` is single-writer like `--append`, and leaves position-delete files in place until a
-  compaction command exists. A key column's type is checked when the schema is known (at write time in
-  `infer` mode).
+- `merge_on` is guarded like `--append` (of two writers on one version, the second exits 75 having
+  published nothing), and leaves position-delete files in place until the table is compacted
+  (`shapeshift compact`, which takes no spec). A key column's type is checked when the schema is
+  known (at write time in `infer` mode).
 
 ---
 

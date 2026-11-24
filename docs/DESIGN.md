@@ -453,7 +453,7 @@ The forward-looking ones are roadmap; the rest are permanent boundaries.
 
 | Not in the OSS engine | Why | Where it belongs |
 |---|---|---|
-| Append-to-existing / multi-snapshot Iceberg | shipped: `--append` chains a new snapshot onto an existing table (reads prior metadata + manifest list, carries manifests forward, bumps version) | ✅ done — row-level **merge / upsert** (CDC) is out of scope |
+| Append-to-existing / multi-snapshot Iceberg | shipped: `--append` chains a new snapshot onto an existing table (reads prior metadata + manifest list, carries manifests forward, bumps version) | ✅ done — row-level **upsert** shipped in 0.3 (`--merge-on`: single writer, Iceberg v2 position deletes); CDC *capture* stays out of scope (last row) |
 | Partitioning (identity + hidden transforms) | shipped: `--partition-by` accepts columns and transform expressions (`bucket(N, col)` with spec-exact Murmur3, `truncate(W, col)`, `year\|month\|day\|hour(col)`); the spec records the real transform strings, rows fan out per **transformed** value, and the manifest partition tuple stores the transform's result type | ✅ done |
 | Object-store output (S3/GCS/Azure) | shipped for **both Parquet and Iceberg** via `shapeshift-objstore` (a new `Sink` crate, opt-in behind the CLI's `object_store` feature) | ✅ done — a moved table reads with `allow_moved_paths=true`; only **catalog-managed** relocation + multi-writer is left to an external **REST catalog** |
 | `zstd` compression | not linked **by default** — it would pull a C codec and break the musl-static single binary; the lean binary gives a **clear error** | ✅ opt-in: `cargo build --features zstd` (the fat build) enables it for Parquet + Iceberg; otherwise `snappy` (default) / `uncompressed` |

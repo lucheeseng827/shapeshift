@@ -10,16 +10,19 @@ destination moves.
 - **`ObjectStoreParquetSink`** — a write-once `Sink` targeting an `s3://` / `gs://` /
   `az://` / `file://` URL. It writes the Parquet to a local temp file first (one row
   group per batch, exactly like [`shapeshift-parquet`](../shapeshift-parquet)), then on
-  `finish` streams it to the store as a **multipart upload** in fixed 8 MiB parts — so
-  neither the shape nor the upload ever holds the whole object in RAM.
+  `finish` uploads it: one `PUT` when it fits in 8 MiB, else a **multipart upload** in
+  fixed 8 MiB parts — so neither the shape nor the upload ever holds more than a part of
+  it in RAM.
 - **`ObjectStoreIcebergSink`** — a write-once `Sink` that lands a whole self-contained
   **Iceberg v2 table** (data Parquet + manifest + manifest-list + `metadata.json` +
   `version-hint.text`) under a URL prefix. It reuses
-  [`shapeshift-iceberg`](../shapeshift-iceberg)'s backend-agnostic table builder: the data
-  Parquet streams up as a multipart upload, the metadata blobs go via `put`, and
-  `version-hint.text` is written **last** so the snapshot only becomes visible once every
-  file it references is in place. Every embedded path is **anchored at the destination
-  URI**, so DuckDB `iceberg_scan('s3://…')` reads the table back in place.
+  [`shapeshift-iceberg`](../shapeshift-iceberg)'s backend-agnostic table builder. The data
+  files, any delete files, the manifests and the manifest list go up **8 at a time** (with
+  at most 16 MiB of file bytes in memory), since nothing names them yet; then the
+  `metadata/v{N}.metadata.json` that does — created only if no other writer created it
+  (the commit) — and `version-hint.text` last. A failed upload or a refused commit removes
+  everything the write put. Every embedded path is **anchored at the destination URI**, so
+  DuckDB `iceberg_scan('s3://…')` reads the table back in place.
 - **`inspect_iceberg`** — read an object-store table's current metadata (via
   `version-hint.text`) and summarize it: the remote analog of
   `shapeshift_iceberg::inspect`.
@@ -55,7 +58,7 @@ flowchart LR
 ## Event flow — `create` → `write_batch`\* → `finish` (Iceberg)
 
 The Parquet flow is the same up to `finish`, where it uploads a single object. The Iceberg
-sink uploads the data file, then `put`s the metadata, publishing `version-hint.text` last:
+sink uploads its files together, then commits the metadata file, then the hint:
 
 ```mermaid
 sequenceDiagram
@@ -73,9 +76,12 @@ sequenceDiagram
     CLI->>Sink: finish()
     Sink->>DW: close — Parquet footer + row count
     Note over Sink: build manifest / manifest-list / metadata,<br/>every path anchored at dest_url
-    Sink->>Store: multipart upload — data/<uuid>.parquet
-    Sink->>Store: put — manifest, manifest-list, metadata.json
-    Sink->>Store: put — version-hint.text (LAST → snapshot visible)
+    par 8 at a time
+        Sink->>Store: put — data/<uuid>.parquet (multipart past 8 MiB)
+        Sink->>Store: put — manifest(s), manifest-list
+    end
+    Sink->>Store: put if absent — metadata/vN.metadata.json (the commit → snapshot visible)
+    Sink->>Store: put — version-hint.text (last; a hint readers look past)
     Sink->>Sink: remove temp file (also on error, via Drop)
     Sink-->>CLI: SinkSummary { files:[metadata_uri], rows, bytes }
 ```

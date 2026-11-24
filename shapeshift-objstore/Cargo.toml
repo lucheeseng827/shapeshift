@@ -18,7 +18,11 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+# The `Stream` trait, to hand `delete_stream` many keys at once (comes with object_store).
+futures-core = "0.3"
 
 [dev-dependencies]
 parquet = { workspace = true }
 arrow-array = { workspace = true }
+# Only to wrap a store in a request-counting `ObjectStore` (comes with object_store).
+async-trait = "0.1"

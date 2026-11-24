@@ -33,6 +33,11 @@ pub enum ShapeError {
     #[error("sink error: {0}")]
     Sink(String),
 
+    /// Another writer committed to the table while this one ran, so this commit was
+    /// refused and nothing of it was published. Safe to retry from the start.
+    #[error("commit conflict: {0}")]
+    Conflict(String),
+
     /// A source (JSON reader) failure bubbled up through a boxed dyn error.
     #[error("source error: {0}")]
     Source(String),

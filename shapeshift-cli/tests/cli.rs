@@ -587,6 +587,72 @@ fn merge_on_upserts_into_an_iceberg_table() {
         out.contains("live-records: 3 (5 written, 2 removed by position deletes)"),
         "got: {out}"
     );
+
+    // Compaction applies the deletes: same live rows, no deletes left.
+    let compact = run(&["compact", t]);
+    let out = String::from_utf8_lossy(&compact.stdout);
+    assert!(compact.status.success(), "compact failed: {out}");
+    assert!(out.contains("(replace)"), "got: {out}");
+    assert!(
+        out.contains("rewrote 2 data file(s)") && out.contains("into 1"),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("applied 2 position delete(s) from 1 delete file(s)"),
+        "got: {out}"
+    );
+    let inspect = run(&["inspect", t]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(out.contains("total-records: 3"), "got: {out}");
+    let again = run(&["compact", t]);
+    let out = String::from_utf8_lossy(&again.stdout);
+    assert!(out.starts_with("nothing to compact"), "got: {out}");
+
+    // Expiry: nothing is five days old; with no age limit, the two merges go and the
+    // compaction stays, and the rows are the same.
+    let young = run(&["expire", t]);
+    let out = String::from_utf8_lossy(&young.stdout);
+    assert!(out.starts_with("nothing to expire"), "got: {out}");
+    let dry = run(&["expire", t, "--older-than", "0s", "--dry-run"]);
+    let out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        out.contains("would expire 2 snapshot(s)") && out.contains("dry run"),
+        "got: {out}"
+    );
+    let expire = run(&["expire", t, "--older-than", "0s"]);
+    let out = String::from_utf8_lossy(&expire.stdout);
+    assert!(expire.status.success(), "expire failed: {out}");
+    assert!(out.contains("expired 2 snapshot(s)"), "got: {out}");
+    assert!(
+        out.contains("deleted 2 data file(s), 1 delete file(s)"),
+        "got: {out}"
+    );
+    let inspect = run(&["inspect", t]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(out.contains("total-records: 3"), "got: {out}");
+}
+
+#[test]
+fn compact_refuses_what_is_not_a_table_and_sizes_it_cannot_read() {
+    let d = workdir("compact-refused");
+    let missing = run(&["compact", d.join("nope").to_str().unwrap()]);
+    assert!(!missing.status.success());
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(err.contains("no Iceberg table"), "got: {err}");
+
+    let bad = run(&["compact", "t", "--target-file-size", "12XB"]);
+    assert!(!bad.status.success());
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("unknown size unit"), "got: {err}");
+
+    let missing = run(&["expire", d.join("nope").to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(err.contains("no Iceberg table"), "got: {err}");
+    let unitless = run(&["expire", "t", "--older-than", "5"]);
+    let err = String::from_utf8_lossy(&unitless.stderr);
+    assert!(err.contains("give a unit"), "got: {err}");
+    let none = run(&["expire", "t", "--retain-last", "0"]);
+    assert!(!none.status.success());
 }
 
 #[test]
@@ -697,4 +763,301 @@ fn merge_on_upserts_into_an_object_store_table() {
         out.contains("live-records: 3 (5 written, 2 removed by position deletes)"),
         "got: {out}"
     );
+
+    let compact = run(&["compact", &url]);
+    let out = String::from_utf8_lossy(&compact.stdout);
+    assert!(compact.status.success(), "compact failed: {out}");
+    assert!(
+        out.contains("applied 2 position delete(s) from 1 delete file(s)"),
+        "got: {out}"
+    );
+    let inspect = run(&["inspect", &url]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(out.contains("total-records: 3"), "got: {out}");
+
+    let expire = run(&["expire", &url, "--older-than", "0s"]);
+    let out = String::from_utf8_lossy(&expire.stdout);
+    assert!(expire.status.success(), "expire failed: {out}");
+    assert!(out.contains("expired 2 snapshot(s)"), "got: {out}");
+    let inspect = run(&["inspect", &url]);
+    let out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(out.contains("total-records: 3"), "got: {out}");
+
+    // The JSON summary names the version and metadata the store now holds.
+    let (out, doc) = run_json(&[
+        "shape",
+        "-i",
+        day1.to_str().unwrap(),
+        "-o",
+        &url,
+        "--to",
+        "iceberg",
+        "--merge-on",
+        "id",
+    ]);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["table"]["version"], 5);
+    assert_eq!(
+        doc["table"]["metadata"],
+        format!("{url}/metadata/v5.metadata.json").as_str()
+    );
+    assert_eq!(doc["merge"]["keys_updated"], 2);
+    let (_, doc) = run_json(&["compact", &url]);
+    assert_eq!(
+        (doc["committed"].as_bool(), doc["version"].as_u64()),
+        (Some(true), Some(6))
+    );
+    let (_, doc) = run_json(&["expire", &url, "--older-than", "0s"]);
+    assert_eq!(
+        (doc["committed"].as_bool(), doc["version"].as_u64()),
+        (Some(true), Some(7))
+    );
+    assert_eq!(doc["snapshots"]["retained"], 1);
+}
+
+/// Run with `--summary-json` and parse stdout, which must be exactly one JSON document.
+fn run_json(args: &[&str]) -> (std::process::Output, serde_json::Value) {
+    let mut args = args.to_vec();
+    args.push("--summary-json");
+    let out = run(&args);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}): {stdout}"));
+    assert_eq!(doc["summary_version"], 1, "{doc}");
+    (out, doc)
+}
+
+#[test]
+fn summary_json_reports_every_run_as_one_document() {
+    let d = workdir("summary-json");
+    let day1 = d.join("day1.jsonl");
+    let day2 = d.join("day2.jsonl");
+    fs::write(
+        &day1,
+        "{\"id\":1,\"status\":\"new\"}\n{\"id\":2,\"status\":\"new\"}\nnot json\n",
+    )
+    .unwrap();
+    fs::write(
+        &day2,
+        "{\"id\":2,\"status\":\"paid\"}\n{\"id\":3,\"status\":\"new\"}\n",
+    )
+    .unwrap();
+    let table = d.join("orders");
+    let t = table.to_str().unwrap();
+    let shape = |input: &PathBuf| {
+        run_json(&[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            t,
+            "--to",
+            "iceberg",
+            "--merge-on",
+            "id",
+        ])
+    };
+
+    // A fresh table: version 1, one parse error sidecarred, nothing replaced.
+    let (out, doc) = shape(&day1);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["command"], "shape");
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["output"]["format"], "iceberg");
+    assert_eq!(doc["rows"]["in"], 2);
+    assert_eq!(doc["rows"]["out"], 2);
+    assert_eq!(doc["rows"]["parse_errors"], 1);
+    assert_eq!(doc["rejects"]["rows"], 1);
+    assert!(doc["rejects"]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("orders.rejects.jsonl"));
+    assert_eq!(doc["table"]["version"], 1);
+    let first_snapshot = doc["table"]["snapshot_id"].as_str().unwrap().to_string();
+    first_snapshot.parse::<i64>().unwrap();
+    assert!(doc["table"]["metadata"]
+        .as_str()
+        .unwrap()
+        .ends_with("metadata/v1.metadata.json"));
+    assert_eq!(doc["merge"]["keys_inserted"], 2);
+    // Drift was checked (the default `warn`) and found nothing.
+    assert_eq!(doc["drift"]["policy"], "warn");
+    assert_eq!(doc["drift"]["rows_with_drift"], 0);
+    assert!(doc["drift"]["report"].is_null());
+
+    // The merge: version 2, one key updated.
+    let (out, doc) = shape(&day2);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["table"]["version"], 2);
+    assert!(doc["rejects"].is_null());
+    let m = &doc["merge"];
+    assert_eq!(m["key_columns"], serde_json::json!(["id"]));
+    assert_eq!(
+        (m["keys_updated"].as_u64(), m["keys_inserted"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(m["prior_rows_replaced"], 1);
+    assert_eq!(m["delete_files"], 1);
+
+    // Compaction: version 3, the delete applied.
+    let (out, doc) = run_json(&["compact", t]);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["command"], "compact");
+    assert_eq!(doc["committed"], true);
+    assert_eq!(doc["version"], 3);
+    assert_eq!(doc["data_files"]["rewritten"], 2);
+    assert_eq!(doc["data_files"]["written"], 1);
+    assert_eq!(doc["delete_files_removed"], 1);
+    assert_eq!(doc["position_deletes_applied"], 1);
+    assert_eq!(doc["rows_rewritten"], 3);
+    let (_, again) = run_json(&["compact", t]);
+    assert_eq!(again["committed"], false);
+    assert!(again["version"].is_null() && again["snapshot_id"].is_null());
+
+    // Expiry: the dry run names what a real run then does.
+    let (out, dry) = run_json(&["expire", t, "--older-than", "0s", "--dry-run"]);
+    assert!(out.status.success(), "{dry}");
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["committed"], false);
+    assert!(dry["version"].is_null());
+    let (out, doc) = run_json(&["expire", t, "--older-than", "0s"]);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["committed"], true);
+    assert_eq!(doc["version"], 4);
+    assert_eq!(doc["snapshots"], dry["snapshots"]);
+    assert_eq!(doc["deleted"], dry["deleted"]);
+    assert_eq!(doc["snapshots"]["expired"][0], first_snapshot.as_str());
+    assert_eq!(doc["snapshots"]["retained"], 1);
+    assert_eq!(doc["deleted"]["data_files"], 2);
+    assert_eq!(doc["deleted"]["delete_files"], 1);
+
+    // Parquet output has no table.
+    let (out, doc) = run_json(&[
+        "shape",
+        "-i",
+        day1.to_str().unwrap(),
+        "-o",
+        d.join("p.parquet").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{doc}");
+    assert_eq!(doc["output"]["format"], "parquet");
+    assert!(doc["table"].is_null() && doc["merge"].is_null());
+}
+
+#[test]
+fn summary_json_names_the_drift_and_its_report() {
+    let (d, spec) = drift_fixture("summary-json-drift");
+    let input = d.join("in.jsonl");
+    let out = d.join("out.parquet");
+    let args = [
+        "shape",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+    ];
+    let (run, doc) = run_json(&args);
+    assert!(run.status.success(), "{doc}");
+    let drift = &doc["drift"];
+    assert_eq!(drift["policy"], "warn");
+    assert_eq!(drift["rows_scanned"], 4);
+    assert_eq!(drift["rows_with_drift"], 2);
+    assert_eq!(drift["new_fields"], serde_json::json!(["currency"]));
+    assert_eq!(drift["type_mismatches"], serde_json::json!(["amount"]));
+    assert_eq!(doc["rows"]["out"], 4);
+    let report = PathBuf::from(drift["report"].as_str().unwrap());
+    assert_eq!(report, d.join("out.parquet.drift.json"));
+    assert!(report.exists());
+
+    // Quarantined rows are counted as rejects, with their sidecar.
+    let mut quarantine = args.to_vec();
+    quarantine.extend(["--on-drift", "quarantine"]);
+    let (run, doc) = run_json(&quarantine);
+    assert!(run.status.success(), "{doc}");
+    assert_eq!(doc["drift"]["rows_quarantined"], 2);
+    assert_eq!(doc["rows"]["out"], 2);
+    assert_eq!(doc["rows"]["rejected"], 2);
+    assert_eq!(doc["rejects"]["rows"], 2);
+
+    // A run that fails on drift says so, in either writer mode.
+    for pipeline in ["on", "off"] {
+        let mut error = args.to_vec();
+        error.extend(["--on-drift", "error", "--pipeline", pipeline]);
+        let (run, doc) = run_json(&error);
+        assert_eq!(run.status.code(), Some(1), "{doc}");
+        assert_eq!(doc["error"]["kind"], "drift", "{doc}");
+    }
+
+    // With drift checks off there is nothing to report.
+    let mut ignore = args.to_vec();
+    ignore.extend(["--on-drift", "ignore"]);
+    let (run, doc) = run_json(&ignore);
+    assert!(run.status.success(), "{doc}");
+    assert!(doc["drift"].is_null(), "{doc}");
+
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn summary_json_reports_a_failure_as_one_document() {
+    let d = workdir("summary-json-err");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+
+    // No table: a failure the engine did not name.
+    let (out, doc) = run_json(&["compact", d.join("nope").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(doc["command"], "compact");
+    assert_eq!(doc["ok"], false);
+    assert_eq!(doc["error"]["kind"], "other");
+    assert!(doc["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no Iceberg table"));
+    // The text error still goes to stderr.
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no Iceberg table"));
+
+    // A bad spec.
+    let spec = d.join("bad.yaml");
+    fs::write(
+        &spec,
+        "dataset: x\nsource: {format: jsonl}\noutput: {format: parquet, path: x}\nbogus: 1\n",
+    )
+    .unwrap();
+    let (out, doc) = run_json(&[
+        "shape",
+        "-s",
+        spec.to_str().unwrap(),
+        "-i",
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(doc["error"]["kind"], "spec");
+
+    // A leftover later version from an older shapeshift: refused, and not as a conflict
+    // (running it again would not help).
+    let table = d.join("t");
+    let t = table.to_str().unwrap();
+    let args = [
+        "shape",
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        t,
+        "--to",
+        "iceberg",
+    ];
+    assert!(run(&args).status.success());
+    fs::write(table.join("metadata/v2.metadata.json"), "{}").unwrap();
+    let mut append = args.to_vec();
+    append.push("--append");
+    let (out, doc) = run_json(&append);
+    assert_eq!(out.status.code(), Some(1), "{doc}");
+    assert_eq!(doc["error"]["kind"], "sink");
+    assert!(doc["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("left over"));
 }

@@ -125,10 +125,12 @@ the old ones, so prior snapshots stay readable; readers fill the new column with
 old rows). Anything non-additive — dropping, renaming, or re-typing a column, or a new
 *required* column — is refused, and the partition spec must match exactly; incompatible
 appends fail at `create()`, before any data file is written, so a rejected append never
-leaves an orphan behind. Appends are **single-writer**: the sink reads
-`version-hint.text`, computes the next version, and publishes it with no lock, so concurrent
-writers to one table would clobber each other — a multi-writer catalog (relocatable, atomic
-commits) is the roadmap REST catalog. Every data file records **per-column
+leaves an orphan behind. Concurrent writers are **guarded**: a commit creates
+`v{N+1}.metadata.json` only if no other writer did (a hard link that refuses to replace, or a
+conditional put on an object store), so of two writers that built on the same version the
+second fails with `ShapeError::Conflict`, having removed what it staged; the hint is replaced
+atomically afterwards and readers follow committed successors past a stale one. Serialising
+writers instead (and relocatable tables) is the roadmap REST catalog. Every data file records **per-column
 statistics** (`value_counts` / `null_value_counts` + min/max `lower_bounds` /
 `upper_bounds`, exact values in Iceberg's little-endian single-value encoding), so readers
 skip files by predicate. **Partitioning** is applied — identity
