@@ -170,6 +170,7 @@ It is YAML or JSON:
 
 ```yaml
 dataset: <name>
+where:   <predicate>               # optional row filter (0.5): which source records the run takes
 source:  { format: jsonl|json-array, path: <optional> }
 output:  { format: parquet|iceberg, path: <path>, compression: snappy|zstd|uncompressed,
            partition_by: [<cols>] }
@@ -184,6 +185,26 @@ options: { flatten: <bool, default true>, row_group_rows: <default 50000>, infer
 The `from` path selects a value out of the record: dotted (`user.name`), an optional leading `$`
 or `$.`, a numeric segment as an array index (`tags.0`), and a bare `$` for the whole record. An
 **unresolved path is null** (which then follows the coercion policy above).
+
+### Row filter (`where`, 0.5)
+
+`where` is a subset of SQL's `WHERE` over the same paths (`shapeshift-core::predicate`). It is
+parsed once when the spec loads, into a tree whose paths are compiled like a column's, and
+evaluated first thing in `Shaper::push`, before drift detection and the per-row append: a record it
+does not keep returns `PushOutcome::Filtered` and touches no builder, no drift counter and no
+rejects sidecar. Evaluation runs on the `Record` trait, so it reads the simd-json tape as cheaply as
+an owned value, and allocates nothing unless it has to describe a type mismatch.
+
+- **SQL's three-valued logic.** Null, missing, and a comparison across kinds are unknown; a record
+  is kept only on true. Cross-kind comparisons are counted, and the first is described, because the
+  likeliest mistake (`status = '500'` against a number) otherwise keeps nothing in silence.
+- **Its paths count as read by the spec**, so a field the filter tests but no column keeps
+  (`record_type` in a table of one record type) is not drift.
+- **Inference samples through it**, so an inferred schema is the kept records' alone. On a stream,
+  dropped records are buffered for replay under the same bound as malformed ones.
+- **Checked against DuckDB**: the grammar is SQL's, so CI runs generated expressions in both and
+  requires the same rows (`examples/where/verify_duckdb.py`). It is also what 0.6's change-feed
+  deletes need (`delete_when:`), so it is a module of its own.
 
 ### Type mapping (logical → Arrow → Parquet → Iceberg)
 
@@ -299,6 +320,20 @@ strings, unions, and (empty) records — and the two manifest schemas
 (`manifest_entry`, `manifest_file`) are fixed constants with their Iceberg field-ids baked in.
 Emitting it ourselves preserves the schema JSON byte-for-byte **and** drops a dependency, which
 keeps the single-static-binary ethos intact.
+
+**Reading is schema-driven, and takes other engines' files (0.5).** The reader parses the schema
+each file carries and decodes against it, so it reads manifests and manifest lists whatever
+fields and order the writer chose: other engines add `partitions` summaries and `key_metadata`
+to the list, and v1 tables name the counts differently. Blocks are decompressed per the header's
+`avro.codec`: `null` (ours), `deflate` (Iceberg's `gzip`, the Java and PyIceberg default; raw
+RFC 1951 through `miniz_oxide`, pure Rust) and `snappy` (with its CRC-32 checked); a block must
+decode to exactly its objects, and a decompressed block over 256 MiB is refused. `zstandard`
+would need the C library and is refused by name. The `partitions` summaries are carried on
+every manifest written back into a new list (`ManifestFileEntry::partitions`), so readers keep
+pruning other engines' manifests. Those engines also write zstd **data** files, which only the
+`zstd` build decodes; a merge or compaction in the lean build names the file and the build
+(`batch_err`) instead of parquet's "Disabled feature at compile time". Writes onto format
+version 1 or 3 tables are refused where every write checks the table's partition spec.
 
 ---
 
@@ -473,10 +508,20 @@ The decisions that make it safe:
   (a DELETED entry, as a compaction writes) is not read by it, so it can go. A file listed as live
   by any retained snapshot stays, whichever snapshot wrote it. Paths are compared exactly as
   recorded: shapeshift writes each file's path once and carries it verbatim.
-- **Never outside the table.** A file is deleted only if its recorded path lies under the
-  table's `location` or under where the table is now. A copy of a table can name another
-  table's files (paths are absolute); expiring the copy must not delete the original's, so such
-  paths are counted and left.
+- **Never outside the table.** A file is deleted only if its recorded path lies under one of
+  the table's anchors (below) or under where the table is now, and it is deleted at its key
+  under where the table is now. A copy's paths name the original's directory: they are the
+  copy's own files, deleted in the copy, never in the original. A path under no anchor (an
+  engine's `write.data.path` elsewhere) is counted and left.
+- **Anchors: where a moved table's paths point.** Paths are absolute, and a table that was
+  moved, written to and moved again holds paths written at several directories. Every reader
+  (append, merge, compact, expire, scan) resolves a path the same way: the table's anchors are
+  its `location` plus the directory above `metadata/` of every snapshot's manifest list and
+  every `metadata-log` entry (except files under the table's own `write.metadata.path`, which
+  an engine keeps there wherever the table is); a path under one, cut at the longest on a path-component
+  boundary, is read at that key where the table is now; a key with a `.` or `..` segment is
+  refused; any other path is read where it says. A catalog's table has one anchor, its
+  location, since its recorded paths are where its files are.
 - **Commit first, delete after.** The metadata without the expired snapshots is published before
   any file is deleted. A crash in between leaves files nothing references, never a table that
   names a missing file.
@@ -549,6 +594,207 @@ The decisions that make it hold:
 
 `examples/merge/race_writers.py` checks it end to end with real processes, on local disk and over
 the S3 protocol, and its `--negative-control` mode demonstrates the loss on a build without it.
+
+## 8e. Catalog commits — `--catalog` (0.5)
+
+A table an Iceberg REST catalog names has another commit point: not the next metadata file, but
+the catalog's pointer to the table's current metadata. shapeshift is a client here. The catalog
+checks each commit against the table as it stands and applies it or refuses it.
+
+Credentials come from the environment (SPEC §5a): a bearer token sent as is, or OAuth2 client
+credentials exchanged at the token endpoint (`{uri}/v1/oauth/tokens`, or the one named) for a
+token. One `RestCatalog` serves a whole run across several short-lived runtimes, so it holds the
+token behind a plain mutex and fetches a fresh one before any request once nine tenths of its life
+have passed; a commit that cannot get a token is refused, since it never left. Headers carrying a
+token are marked sensitive, and `CatalogAuth`'s `Debug` prints none of the secrets.
+
+```text
+auth:   POST {token endpoint}  grant_type=client_credentials  (with a credential; again near expiry)
+open:   GET  /v1/config[?warehouse=]                   the catalog's prefix, if it has one
+        GET  …/namespaces/{ns}/tables/{t}             metadata, location, main's snapshot
+             404 → POST …/namespaces/{ns}/tables       create it empty (this run's schema + spec)
+                   409 → load the one another writer created
+        evolve fields against its schema; partitioning must match; data without --append → refuse
+write:  data files, manifests, manifest list          under the table's location, any store
+commit: POST …/namespaces/{ns}/tables/{t}
+          requirements  assert-table-uuid, assert-ref-snapshot-id (main as loaded)
+                        + assert-current-schema-id, assert-last-assigned-field-id (new schema)
+          updates       [add-schema, set-current-schema -1,] add-snapshot, set-snapshot-ref main
+        200                              committed
+        409                              refused by another writer → rebase (below)
+        other 4xx, connection never made refused (never applied) → error, files removed
+        5xx, timeout, dropped connection → load the table again:
+            this snapshot in it                  committed
+            main moved, this snapshot absent     refused by another writer → rebase
+            main unmoved, this snapshot absent   send the same commit again (≤ 3 times);
+                                                 a refused copy → load: this snapshot in it = committed
+            no table to load, load failed        unknown → error, files stay
+rebase (an append, ≤ 16 times, after a random pause of up to 20 ms × 2ⁿ):
+        load the table; table-uuid, location, schema and partition spec as loaded? else Conflict
+        remove the refused attempt's manifest + manifest list   (data files stay)
+        build a new snapshot on the new head over the same data files, put its manifest + list
+        commit again                                             past the bound → Conflict, exit 75
+
+merge (--merge-on): open as above; at finish read the head's key columns and delete files
+        write:  data files + delete files, manifests (+ delete manifest), manifest list
+        commit: as above; 409 / main moved → Conflict, exit 75, every file removed (no rebase)
+        a read that fails after main moved → Conflict (another writer's compaction or expiry)
+compact --catalog: load (must exist); read the head; write the rewritten files at its location
+        commit: a `replace` snapshot, as above, no rebase
+expire --catalog:  load (must exist); plan against the head as loaded
+        commit: POST …/tables/{t}
+          requirements  assert-table-uuid, assert-ref-snapshot-id for main AND every other ref
+          updates       remove-snapshots [the expired ids]
+        lost answer → load: none of the ids left = committed; some left and a ref moved =
+                      refused; some left, nothing moved = send it again (≤ 3), else unknown
+        committed → delete the files only the expired snapshots read; else delete nothing
+```
+
+- **The snapshot is built as for any append.** `build_metadata_artifacts` runs against the
+  metadata the catalog returned; `catalog_commit` reads the new snapshot (and, when columns were
+  added, the new schema) out of the result and sends them as updates. The metadata file it built
+  is never written: the catalog writes its own, so a catalog commit has no `vN`.
+- **The requirement is the guard.** `assert-ref-snapshot-id` is the catalog's form of "create
+  `v{N+1}` only if absent": of two writers that loaded the same `main`, the catalog applies one.
+  The table's uuid is asserted too, so a table dropped and recreated under the same name refuses
+  a commit built for the old one.
+- **An unanswered commit is judged by the table** (`judge_reload`). A timeout does not cancel a
+  request the catalog is still applying, so a table whose `main` has not moved may yet take it.
+  The same commit can then be sent again: every copy asserts the same head and adds the same
+  snapshot id, so at most one copy ever applies, and the table shows which outcome happened. A
+  copy that is refused is checked against the table before anything is deleted or rebuilt, since
+  the refusal may be because the first copy landed. Once `main` has moved to another snapshot,
+  no copy's requirement can hold again, so the attempt's files can go.
+- **An append rebases; a planned write would not.** An append's data files do not depend on what
+  the table holds, so after another writer's commit only its manifest list (and the snapshot
+  over it) is built again, on the new head, with a fresh snapshot id; the refused attempt's
+  manifest and list are removed, the data files reused. The rebuild is refused
+  (`rebase_blocked`) if the table's identity, location, schema or partition spec moved, since
+  the files were written for those. A merge, compaction or expiry was planned against the head
+  it read, so through the catalog none of them rebases: a merge found the rows it replaces in
+  that head (another writer may have added rows with the same keys), a compaction rewrote files
+  another writer may have deleted rows from, and an expiry chose which files only the old
+  snapshots read. They are sent with `max_rebases` 0 and exit 75 on a refusal.
+- **An expiry is a commit with no snapshot** (`expiry_commit`, `CommitEffect::RemovesSnapshots`).
+  It asserts `main` and every other ref as loaded, since its plan kept every snapshot a ref
+  pointed at and a ref moved onto an expired one would be left naming deleted files. A lost
+  answer is judged by `judge_removal`: snapshot ids are never reused, so an expired id still in
+  the table means the commit has not applied, and it never can once an asserted ref has moved.
+  Files are deleted only after the commit is known to have landed; an expiry that stays unknown
+  deletes nothing, and running it again is safe (the files it would have deleted are left
+  unreferenced). A ref created while it runs cannot be asserted: the protocol has no "no other
+  ref" requirement, and a catalog may drop a ref left pointing at a removed snapshot.
+- **A table holding data needs `--append`.** Replacing a catalog table's contents is an overwrite
+  snapshot, a separate feature; a write without `--append` onto data is refused before anything
+  is staged. An empty table, just created or made by DDL in another engine, is written to.
+- **No new dependency.** The client uses the `reqwest` that `object_store` already links, without
+  a connection pool, so each call gets a connection opened for it.
+
+Verified three ways: a stand-in catalog in `shapeshift-objstore`'s tests applies commits like a
+real one and can fail each in every way a client can see (409, 5xx before or after applying, a
+dropped connection, an answer after the client gave up); Apache Iceberg's reference REST server
+(SQLite-backed), with DuckDB attaching the same catalog and reading every table back; and real
+concurrent writers against that server, where every run commits (12 writers starting together
+needed up to 5 rebases each), every snapshot is claimed by one run, no refused attempt's files
+remain, and DuckDB reads exactly the committed runs' rows. Merge, compaction and expiry through
+the catalog are covered by the stand-in: every refusal they meet (another writer's commit, a ref
+moved under an expiry, an earlier attempt of the run) leaves nothing behind and is never
+rebuilt, a lost answer settles by the table, and an expiry deletes exactly the files its dry run
+named once its commit lands.
+
+## 8f. Run ids — retries that never append twice (0.5)
+
+An orchestrator retries a failed run, and hands a run to another worker when the first stops
+answering. Losing contact is not proof the first attempt stopped: it may still be committing. Two
+attempts of one append would then both land, and the table would hold the rows twice. A run id
+closes that. The caller gives every attempt of a run the same id (`shape --run-id`), and the
+table's own history records which run each snapshot came from.
+
+```text
+snapshot summary  shapeshift.run-id   the caller's id (when given)
+                  shapeshift.version  the engine that wrote it (always)
+                  shapeshift.rebases  rebuilds before it landed (a catalog append, when > 0)
+
+before reading    the table holds a snapshot with this run id → report it, write nothing
+at finish         the table the sink loaded holds it           → remove this attempt's files
+on a refusal      reload; the head's history holds it         → remove this attempt's files,
+                  (guard or catalog, before any rebase)           report that snapshot (exit 0)
+                  otherwise                                    → as before: rebase, or exit 75
+```
+
+- **The table is the record.** No ledger beside the table, no lock: an attempt reads the same
+  metadata a reader does. `snapshot_of_run` scans the snapshots still in the history, so the
+  record lasts as long as the snapshot does (an expiry that removes it removes the record).
+- **Every path checks it.** A path table's guard refusal (`moved_on` for a merge that found the
+  table moved), an object-store guard refusal, and a catalog 409 all reload and look before
+  failing or rebuilding. The catalog loop does so even when no rebuild is left, so the bound on
+  rebases never turns an earlier attempt's success into an exit 75.
+- **Ids are opaque and caller-owned.** shapeshift checks their shape (`validate_run_id`) and
+  compares them byte for byte. One id per run, shared by its attempts; two runs given one id
+  would be taken for one.
+
+Verified by deterministic races in each crate (two attempts built on one version, local, object
+store and the stand-in catalog, plus an attempt that begins after the run committed), mutants of
+every check, and the reference REST server: 20 runs started as 4 concurrent attempts each landed
+exactly once, every late retry read nothing, no attempt left a file, and DuckDB read each run's
+rows once.
+
+## 8g. Relocation — `shapeshift relocate` (0.5)
+
+A table records absolute paths, and a write into a moved table records its files under the new
+place while `location` keeps the old one, so a table can hold paths written at several
+directories. Every reader finds a recorded path the same way, through the table's **anchors**:
+its `location` plus the directory above `metadata/` of every snapshot's manifest list and every
+`metadata-log` entry, except those under the table's own `write.metadata.path`. A path under one
+(cut at the longest, on a path-component boundary) is read
+at that key where the table is now; a key with `.` or `..` is refused; any other path is read
+where it says. `relocate` uses the same keys to write the new paths.
+
+```text
+read   metadata (current version N)          anchors = location + every place it was written at
+check  manifest lists, then manifests, then every live file a snapshot reads, against ONE listing
+       of the table: anything missing → refused, naming it, nothing written
+ask    each anchor that is not here: a table still answers there (or cannot be checked)
+       → refused unless --moved (same table-uuid) or --copy (a new one); none answers → a move
+write  (new names, beside the old)
+       position delete files whose rows name a moved data file: paths replaced, rows re-sorted
+         by (file_path, pos); other columns carried; size, file_path bounds, column sizes and
+         split offsets read back from the new file
+       manifests naming a moved or rewritten file: transcoded (decoded against their own schema,
+         every other value written back as it was), one uncompressed block
+       manifest lists naming a moved or rewritten manifest: transcoded, its new path and length
+commit v{N+1}.metadata.json through the guard: location, every manifest-list, metadata-log,
+       statistics paths, the table's own path properties; table-uuid if a copy
+then   version-hint.text; then the superseded files (the rewritten ones' old copies) removed
+with --catalog: POST …/namespaces/{ns}/register {name, metadata-location} (never overwrite)
+       409, 5xx or a lost answer → load the name: at this file = already registered;
+       at another = refused (the relocation stands; nothing in the catalog changed)
+```
+
+- **Transcoded, not re-modelled.** A manifest another engine wrote carries fields shapeshift
+  never writes (column sizes, split offsets, sort order ids, `referenced_data_file`, partition
+  summaries in a list). Decoding into shapeshift's own entry model would drop them, so the file is
+  decoded into values that keep everything (floats and fixed values as their bytes, an enum's
+  index, a union's branch) and encoded back against the same schema. The header keeps every key
+  but the codec.
+- **Delete files are rewritten, not just re-pointed.** A reader applies a position delete only to
+  the data file whose path it names exactly. A relocation that rewrote the manifests but not the
+  delete files would bring every deleted row back; the tests catch a build that skips them.
+- **Data files are never touched**, and nothing is overwritten: a refused commit (another writer
+  first: exit 75) removes what the relocation wrote, and the table is as it was.
+- **The reader contract is `expire`'s.** A reader that loaded the previous version can find a
+  superseded file gone and fails rather than reading wrong rows; relocate before pointing readers
+  at the new place. A writer that loaded it loses the commit guard to the relocation (exit 75):
+  a table at a path has no rebase, so nothing republishes a superseded file.
+- **Registering is last, and never replaces.** The catalog records where the metadata file is,
+  so it is registered only once every path names where the table is. A local table registers
+  by its plain path, and the catalog write path opens a plain absolute location as `file://`.
+  An unclear answer is settled by loading the name. It is done when the catalog holds this
+  file, or a later version whose `metadata-log` names it (written through the catalog since,
+  until the catalog trims the log). The table's uuid is not enough: a move keeps it, so the
+  same table still held at its old place would pass.
+- **`s3a://` is S3.** A table Spark recorded as `s3a://` and reached as `s3://` is not "moved",
+  and a relocation keeps its spelling, so its other readers keep their client.
 
 ## 9. The Parquet sink
 
@@ -688,9 +934,9 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   **location-anchored** (absolute): a table is valid at the location it was written to (a bucket
   prefix or a local dir), so it reads back in place. A moved or copied table is still
   **readable** — DuckDB resolves it with `iceberg_scan('<new path>', allow_moved_paths=true)`
-  (verified for partitioned and multi-snapshot tables). **Catalog-managed** relocation
-  (re-anchoring the embedded paths so any engine reads a moved table with no flag, plus
-  multi-writer commits) is left to an external Iceberg REST catalog.
+  (verified for partitioned and multi-snapshot tables), and `shapeshift relocate` re-anchors it
+  so any engine reads it with no flag (§8g). A catalog does not do that: it records where a
+  table's metadata is, and the paths inside stay as written.
 - **zstd** is off by default (musl-static); in the lean binary `--compression zstd` is a clear
   error (the opt-in `--features zstd` fat build enables it) — otherwise use
   `snappy`/`uncompressed`.

@@ -17,6 +17,29 @@ use serde_json::Value;
 
 use crate::record::{Kind, Record};
 
+/// The deepest a record may nest, objects and arrays together. The readers refuse a
+/// deeper one as a parse error, before anything else sees it.
+///
+/// Building an owned record, converting a tape record to one (which a `json` column
+/// does), inferring from it and freeing it all recurse once per level. Measured on a
+/// 2 MiB stack (a spawned thread's, and serve's workers'), the weakest of those, the tape
+/// conversion, gives out past about 930 levels in a debug build and 2,160 in release.
+/// This leaves room under both. No record anyone means to shape comes near it.
+///
+/// Only the readers enforce it. [`Shaper::push`](crate::Shaper::push),
+/// [`infer_columns`](crate::infer_columns) and drift detection take any [`Record`] and
+/// recurse over it as given, so a caller that builds records itself (a `Value` from
+/// another source, its own `Record` type) must refuse deeper ones first, or bound them
+/// as the readers do.
+pub const MAX_RECORD_DEPTH: usize = 512;
+
+/// The most segments a path (`from:`, or one in a `where`) may have. Each segment
+/// descends one level, so a longer path could never resolve against a record the readers
+/// accept. It also bounds the drift tracker's path trie, which is built, walked and freed
+/// recursively: without it a spec's text alone set that depth (a `where` of 64 KiB holds
+/// 32,000 segments of `a.`), and a long enough path crashed the process.
+pub const MAX_PATH_SEGMENTS: usize = MAX_RECORD_DEPTH;
+
 /// Split a path spec into its segments, dropping a leading `$`/`$.`.
 pub fn segments(path: &str) -> Vec<&str> {
     let p = path.strip_prefix('$').unwrap_or(path);
@@ -55,6 +78,22 @@ pub fn select<'a>(record: &'a Value, path: &str) -> Option<&'a Value> {
 pub struct Segment {
     key: String,
     index: Option<usize>,
+}
+
+impl Segment {
+    /// One segment from its literal key: the row filter's quoted segments (`"a.b"`) carry
+    /// characters a dotted path cannot.
+    pub(crate) fn new(key: String) -> Segment {
+        Segment {
+            index: key.parse().ok(),
+            key,
+        }
+    }
+
+    /// The segment's literal key.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 /// Compile a dotted path into its segments once, so the hot loop never re-splits it.

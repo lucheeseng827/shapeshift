@@ -34,15 +34,20 @@ transactional per-row append, the field-id chain, the hand-rolled Avro encoder) 
 
 ```yaml
 dataset: <name>                    # required, non-empty
+where: <predicate>                 # optional; which source records the run takes (§6a)
 source:                            # optional; defaults shown
   format: jsonl | json-array       # default jsonl
   path: <input path>               # optional; CLI --input overrides
 output:                            # required
   format: parquet | iceberg        # required
-  path: <output path>              # required
+  path: <output path>              # required, unless `catalog` names the table
   compression: snappy | zstd | uncompressed   # default snappy
   partition_by: [<col> | <transform(col)>, ...]  # default [] (Iceberg; identity or bucket|truncate|year|month|day|hour)
   merge_on: [<col>, ...]           # default [] (Iceberg; upsert on these key columns)
+  catalog:                         # optional (Iceberg; commit through a REST catalog, no path)
+    uri: <http(s)://host:port>
+    table: <namespace>.<name>
+    warehouse: <name>              # optional; credentials come from the environment (§5a)
 schema: infer | strict             # default infer
 columns:                           # default [] (all inferred)
   - name: <col>
@@ -65,6 +70,7 @@ options:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dataset` | string | — (required) | Logical table name. Must not be empty/whitespace. Used as the Parquet file stem when `output.path` is a directory, and as the Iceberg table name. |
+| `where` | string | *(none)* | Which source records the run takes: a subset of SQL's `WHERE` over source paths (§6a). A record it does not keep is counted as filtered, not rejected. `--where` overrides it. |
 | `source` | `SourceSpec` | `{format: jsonl}` | How to read the input (§2.2). |
 | `output` | `OutputSpec` | — (required) | How and where to write the output (§2.3). |
 | `schema` | `infer` \| `strict` | `infer` | Schema strictness (§7). `infer` lets undeclared columns ride along; `strict` writes only declared columns. |
@@ -83,10 +89,11 @@ options:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `format` | `parquet` \| `iceberg` | — (required) | `parquet` = one Parquet file. `iceberg` = a self-contained Apache Iceberg v2 table directory (no catalog server), one append snapshot per run (unpartitioned by default; partitioned per `partition_by` — identity or hidden transforms). |
-| `path` | string | — (required) | Destination. For `parquet`: a file path, or a directory (then `<path>/<dataset>.parquet` is written). For `iceberg`: the table root directory (created if absent). |
+| `path` | string | — (required unless `catalog`) | Destination. For `parquet`: a file path, or a directory (then `<path>/<dataset>.parquet` is written). For `iceberg`: the table root directory (created if absent). |
 | `compression` | `snappy` \| `zstd` \| `uncompressed` | `snappy` | Parquet page compression. **`zstd` needs the opt-in fat build** (`--features zstd`); the default musl-static binary has no C codecs, so selecting it there returns a clear error — use `snappy`/`uncompressed` or rebuild with the feature. |
 | `partition_by` | list of string | `[]` | Partition fields (Iceberg output). Each entry is a column name (**identity**) or a **hidden-transform expression**: `bucket(N, col)` (spec-exact Murmur3; long/string/date/timestamp), `truncate(W, col)` (long/string), `year(col)`/`month(col)`/`day(col)` (date/timestamp), `hour(col)` (timestamp). When columns are declared, every *source* column must be declared (§9); in `infer` mode it resolves against the inferred schema. **Applied:** the table's partition spec records the real transform strings and rows fan out to one data file per **transformed** value under Hive-style directories (temporal segments human-readable, e.g. `data/event_at_day=2026-01-01/`). Ignored for `parquet` output (a single file is still written). |
 | `merge_on` | list of string | `[]` | Iceberg only: **upsert** on these key columns instead of appending. Each written row replaces any row already in the table with the same key (every key column equal); a key the input carries more than once keeps its **last** occurrence; a row with a null in any key column is appended and matches nothing. Creates the table if there is none. Key columns may be `int64`, `string`, `json`, `date`, `timestamp`, or `bool` — `float64` is refused. Rows are removed with Iceberg v2 position deletes (merge-on-read). Works on a local table and, in a build with the `object_store` feature, an object-store `output.path`. `--merge-on` overrides it. |
+| `catalog` | `{uri, table, warehouse?}` | none | Iceberg only, in a build with the `object_store` feature: commit to the table `table` (`<namespace>.<name>`, a namespace may have several levels) that the Iceberg REST catalog at `uri` (`http(s)://host:port`) names, instead of a table directory — so leave out `path`. The catalog decides where the files go and is the commit point. A table it lacks is created empty in a namespace that must exist; one that already holds data needs `--append`. An append another writer beat to the commit is rebuilt onto the new head and committed again. With `merge_on` the merge commits through the catalog the same way, but is not rebuilt: another writer's commit refuses it (exit 75). `warehouse` names which of the catalog's warehouses holds the table (sent as `?warehouse=` with `GET /v1/config`; a Polaris catalog's name, a Lakekeeper warehouse). Credentials never go here (§5a). `--catalog` / `--table` / `--warehouse` override it. |
 
 ### 2.4 `ColumnSpec`
 
@@ -175,6 +182,48 @@ for you) or apply `transform: json_encode` and use `type: string` — both yield
 
 ---
 
+## 5a. Catalog credentials
+
+A REST catalog that asks for credentials gets them from the **environment**, never from the
+spec: a spec is meant to be committed, and a credential in it would be too.
+
+| Variable | Meaning |
+|---|---|
+| `SHAPESHIFT_CATALOG_TOKEN` | A bearer token, sent as is with every catalog request. |
+| `SHAPESHIFT_CATALOG_CREDENTIAL` | OAuth2 client credentials, `client_id:client_secret` (or a secret alone), exchanged for a bearer token with the `client_credentials` grant. The token is fetched again once nine tenths of the life the endpoint gives it (`expires_in`, a number or a numeric string) have passed, so a long run never sends one past it; a token issued without `expires_in` is kept for the run. |
+| `SHAPESHIFT_CATALOG_OAUTH2_SERVER_URI` | The token endpoint, when it is not the catalog's own `{uri}/v1/oauth/tokens` (an identity provider in front of the catalog). With a credential only. |
+| `SHAPESHIFT_CATALOG_SCOPE` | The scope asked for; default `catalog`, as Iceberg's own clients ask. Polaris wants `PRINCIPAL_ROLE:ALL`. With a credential only. |
+
+- Setting both a token and a credential, or a token endpoint or scope without a credential, is
+  refused before any request is made.
+- The system's CA certificates must be installed (or `SSL_CERT_FILE` pointed at a PEM bundle):
+  the HTTP client checks TLS against them, and without any it cannot start, so every catalog and
+  object-store call fails, plain http included, with an error that names the missing
+  certificates and what to do.
+- No variable set means no credentials, which is what a catalog that asks for none (Iceberg's
+  reference fixture) wants. A catalog that answers 401 or 403 is reported with which variable
+  to set, or that the one set was refused.
+- A catalog URI or token endpoint carrying credentials (`user:password@host`) is refused: URIs
+  are printed in errors.
+- A token or secret never appears in an error, a log line or `--summary-json`. A token
+  endpoint's refusal is reported by its status and, when it is one of RFC 6749's, its error code
+  (`invalid_client`); nothing else the endpoint wrote is shown, since it may echo the request.
+- Credentials are not sent over plain `http://` to a host other than this machine: such a
+  catalog or token endpoint is refused before any request. OAuth 2.0 requires TLS at the token
+  endpoint. The insecure mode, `--insecure-catalog` on the command line of one run, allows it for
+  a network trusted on its own terms (a compose network), and the run logs a warning; nothing in
+  the environment or a spec turns it on. Without credentials, plain http is fine (Iceberg's
+  reference fixture).
+- A catalog or token endpoint on this machine is never reached through a proxy, whatever
+  `HTTP_PROXY` / `NO_PROXY` say: no proxy can reach it, and the token would cross the network
+  to the proxy in the clear. Other hosts follow the usual proxy variables. The token request never
+  follows a redirect, since its body carries the secret; a catalog request that does follow one
+  to another host drops the token, as `reqwest` does for any cross-host redirect.
+- Object-store credentials for the table's files are separate: the same `AWS_*` / GCS / Azure
+  environment as an object-store `--output`. The catalog does not vend them.
+
+---
+
 ## 6. Path selection (`from`)
 
 `from` selects a value out of each JSON record. A path that does not resolve yields **null** (never
@@ -189,8 +238,92 @@ an error), which the reject policy (§8) turns into a written null or a row reje
   is the `sku` of the third element.
 - Descent stops (→ null) when a segment is applied to a scalar, an object lacks the key, an array
   index is out of range, or a numeric segment is applied to a non-array.
+- A path has at most **512 segments**, as deep as a record may nest (§8); a longer one is a
+  validation error.
 
 When `from` is omitted, the column `name` is used as the path (so `name: id` reads `id`).
+
+---
+
+## 6a. Row filter (`where`)
+
+`where` names the source records a run takes. One stream often carries several kinds of record
+(a `record_type` field, an `op` field); a spec describes one kind, and `where` sets the others
+aside:
+
+```yaml
+dataset: gate
+where: record_type = 'gate' and verdict in ('pass', 'fail')
+```
+
+It is tested on each **source record, before shaping**, so it can test a field no column keeps,
+and a record of another kind never reaches a required column, a strict coercion or drift
+detection. A record it does not keep is **filtered**: counted (`filtered=` in the report,
+`rows.filtered` in `--summary-json`), never written to the rejects sidecar, never seen by
+inference or drift detection. `rows_in` is the sum of `rows_out`, `rejected` and `filtered`.
+Inference (`infer`, and `shape` in `infer` mode) samples only the records the filter keeps. The
+fields it reads count as read by the spec, so they are never reported as drift; a scalar where
+it reads deeper (`payload` is `7`, the filter reads `payload.kind`) is read by nothing, and is.
+A drift report's "first at record N" counts the filtered records too, so N is the record's
+place in the input.
+
+### Grammar
+
+A small subset of SQL's `WHERE`, so it reads the way the table will be queried, and DuckDB runs
+the same text:
+
+```text
+expr     := or
+or       := and { "or" and }
+and      := unary { "and" unary }
+unary    := "not" unary | "(" expr ")" | test
+test     := operand cmp operand
+          | operand [ "not" ] "in" "(" literal { "," literal } ")"
+          | operand "is" [ "not" ] "null"
+cmp      := "=" | "!=" | "<" | "<=" | ">" | ">="
+operand  := path | literal
+literal  := 'string' ('' for a quote) | number | true | false
+```
+
+- **Paths** are `from:` paths (§6): `user.plan`, `tags.0`, an optional leading `$`. A name of
+  letters, digits, `_` and `-` (not first) is written bare; any other name is double-quoted, a
+  segment at a time: `"user name".first`, `"in" = 'x'` for a field called `in`. A path that does
+  not resolve is null, as in `from:`.
+- **Strings** take single quotes. A double-quoted word is a field, as in SQL: `kind = "gate"`
+  compares two fields.
+- **Keywords** (`and`, `or`, `not`, `in`, `is`, `null`, `true`, `false`) are case-insensitive;
+  paths and strings are not. `and` binds tighter than `or`, and `not` tighter than `and`.
+- **One spelling per operator.** `==`, `<>`, `&&`, `||` and `!` are refused, each naming the
+  spelling to use; so is `= null` (use `is null`), a `null` in an `in` list, a comparison of two
+  values with no field, and `<` (or `<=`, `>`, `>=`) against `true` or `false`.
+- At most 64 KiB of text, 64 levels of `not` and parentheses, and 512 segments in a path. The
+  expression is parsed when the spec loads; a mistake is a validation error that names the
+  character, with the text and a caret. `shape --where` replaces the spec's before it is
+  checked, so it can stand in for one the file gets wrong.
+
+### What a comparison means
+
+SQL's three-valued logic: a test is true, false or **unknown**, and a record is kept only when the
+whole expression is **true**. `not unknown` is unknown; `unknown or true` is true; `unknown and
+false` is false.
+
+| Operands | Result |
+|---|---|
+| number, number | numeric (two integers exactly; otherwise as floats) |
+| string, string | by code point |
+| `true`/`false`, `true`/`false` | `=` and `!=` only |
+| either side null or missing | unknown (`is null` and `is not null` say which) |
+| different kinds, or an array or object | unknown, and counted as a **type mismatch** |
+
+- `status != 200` therefore drops a record with no `status`, as every SQL engine does. To keep
+  it: `status != 200 or status is null`.
+- `x in (a, b)` is `x = a or x = b`; `not in` is its negation, so a null `x` is unknown either way.
+- Dates and timestamps are compared as they are in the source: ISO-8601 strings in one format
+  order correctly as strings, epoch numbers as numbers. There is no date type in the filter.
+- **Type mismatches are reported**, because the likeliest mistake is `status = '500'` against a
+  numeric field, which keeps nothing. The report says how many records met one and describes the
+  first (`--summary-json`: `where.type_mismatches`, `where.first_mismatch`); a run that kept no
+  record says so too. Neither changes the exit status.
 
 ---
 
@@ -245,7 +378,10 @@ value is always allowed and becomes null, in both modes.
 
 ### Rejects sidecar
 
-`shapeshift shape` never aborts on a bad **source** line (a JSONL parse error). Such lines are
+`shapeshift shape` never aborts on a bad **source** line (a JSONL parse error). A line is bad
+when it is not valid JSON, when it is larger than 256 MiB, or when it nests deeper than **512
+levels** of objects and arrays together. Nothing real comes near that depth; the bound is what
+keeps one deliberately deep line from exhausting the stack. Such lines are
 counted and written to `<output>.rejects.jsonl`, one JSON object per line:
 `{"line": <n>, "error": <message>, "raw": <original text>}`. Rows dropped by a lenient soft-reject
 are counted in the run report (`rejected=…`); the report line printed by `shape` is:
@@ -259,8 +395,8 @@ rows_in=.. rows_out=.. rejected=.. parse_errors=.. row_groups=.. bytes=..
 ## 9. Validation errors
 
 `DatasetSpec::validate()` runs on load, after serde has checked the document shape (a missing
-required field — `dataset`, `output`, `output.format`, `output.path`, or a column's `type` — fails
-there first). The structural checks and their messages:
+required field — `dataset`, `output`, `output.format`, a `catalog`'s `uri` or `table`, or a
+column's `type` — fails there first). The structural checks and their messages:
 
 | Condition | Message |
 |---|---|
@@ -268,9 +404,16 @@ there first). The structural checks and their messages:
 | `schema: strict` with no `columns` | `strict schema mode requires at least one declared column` |
 | Two columns share a `name` | `` duplicate column name `<name>` `` |
 | `partition_by` names a column not in `columns` (declared/`strict` mode only) | `` partition column `<name>` is not a declared column (declare it to partition by it) `` |
+| Neither `path` nor `catalog` | `` `output.path` is required (or `output.catalog` for an Iceberg table a REST catalog names) `` |
+| `catalog` with `format: parquet` | `` `output.catalog` applies only to Iceberg tables (`format: iceberg`) `` |
+| `catalog` and `path` both set | `` `output.path` and `output.catalog` both name the table: the catalog decides its location, so drop the path `` |
+| `catalog` with an empty `uri` or `table` | `` `output.catalog` needs both a `uri` and a `table` `` |
+| `catalog` with an empty `warehouse` | `` `output.catalog.warehouse` is empty: name the warehouse, or leave the key out `` |
+| `catalog` with a `token`, `credential` or other secret | `` unknown field `token` … A catalog's credentials never go in a spec, which is meant to be committed: set SHAPESHIFT_CATALOG_TOKEN, or SHAPESHIFT_CATALOG_CREDENTIAL (client_id:client_secret), in the environment `` |
 | `merge_on` with `format: parquet` | `` `output.merge_on` applies only to Iceberg tables (`format: iceberg`) `` |
 | `merge_on` names a column twice | `` `output.merge_on` names `<name>` twice `` |
 | `merge_on` names a column not in `columns` (`strict` mode only) | `` merge key `<name>` is not a declared column (declare it to merge on it) `` |
+| `where` does not parse (§6a) | `` `where`: <what is wrong> (at character <n>) ``, then the text with a caret under the character |
 
 When columns are declared, a partition column must be among them so Iceberg has a stable field-id
 for it. In `infer` mode there are no declared columns; the check is deferred and the sink resolves
@@ -319,8 +462,21 @@ spec field for a single run without editing the file:
 - `--dataset` overrides `dataset`.
 - `--partition-by` overrides `output.partition_by`; `--merge-on` overrides `output.merge_on`
   (comma-separate a composite key).
+- `--where <expr>` overrides `where`. `infer --where <expr>` samples only the records it keeps,
+  and writes it into the spec it prints.
+- `--catalog <uri> --table <ns>.<name>` (always together, never with `-o`) override
+  `output.catalog`, set aside the spec's `output.path`, and make the output Iceberg unless `--to`
+  says otherwise. `--warehouse <name>` overrides `output.catalog.warehouse`; it needs a catalog,
+  from the flags or the spec. `--insecure-catalog` (no spec field) lets the catalog's credentials
+  go over plain http to another machine (§5a); it needs a catalog too. `compact` and `expire`
+  take `--catalog`, `--warehouse` and `--insecure-catalog` too.
 
-With no `-s/--spec`, `shape` infers a spec on the fly (then `--input` and `--output` are required),
+`--run-id <id>` has no spec field either: it names one run of a spec, not the spec. It is recorded
+in the snapshot (`shapeshift.run-id`), and a run whose id the table already holds commits nothing
+and reports that snapshot (Iceberg only; 1–128 letters, digits, `.`, `_`, `:` or `-`).
+
+With no `-s/--spec`, `shape` infers a spec on the fly (then `--input` and `--output`, or
+`--catalog` and `--table`, are required),
 which is equivalent to running `infer` and immediately shaping with the result.
 
 Flags that only change how a run reports, not what it writes, have no spec field: `--summary-json`
@@ -443,8 +599,8 @@ table directory).
   *required* column, is refused, and the partition spec must match — all checked at `create`
   time (before any data is written). Concurrent writers are **guarded**: a commit creates the
   next `metadata.json` only if no other writer did, and the loser fails with a commit conflict
-  (CLI exit status 75) having published nothing — run it again. Serialising writers instead of
-  refusing them needs a catalog (roadmap REST catalog).
+  (CLI exit status 75) having published nothing — run it again. Through a REST catalog
+  (`output.catalog`) the catalog checks the commit, with the same exit status for a loser.
 - `compression: zstd` is **off by default** (the musl-static binary links no C codecs) — it returns
   a clear error there; use `snappy`/`uncompressed`, or build with `--features zstd` (the opt-in fat
   build) to enable it for both Parquet and Iceberg.
@@ -454,8 +610,12 @@ table directory).
   musl-static binary); Iceberg tables are **location-anchored** (absolute paths, valid where
   written). A moved or copied table is still **readable** via DuckDB's
   `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
-  tables); **catalog-managed** relocation (re-anchoring paths so any engine reads with no flag, plus
-  multi-writer commits) is left to an external Iceberg REST catalog.
+  tables), and shapeshift reads and writes it where it is, however many times it has moved: a path
+  recorded under any directory the table has been written at is read at the same key where it is
+  now. `inspect` says the table has moved, and a write into it warns. `shapeshift relocate`
+  (0.5; no spec) re-anchors it so any engine reads it with no flag: it rewrites the metadata,
+  manifests and position-delete files that name the old places, never a data file, and keeps
+  every snapshot.
 - `merge_on` is guarded like `--append` (of two writers on one version, the second exits 75 having
   published nothing), and leaves position-delete files in place until the table is compacted
   (`shapeshift compact`, which takes no spec). A key column's type is checked when the schema is

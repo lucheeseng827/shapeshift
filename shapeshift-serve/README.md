@@ -1,14 +1,17 @@
 # shapeshift-serve
 
 A tiny **local web console** for the shapeshift shaper. `shapeshift serve` starts an
-HTTP server that puts a browser UI in front of the same four verbs the CLI exposes —
-**infer** a spec from sample JSON, **shape** JSON/JSONL into Parquet or an Apache
-Iceberg v2 table, **inspect** the output, and **cost** a run against MAR billing.
+HTTP server that puts a browser UI in front of the CLI's verbs — **infer** a spec from
+sample JSON, **shape** JSON/JSONL into Parquet or an Apache Iceberg v2 table, and
+**inspect** the output (pricing a run is `shapeshift cost`, or the website's calculator). Two
+read-only views show what happened: **Runs** (every run this console started, its phases
+and outcome) and **Tables** (a table's history, read from its own Iceberg metadata).
 
 It is deliberately lean: a
-*shaper* console, not a control plane. Single-user, stateless beyond the files it
-writes, with **no scheduler, run queue, catalog server, connectors, metering, or
-auth**. Those are orchestration concerns, and out of scope here.
+*shaper* console, not a control plane. Single-user, keeping nothing beyond the files it
+writes and the log of its own runs (`runs.jsonl`), with **no scheduler, run queue,
+catalog server, connectors, metering, or auth**. Those are orchestration concerns, and
+out of scope here.
 
 ## Single static binary, no runtime
 
@@ -38,7 +41,7 @@ flowchart LR
     browser["browser UI<br/>index.html · styles.css · app.js<br/>(embedded via include_str!)"]
     subgraph serve["shapeshift-serve"]
         http["http.rs<br/>std::net thread pool<br/>Host allow-list · JSON / no-CORS gate"]
-        handlers["handlers.rs<br/>infer · shape · inspect · cost"]
+        handlers["handlers.rs<br/>infer · shape · inspect · runs · tables"]
     end
     json["shapeshift-json<br/>source"]
     core["shapeshift-core<br/>Shaper → RecordBatch · cost"]
@@ -112,9 +115,11 @@ Same-origin JSON, wrapping the OSS engine one-to-one:
 |---|---|
 | `GET /api/health` | liveness + version + data dir |
 | `POST /api/infer` | sample records → an editable `DatasetSpec` (YAML) |
-| `POST /api/shape` | records + spec → run report, output path, reject sample, drift report (`on_drift` picks the policy); a spec's `output.merge_on` upserts into the table |
+| `POST /api/shape` | records + spec → run report, output path, reject sample, drift report (`on_drift` picks the policy); a spec's `output.merge_on` upserts into the table; a spec's `where` takes only the records it keeps (`filtered` counts the rest; `type_mismatches` and `first_mismatch` report comparisons of different kinds, which are never true) |
 | `POST /api/inspect` | a path → Parquet / Iceberg schema + row count (an Iceberg table's live rows after position deletes, too) |
-| `POST /api/cost` | rows + prices → the MAR vendor-vs-self-host comparison |
+| `GET /api/runs` | the runs this console started, newest first (its log keeps the newest 500 and any still running): phases (start and end), outcome (`running`, `ok`, `conflict`, `failed`, `interrupted`), exit status, counts, error |
+| `GET /api/tables` | the Iceberg tables under `outputs/`: rows, files, snapshots, last change |
+| `POST /api/table` | a table path → its history as events (`shapeshift_iceberg::table_events`), schema, partitioning |
 
 ## License
 

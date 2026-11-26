@@ -19,12 +19,13 @@ use serde_json::{Map, Value};
 
 use crate::drift::{DriftPolicy, DriftReport, DriftSpec, DriftTracker};
 use crate::error::{Result, ShapeError};
+use crate::predicate::Predicate;
 use crate::record::{Kind, Record};
 use crate::sink::Sink;
 use crate::spec::{ColumnSpec, DatasetSpec, SchemaMode};
 use crate::transform::Transform;
 use crate::types::ColumnType;
-use crate::value::{compile_path, select_compiled, Segment};
+use crate::value::{compile_path, select_compiled, Segment, MAX_PATH_SEGMENTS};
 
 /// A column compiled from a [`ColumnSpec`] into the exact work the hot loop does.
 #[derive(Debug, Clone)]
@@ -145,6 +146,30 @@ pub enum PushOutcome {
     Appended,
     /// The row was dropped (lenient policy). Carries the reason.
     Rejected(String),
+    /// The spec's `where` did not keep the record. Not an error: the run is about other
+    /// rows. Counted (see [`Shaper::filter_report`]) and otherwise left alone.
+    Filtered,
+}
+
+/// What a run's `where` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterReport {
+    /// The expression, as written.
+    pub expr: String,
+    /// Records it did not keep.
+    pub filtered: u64,
+    /// Records in which some comparison met values of different kinds (a number against
+    /// a string, say), and so could not be true.
+    pub type_mismatches: u64,
+    /// The first such comparison, described.
+    pub first_mismatch: Option<String>,
+}
+
+/// A shaper's filter and what it has done so far.
+#[derive(Debug, Clone)]
+struct Filter {
+    predicate: Predicate,
+    report: FilterReport,
 }
 
 /// The shaping engine over a fixed output schema.
@@ -159,6 +184,8 @@ pub struct Shaper {
     drift: Option<DriftTracker>,
     /// Index of the rescue builder (always last in `builders`) under `policy: rescue`.
     rescue: Option<usize>,
+    /// The spec's `where`, when it has one. `None` costs the hot loop nothing.
+    filter: Option<Filter>,
 }
 
 impl Shaper {
@@ -206,6 +233,22 @@ impl Shaper {
                 required: c.required,
             })
             .collect();
+        // Every column enters here (declared, inferred, or a library caller's), and the
+        // drift tracker builds its trie from these paths recursively: bound them all,
+        // not only the ones a spec's validation sees.
+        if let Some(c) = compiled.iter().find(|c| c.segs.len() > MAX_PATH_SEGMENTS) {
+            // An inferred column is named after its path, so neither is printed whole.
+            let short = |s: &str| match s.char_indices().nth(40) {
+                Some((i, _)) => format!("{}…", &s[..i]),
+                None => s.to_string(),
+            };
+            return Err(ShapeError::Schema(format!(
+                "column `{}`: its path `{}` has {} segments, more than {MAX_PATH_SEGMENTS}",
+                short(&c.name),
+                short(&c.path),
+                c.segs.len()
+            )));
+        }
         let mut fields: Vec<Field> = columns
             .iter()
             .map(|c| Field::new(&c.name, c.ty.arrow_type(), !c.required))
@@ -249,7 +292,42 @@ impl Shaper {
             strict,
             drift: tracker,
             rescue,
+            filter: None,
         })
+    }
+
+    /// Take only the records `expr` keeps (see [`Predicate`]); the others come back from
+    /// [`Shaper::push`] as [`PushOutcome::Filtered`], before drift detection or shaping
+    /// sees them. A shaper has one filter: a second call is refused, since the first
+    /// one's paths are already counted as read.
+    pub fn with_where(mut self, expr: &str) -> Result<Self> {
+        if let Some(f) = &self.filter {
+            return Err(ShapeError::Spec(format!(
+                "this shaper already filters with `where {}`; combine the two with `and`",
+                f.report.expr
+            )));
+        }
+        let predicate = Predicate::parse(expr)?;
+        // A field the filter reads is one the spec knows about: not drift, even when no
+        // column keeps it (`record_type` in a table of one record type).
+        if let Some(d) = self.drift.as_mut() {
+            for segs in predicate.paths() {
+                d.cover(segs.iter().map(|s| s.key()));
+            }
+        }
+        self.filter = Some(Filter {
+            report: FilterReport {
+                expr: predicate.text().to_string(),
+                ..FilterReport::default()
+            },
+            predicate,
+        });
+        Ok(self)
+    }
+
+    /// What the `where` has done so far — `None` when the shaper has none.
+    pub fn filter_report(&self) -> Option<&FilterReport> {
+        self.filter.as_ref().map(|f| &f.report)
     }
 
     /// Build a shaper directly from a spec plus an inferred column list (empty in
@@ -257,12 +335,16 @@ impl Shaper {
     /// spec's `drift` block decides what happens to whatever the schema misses.
     pub fn from_spec(spec: &DatasetSpec, inferred: &[ColumnSpec]) -> Result<Self> {
         let cols = effective_columns(spec, inferred);
-        Shaper::with_drift(
+        let shaper = Shaper::with_drift(
             cols,
             spec.schema == SchemaMode::Strict,
             &spec.drift,
             spec.options.flatten,
-        )
+        )?;
+        match &spec.filter {
+            Some(expr) => shaper.with_where(expr),
+            None => Ok(shaper),
+        }
     }
 
     /// The Arrow schema every emitted batch carries.
@@ -287,6 +369,25 @@ impl Shaper {
 
     /// Shape one record into the current batch.
     pub fn push<'a, R: Record<'a>>(&mut self, record: R) -> Result<PushOutcome> {
+        // The filter first: a record the run is not about must not reach drift
+        // detection, a required column or a strict coercion.
+        if let Some(f) = self.filter.as_mut() {
+            let tested = f.predicate.test(record);
+            if tested.mismatch {
+                f.report.type_mismatches += 1;
+                if f.report.first_mismatch.is_none() {
+                    f.report.first_mismatch = f.predicate.explain_mismatch(record);
+                }
+            }
+            if !tested.keep {
+                f.report.filtered += 1;
+                if let Some(d) = self.drift.as_mut() {
+                    d.skip();
+                }
+                return Ok(PushOutcome::Filtered);
+            }
+        }
+
         // Phase 0: find source paths no column reaches. Done before anything is
         // appended, so an `error` policy fails with the builders still aligned.
         let mut rescued: Option<Map<String, Value>> = self.rescue.map(|_| Map::new());
@@ -360,7 +461,7 @@ impl Shaper {
                 DriftPolicy::Error => {
                     return Err(ShapeError::Drift(format!(
                         "record {}: {reason} (drift.policy = error)",
-                        d.rows_scanned()
+                        d.position()
                     )));
                 }
                 DriftPolicy::Quarantine => {
@@ -434,6 +535,11 @@ pub struct RunReport {
     pub rows_out: u64,
     /// Rows dropped by a lenient reject — including rows quarantined for drift.
     pub rows_rejected: u64,
+    /// Records the spec's `where` did not keep. `rows_in` is the sum of `rows_out`,
+    /// `rows_rejected` and this.
+    pub rows_filtered: u64,
+    /// What the `where` did — `None` when the spec has none.
+    pub filter: Option<FilterReport>,
     /// RecordBatches (row groups) flushed.
     pub batches: u64,
     /// What the source did that the schema does not cover — `None` under
@@ -462,6 +568,7 @@ where
         match shaper.push(&record)? {
             PushOutcome::Appended => report.rows_out += 1,
             PushOutcome::Rejected(_) => report.rows_rejected += 1,
+            PushOutcome::Filtered => report.rows_filtered += 1,
         }
         if shaper.pending() >= rg {
             if let Some(batch) = shaper.flush()? {
@@ -475,6 +582,7 @@ where
         report.batches += 1;
     }
     let summary = sink.finish()?;
+    report.filter = shaper.filter_report().cloned();
     report.drift = shaper.into_drift_report();
     Ok((report, summary))
 }

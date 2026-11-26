@@ -51,7 +51,8 @@ flowchart LR
   (temporal segments human-readable, e.g. `data/event_at_day=2026-01-01/region=us/`;
   composes with `--append`). Source parse errors are counted and
   sidecarred to `<output>.rejects.jsonl`; the run never aborts on a bad line. Prints
-  `rows_in / rows_out / rejected / parse_errors / row_groups / bytes`.
+  `rows_in / rows_out / rejected / parse_errors / row_groups / bytes`, with `filtered` after
+  `rows_out` when the spec (or `--where`) has a row filter.
   `--on-drift ignore|warn|rescue|quarantine|error` (overriding the spec's `drift.policy`,
   default `warn`) decides what happens when the source outgrows the schema — an undeclared
   field, or a value that stopped coercing in an optional column. Both used to pass silently;
@@ -156,8 +157,8 @@ shapeshift inspect s3://my-bucket/db/events                                     
 `AWS_*` / `GOOGLE_*` / `AZURE_*` env vars); data uploads as a bounded-RAM multipart
 stream. The Iceberg table's paths are anchored at the destination, so DuckDB
 `iceberg_scan('s3://…')` reads it in place. The default binary refuses a URL `--output`
-(or `inspect <url>`) with a clear "rebuild with `--features object_store`" message. A
-**REST catalog** (copy-anywhere relocation) is out of scope — use an external one. See
+(or `inspect <url>`) with a clear "rebuild with `--features object_store`" message. A table
+copied or moved to another prefix is re-anchored there with `shapeshift relocate`. See
 [`shapeshift-objstore`](../shapeshift-objstore).
 
 See [`examples/embed.rs`](./examples/embed.rs) for driving the same engine as a library.

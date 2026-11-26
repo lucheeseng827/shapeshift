@@ -45,6 +45,13 @@ Put `examples/merge/s3_proxy.py` between the binary and the mock to get S3's kee
 connections and per-request latency; CI does. Any request the binary had to retry fails the
 run, since against a local mock that means a request hung or failed.
 
+After its merges, each table is moved, and DuckDB's default read (no `allow_moved_paths`)
+must fail; `shapeshift relocate` must then make that read return the model at every
+snapshot. Merges go on in the relocated table; it is moved, written to, and moved again,
+and relocated once more; then copied, with the original kept: `relocate` must refuse the
+copy until it is told `--copy`, give it a new identity, and leave the original reading
+every snapshot as before. `--no-relocate` skips this.
+
 Exit status 0 means every scenario matched at every snapshot.
 
 `--negative-control` writes each delta with `--append` instead of `--merge-on`. An append
@@ -249,7 +256,67 @@ def expire(binary, con, name, r, table, expected, history, retain):
     return len(expired), deleted, travelled
 
 
-def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every):
+def place(table):
+    """A table's directory on this machine, for a local path or a `file://` URL."""
+    return table[len("file://"):] if table.startswith("file://") else table
+
+
+def move_table(src, dst, copy=False):
+    """Move (or copy) every file of the table at `src` to `dst`, as any tool would."""
+    if src.startswith("s3://"):
+        import boto3
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("AWS_ENDPOINT"),
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        sb, _, sp = src[len("s3://"):].partition("/")
+        db, _, dp = dst[len("s3://"):].partition("/")
+        pages = s3.get_paginator("list_objects_v2").paginate(Bucket=sb, Prefix=sp + "/")
+        keys = [o["Key"] for page in pages for o in page.get("Contents", [])]
+        for k in keys:
+            s3.copy_object(Bucket=db, Key=dp + k[len(sp):], CopySource={"Bucket": sb, "Key": k})
+        if not copy:
+            for k in keys:
+                s3.delete_object(Bucket=sb, Key=k)
+    elif copy:
+        shutil.copytree(place(src), place(dst))
+    else:
+        os.rename(place(src), place(dst))
+
+
+def default_read_fails(name, table, old, when):
+    """A moved table not yet relocated must fail a reader that is given no flag, on a file
+    at one of the places in `old`, where the table was: its metadata names files there. (Any
+    other failure, a credential or an extension, is not that, and fails the check.) Read on a
+    connection of its own: DuckDB keeps the files a connection has read, and the one the
+    checks share read them all before the move."""
+    try:
+        read_back(connect(table), table)
+    except duckdb.Error as e:
+        if any(f"{place(o)}/" in str(e) for o in old):
+            return
+        raise Mismatch(f"[{name}] {when}: DuckDB failed on the moved table, but not on a file "
+                       f"where it was: {e}")
+    raise Mismatch(f"[{name}] {when}: DuckDB read the moved table with no flag before it was relocated")
+
+
+def relocate(binary, con, name, table, history, expected, when, flags=()):
+    """Relocate `table`; DuckDB, given no flag, must then read the model at every snapshot
+    and `inspect` must agree. Returns the summary."""
+    doc = summary(binary, ["relocate", table, *flags])
+    if not doc["committed"] or doc["superseded"]["not_deleted"]:
+        raise Mismatch(f"[{name}] relocation {when}: {doc}")
+    time_travel(con, name, table, history)
+    check(con, binary, name, f"relocation {when}", table, expected)
+    again = summary(binary, ["relocate", table])
+    if not again["already_anchored"] or again["committed"]:
+        raise Mismatch(f"[{name}] relocating again {when} did something: {again}")
+    return doc
+
+
+def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every, relocation):
     name, partition_by, key, rounds, per_round, key_space, rg, climbing = scenario
     rng = random.Random(seed)
     slug = re.sub(r"[^a-z0-9]+", "-", name)
@@ -262,7 +329,12 @@ def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every
 
     model, nulls, history, pruned = {}, [], [], 0
     compactions, rewritten, expired, deleted, travelled = 0, 0, 0, 0, 0
-    for r in range(rounds):
+
+    def merge_round(r, table, read=True):
+        """One random delta merged into `table`, checked against the model; returns the rows
+        the model holds afterwards. A table that has moved and is not yet relocated is not
+        read (a reader given no flag cannot): its snapshot is read once it is relocated."""
+        nonlocal pruned
         delta = []
         for i in range(per_round):
             row = {
@@ -279,7 +351,7 @@ def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every
         with open(path, "w") as f:
             f.writelines(json.dumps(row) + "\n" for row in delta)
 
-        args = ["shape", "--spec", spec, "-i", path, *write(key)]
+        args = ["shape", "--spec", spec, "-i", path, "-o", table, *write(key)]
         for p in partition_by:
             args += ["--partition-by", p]
         doc = summary(binary, args)
@@ -298,8 +370,16 @@ def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every
             else:
                 model[k] = row
         expected = sorted((as_tuple(row) for row in [*model.values(), *nulls]), key=repr)
-        check(con, binary, name, f"round {r}", table, expected)
-        history.append((committed(con, name, f"round {r}", table, doc["table"]["snapshot_id"]), expected))
+        if read:
+            check(con, binary, name, f"round {r}", table, expected)
+            snapshot = committed(con, name, f"round {r}", table, doc["table"]["snapshot_id"])
+        else:
+            snapshot = int(doc["table"]["snapshot_id"])
+        history.append((snapshot, expected))
+        return expected
+
+    for r in range(rounds):
+        expected = merge_round(r, table)
 
         if compact_every and ((r + 1) % compact_every == 0 or r == rounds - 1):
             target = rng.choice(["512MiB", "0", "16KiB"])
@@ -321,6 +401,41 @@ def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every
     time_travel(con, name, table, history)
     travelled += len(history)
 
+    relocated = ""
+    if relocation:
+        # Moved: a default read fails until it is relocated, and then reads every snapshot.
+        moved = f"{table}-moved"
+        move_table(table, moved)
+        default_read_fails(name, moved, [table], "after a move")
+        doc = relocate(binary, con, name, moved, history, expected, "after a move")
+        if doc["new_uuid"]:
+            raise Mismatch(f"[{name}] a move gave the table a new identity: {doc}")
+        r = rounds
+        expected = merge_round(r, moved)
+        # Moved, written to there, and moved again: paths at two old places, one relocation.
+        twice = f"{table}-twice"
+        move_table(moved, f"{table}-between")
+        expected = merge_round(r + 1, f"{table}-between", read=False)
+        move_table(f"{table}-between", twice)
+        default_read_fails(name, twice, [moved, f"{table}-between"], "after two moves")
+        relocate(binary, con, name, twice, history, expected, "after two moves")
+        expected = merge_round(r + 2, twice)
+        # Copied, the original alive: refused until named a copy, then a table of its own;
+        # the original reads every snapshot as before.
+        copy = f"{table}-copy"
+        move_table(twice, copy, copy=True)
+        refused = subprocess.run([binary, "relocate", copy], capture_output=True, text=True)
+        if refused.returncode != 1 or "still answers at" not in refused.stderr:
+            raise Mismatch(f"[{name}] relocating a copy without --copy or --moved: "
+                           f"exit {refused.returncode}: {refused.stderr}")
+        doc = relocate(binary, con, name, copy, history, expected, "of a copy", ["--copy"])
+        if not doc["new_uuid"]:
+            raise Mismatch(f"[{name}] a copy kept the original's identity: {doc}")
+        time_travel(con, name, twice, history)
+        check(con, binary, name, "the original of a copy", twice, expected)
+        travelled += 4 * len(history)
+        relocated = ", relocated after a move, two moves and a copy"
+
     if climbing and pruned == 0:
         sys.exit(f"[{name}] expected disjoint key ranges to prune files, none were")
     if compact_every and compactions == 0:
@@ -331,7 +446,7 @@ def run_scenario(binary, con, root, tables, seed, scenario, write, compact_every
         f"ok  {name}: {rounds} merges, {len(model)} keys + {len(nulls)} null-key rows live, "
         f"{travelled} snapshot reads time-travelled, {pruned} file(s) pruned, "
         f"{compactions} compaction(s) rewrote {rewritten} file(s), "
-        f"{expired} snapshot(s) expired, {deleted} file(s) deleted"
+        f"{expired} snapshot(s) expired, {deleted} file(s) deleted{relocated}"
     )
 
 
@@ -355,6 +470,16 @@ def configure_s3(con):
     con.sql(f"CREATE SECRET verify_s3 (TYPE s3, {body})")
 
 
+def connect(tables):
+    """A DuckDB connection with the Iceberg extension, and S3 configured if `tables` is on
+    S3."""
+    con = duckdb.connect()
+    con.sql("INSTALL iceberg; LOAD iceberg;")
+    if tables and tables.startswith("s3://"):
+        configure_s3(con)
+    return con
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin", default="target/debug/shapeshift", help="the shapeshift binary")
@@ -371,6 +496,11 @@ def main():
         help="append instead of merging; succeed only if the model check catches it",
     )
     ap.add_argument(
+        "--no-relocate",
+        action="store_true",
+        help="skip moving, copying and relocating each table after its merges",
+    )
+    ap.add_argument(
         "--compact-every",
         type=int,
         default=2,
@@ -383,20 +513,18 @@ def main():
         write = lambda key: ["--merge-on", ",".join(key)]  # noqa: E731
 
     binary = os.path.abspath(a.bin)
-    con = duckdb.connect()
-    con.sql("INSTALL iceberg; LOAD iceberg;")
     root = tempfile.mkdtemp(prefix="shapeshift-merge-")
     tables = None
     if a.tables:
         # A fresh prefix per run, so a rerun never merges into the last run's tables.
         tables = f"{a.tables.rstrip('/')}/{os.path.basename(root)}"
-        if tables.startswith("s3://"):
-            configure_s3(con)
+    con = connect(tables)
     mode = " (negative control: appending)" if a.negative_control else ""
     print(f"duckdb {duckdb.__version__}, seed {a.seed}, tables under {tables or root}{mode}")
     try:
         for i, scenario in enumerate(SCENARIOS):
-            run_scenario(binary, con, root, tables, a.seed + i, scenario, write, a.compact_every)
+            run_scenario(binary, con, root, tables, a.seed + i, scenario, write, a.compact_every,
+                         not (a.no_relocate or a.negative_control))
     except Mismatch as e:
         if a.negative_control:
             print(f"ok  negative control: the check caught the append — {str(e).splitlines()[0]}")

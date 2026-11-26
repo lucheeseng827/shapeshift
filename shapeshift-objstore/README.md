@@ -143,5 +143,6 @@ Both **Parquet** and **Iceberg v2** land in an object store, verified end-to-end
 DuckDB `iceberg_scan('file://…')` (identical to the local path). Tables are
 **location-anchored** (absolute paths) — valid and readable at the prefix they were written
 to, and still **readable after a move/copy** via `iceberg_scan('<new path>',
-allow_moved_paths=true)`. **Catalog-managed** relocation (re-anchoring paths so any engine
-reads a moved table with no flag, plus multi-writer commits) is left to an external Iceberg REST catalog.
+allow_moved_paths=true)`. `relocate_iceberg` re-anchors a moved or copied table where it now is,
+so any engine reads it with no flag (the same rewrite as a local table's; the files a snapshot
+reads are checked against one listing of the prefix first).

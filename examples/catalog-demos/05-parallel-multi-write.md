@@ -108,7 +108,7 @@ for attempt in range(10):
 
 This is precisely the guarantee shapeshift's OSS file-system append cannot give on its own,
 and what an Iceberg **REST catalog** provides out of the box
-(multi-writer commits + copy-anywhere relocation — see the [README](../../README.md)
+(multi-writer commits — see the [README](../../README.md)
 and [ROADMAP](../../ROADMAP.md)).
 
 ## Anti-pattern — concurrent `--append` to one table dir *(silent data loss)*

@@ -20,9 +20,13 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 # The `Stream` trait, to hand `delete_stream` many keys at once (comes with object_store).
 futures-core = "0.3"
+# The REST catalog client (0.5). The same reqwest, with the same features, that
+# object_store already links: a catalog adds no crate to the object-store build.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"] }
 
 [dev-dependencies]
 parquet = { workspace = true }
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 # Only to wrap a store in a request-counting `ObjectStore` (comes with object_store).
 async-trait = "0.1"

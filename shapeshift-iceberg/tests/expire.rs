@@ -274,12 +274,15 @@ fn a_dry_run_reports_what_it_would_delete_and_changes_nothing() {
 }
 
 #[test]
-fn a_file_outside_the_table_is_never_deleted() {
-    // A copy whose metadata names another location: its old snapshots' paths point into
-    // the original table, which an expiry of the copy must not touch.
-    let original = history("outside-original");
+fn an_expiry_of_a_copy_deletes_the_copys_files_never_the_originals() {
+    // A copy's recorded paths name the original table's directory (and here its `location`
+    // names yet another place). Under the copy they are the copy's own files, at the same
+    // keys (RELOCATE-PLAN §4), so the expiry deletes those and the original is untouched.
+    // (A path under no directory the table has lived at is never deleted: see the unit
+    // test `a_file_under_no_anchor_is_never_deleted`.)
+    let original = history("copy-original");
     compact_table(&original, &CompactOptions::default()).unwrap();
-    let copy = tmp_dir("outside-copy");
+    let copy = tmp_dir("copy-copy");
     copy_dir(&original, &copy);
     let hint = std::fs::read_to_string(copy.join("metadata/version-hint.text")).unwrap();
     let meta_path = copy.join(format!("metadata/v{}.metadata.json", hint.trim()));
@@ -289,16 +292,14 @@ fn a_file_outside_the_table_is_never_deleted() {
     std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 
     let before = on_disk(&original);
+    let copy_before = on_disk(&copy);
     let s = expire(&copy, 1, false);
     assert!(s.committed);
-    assert!(s.files_outside_table > 0, "{s:?}");
-    assert_eq!(
-        s.data_files_deleted
-            + s.delete_files_deleted
-            + s.manifests_deleted
-            + s.manifest_lists_deleted,
-        0,
-        "every path named the original table"
+    assert_eq!(s.files_outside_table, 0, "{s:?}");
+    assert_eq!(s.files_not_deleted, 0, "{s:?}");
+    assert!(
+        s.data_files_deleted > 0 && s.manifest_lists_deleted > 0,
+        "{s:?}"
     );
     assert_eq!(
         on_disk(&original),
@@ -306,6 +307,10 @@ fn a_file_outside_the_table_is_never_deleted() {
         "the original table is untouched"
     );
     assert_eq!(live_ids(&original), 4);
+    assert_eq!(live_ids(&copy), 4);
+    let after = on_disk(&copy);
+    let gone: Vec<_> = copy_before.difference(&after).collect();
+    assert!(!gone.is_empty(), "the copy's own expired files are deleted");
     std::fs::remove_dir_all(&original).ok();
     std::fs::remove_dir_all(&copy).ok();
 }

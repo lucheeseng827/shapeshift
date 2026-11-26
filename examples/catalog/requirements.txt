@@ -1,0 +1,6 @@
+# Python dependencies of verify_catalog.py, pinned so a CI run is reproducible (the same
+# versions as examples/merge/requirements.txt).
+duckdb==2.0.0
+# Only for the S3 runs: a local S3-compatible server and the client that makes its bucket.
+moto[server]==5.2.4
+boto3==1.43.119

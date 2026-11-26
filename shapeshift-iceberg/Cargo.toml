@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+miniz_oxide = { workspace = true }
+snap = { workspace = true }
 
 [dev-dependencies]
 shapeshift-core = { workspace = true }

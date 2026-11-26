@@ -1,9 +1,12 @@
 //! # shapeshift-serve — a local web console for the OSS shaper
 //!
 //! `shapeshift serve` starts a tiny HTTP server that puts a browser UI in front of
-//! the same four verbs the CLI exposes — **infer** a spec from sample JSON,
-//! **shape** JSON/JSONL into Parquet or an Apache Iceberg v2 table, **inspect** the
-//! output, and **cost** a run against MAR billing. It is meant to be run on your own
+//! three of the CLI's verbs — **infer** a spec from sample JSON, **shape**
+//! JSON/JSONL into Parquet or an Apache Iceberg v2 table, and **inspect** the output
+//! (`shapeshift cost` stays on the CLI; the website has the calculator). Two read-only views show what those
+//! runs did: **Runs**, every run this console started (its phases, outcome and counts,
+//! kept in `runs.jsonl` in the data dir), and **Tables**, a table's history read from its
+//! own Iceberg metadata, every snapshot an event linked to the run that wrote it. It is meant to be run on your own
 //! machine (or a box in your own infra) — a friendlier on-ramp than the CLI for
 //! trying shapeshift and iterating on a spec.
 //!
@@ -15,9 +18,9 @@
 //! Node, no JVM, no Python — and the whole thing is one relocatable file.
 //!
 //! ## Scope (deliberately small)
-//! It is a *shaper* console, not a control plane: single-user, stateless beyond the
-//! files it writes, with **no scheduler, run queue, catalog server, connectors,
-//! metering, or auth**. Those are orchestration concerns, out of scope here. The
+//! It is a *shaper* console, not a control plane: single-user, keeping nothing beyond the
+//! files it writes and the log of its own runs, with **no scheduler, run queue, catalog
+//! server, connectors, metering, or auth**. Those are orchestration concerns, out of scope here. The
 //! server binds to `127.0.0.1` by
 //! default and — as a local tool — has no application-level authentication; keep it
 //! bound to loopback, or put your own auth in front of it if you expose it.
@@ -29,6 +32,7 @@
 
 mod handlers;
 mod http;
+mod runs;
 
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::PathBuf;
@@ -193,8 +197,10 @@ fn route(server: &Server, req: &Request) -> Response {
         ("POST", "/api/inspect") => {
             guard_json(req).unwrap_or_else(|| handlers::inspect(&server.ctx, req))
         }
-        ("POST", "/api/cost") => {
-            guard_json(req).unwrap_or_else(|| handlers::cost(&server.ctx, req))
+        ("GET", "/api/runs") => handlers::runs(&server.ctx),
+        ("GET", "/api/tables") => handlers::tables(&server.ctx),
+        ("POST", "/api/table") => {
+            guard_json(req).unwrap_or_else(|| handlers::table(&server.ctx, req))
         }
 
         // ---- fallbacks ----

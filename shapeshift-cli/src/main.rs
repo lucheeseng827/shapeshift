@@ -10,9 +10,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use shapeshift_core::{
-    estimate_mar, infer_columns, ColumnSpec, Compression, DatasetSpec, DriftPolicy, DriftReport,
-    MarInputs, MergeSummary, OutputFormat, OutputSpec, PushOutcome, Record, RecordBatch,
-    SchemaMode, ShapeError, Shaper, Sink, SinkSummary, SourceFormat, SourceSpec,
+    estimate_mar, infer_columns, CatalogSpec, ColumnSpec, Compression, DatasetSpec, DriftPolicy,
+    DriftReport, FilterReport, MarInputs, MergeSummary, OutputFormat, OutputSpec, Predicate,
+    PushOutcome, Record, RecordBatch, SchemaMode, ShapeError, Shaper, Sink, SinkSummary,
+    SourceFormat, SourceSpec,
 };
 use shapeshift_iceberg::IcebergSink;
 use shapeshift_json::{
@@ -46,12 +47,23 @@ enum Cmd {
     Compact(CompactArgs),
     /// Expire old snapshots of an Iceberg table and delete the files only they read.
     Expire(ExpireArgs),
+    /// Re-anchor an Iceberg table that was copied or moved, so every path it records names
+    /// where it is now and any engine reads it with no flag.
+    Relocate(RelocateArgs),
     /// Price a shape against a managed vendor's MAR (Monthly Active Rows) rate.
     Cost(CostArgs),
     /// Serve a local web console over the shaper (infer/shape/inspect/cost).
     /// Requires a build with `--features serve`.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
+    /// A build without the console still knows the word, so `serve` says how to get it
+    /// instead of clap suggesting `expire`. Hidden from --help: this build has no console.
+    #[cfg(not(feature = "serve"))]
+    #[command(hide = true, disable_help_flag = true)]
+    Serve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -135,6 +147,11 @@ struct InferArgs {
     /// Dataset name (defaults to the input file stem).
     #[arg(long)]
     dataset: Option<String>,
+    /// Sample only the records this keeps, and write it into the spec as `where`: a
+    /// subset of SQL's WHERE over source paths, e.g. `record_type = 'gate'` (see the
+    /// spec reference).
+    #[arg(long = "where", value_name = "EXPR")]
+    filter: Option<String>,
     /// Write the spec here instead of printing it.
     #[arg(short, long)]
     out: Option<PathBuf>,
@@ -174,6 +191,12 @@ struct ShapeArgs {
     /// low-cardinality transforms.
     #[arg(long)]
     partition_by: Vec<String>,
+    /// Shape only the source records this keeps (overrides the spec's `where`): a subset
+    /// of SQL's WHERE over source paths, e.g. `record_type = 'gate' and status >= 500`.
+    /// A record it does not keep is counted as filtered, not rejected, and never reaches
+    /// inference, drift detection or the table.
+    #[arg(long = "where", value_name = "EXPR")]
+    filter: Option<String>,
     /// Merge (upsert) on these key columns instead of appending (overrides the spec's
     /// `merge_on`): each row replaces any row already in the table with the same key, and
     /// a key repeated in the input keeps its last occurrence. Creates the table if there
@@ -181,6 +204,30 @@ struct ShapeArgs {
     /// table, or an object-store URL in a build with the `object_store` feature).
     #[arg(long, value_delimiter = ',')]
     merge_on: Vec<String>,
+    /// Commit to an Iceberg table through the REST catalog at this URI
+    /// (`http(s)://host:port`) instead of writing a table directory: the catalog names the
+    /// table's location and is its commit point (overrides the spec's `output.catalog`).
+    /// Needs --table and implies --to iceberg. A table the catalog lacks is created empty
+    /// in an existing namespace; one that holds data needs --append or --merge-on. An
+    /// append another writer beat to the commit is rebuilt onto the new head and committed
+    /// again; a merge is not (exit 75). A build with the `object_store` feature.
+    #[arg(long, requires = "table", conflicts_with = "output")]
+    catalog: Option<String>,
+    /// The catalog's table, `<namespace>.<name>` (with --catalog).
+    #[arg(long, requires = "catalog", conflicts_with = "output")]
+    table: Option<String>,
+    /// Which of the catalog's warehouses holds the table (overrides the spec's
+    /// `output.catalog.warehouse`): a Polaris catalog's name, a Lakekeeper warehouse. The
+    /// catalog's credentials come from the environment: SHAPESHIFT_CATALOG_TOKEN, or
+    /// SHAPESHIFT_CATALOG_CREDENTIAL (client_id:client_secret, exchanged for a token).
+    #[arg(long)]
+    warehouse: Option<String>,
+    /// Insecure mode: let the catalog's credentials go over plain `http://` to another
+    /// machine (a compose network's `http://polaris:8181`). Without it they go only over
+    /// https, or to this machine, since anyone on the path could read the token or secret.
+    /// For a network trusted on its own terms; each run warns.
+    #[arg(long)]
+    insecure_catalog: bool,
     /// What to do when the source's shape outgrows the schema (overrides the spec's
     /// `drift.policy`): `ignore` (no detection), `warn` (default — count and report
     /// what the schema drops), `rescue` (keep the dropped values in a json catch-all
@@ -195,6 +242,13 @@ struct ShapeArgs {
     /// thread. On by default (`auto`); never changes the output, only who waits.
     #[arg(long, value_enum, default_value_t = CliPipeline::Auto)]
     pipeline: CliPipeline,
+    /// Name this run, for an orchestrator that may start it more than once (a retry, or
+    /// another worker taking over from one that went quiet). The id is recorded in the
+    /// snapshot (`shapeshift.run-id`). A run whose id the table already holds commits
+    /// nothing and reports that snapshot, so a retry can never append the rows twice.
+    /// Iceberg tables only; 1–128 letters, digits, `.`, `_`, `:` or `-`.
+    #[arg(long, value_name = "ID", value_parser = parse_run_id)]
+    run_id: Option<String>,
     /// Print one JSON summary to stdout instead of the text report (`summary_version: 1`;
     /// see the README). On failure stdout carries a JSON error instead; the exit status
     /// is unchanged.
@@ -237,8 +291,23 @@ struct InspectArgs {
 #[derive(Parser)]
 struct CompactArgs {
     /// The Iceberg table: a directory, or an `s3://` / `gs://` / `az://` / `file://` URL
-    /// (in a build with `--features object_store`).
+    /// (in a build with `--features object_store`); with --catalog, `<namespace>.<name>`.
     table: String,
+    /// Maintain the table through the REST catalog at this URI (`http(s)://host:port`);
+    /// TABLE is then the catalog's `<namespace>.<name>`. The table's files are read and
+    /// written where the catalog says, and the commit goes through the catalog, asserting
+    /// the table and its refs are as read: another writer's commit in between refuses it
+    /// (exit 75), and it is not retried. A build with the `object_store` feature.
+    #[arg(long)]
+    catalog: Option<String>,
+    /// Which of the catalog's warehouses holds the table (with --catalog). Credentials
+    /// come from the environment: SHAPESHIFT_CATALOG_TOKEN, or SHAPESHIFT_CATALOG_CREDENTIAL.
+    #[arg(long, requires = "catalog")]
+    warehouse: Option<String>,
+    /// Insecure mode: let the catalog's credentials go over plain `http://` to another
+    /// machine (with --catalog). Without it they go only over https, or to this machine.
+    #[arg(long, requires = "catalog")]
+    insecure_catalog: bool,
     /// Files smaller than this are packed together within their partition, into files
     /// of up to about this size (`512MiB`, `64M`, `1048576`). `0` packs nothing: only
     /// the files carrying deletes are rewritten.
@@ -257,8 +326,23 @@ struct CompactArgs {
 #[derive(Parser)]
 struct ExpireArgs {
     /// The Iceberg table: a directory, or an `s3://` / `gs://` / `az://` / `file://` URL
-    /// (in a build with `--features object_store`).
+    /// (in a build with `--features object_store`); with --catalog, `<namespace>.<name>`.
     table: String,
+    /// Maintain the table through the REST catalog at this URI (`http(s)://host:port`);
+    /// TABLE is then the catalog's `<namespace>.<name>`. The table's files are read and
+    /// written where the catalog says, and the commit goes through the catalog, asserting
+    /// the table and its refs are as read: another writer's commit in between refuses it
+    /// (exit 75), and it is not retried. A build with the `object_store` feature.
+    #[arg(long)]
+    catalog: Option<String>,
+    /// Which of the catalog's warehouses holds the table (with --catalog). Credentials
+    /// come from the environment: SHAPESHIFT_CATALOG_TOKEN, or SHAPESHIFT_CATALOG_CREDENTIAL.
+    #[arg(long, requires = "catalog")]
+    warehouse: Option<String>,
+    /// Insecure mode: let the catalog's credentials go over plain `http://` to another
+    /// machine (with --catalog). Without it they go only over https, or to this machine.
+    #[arg(long, requires = "catalog")]
+    insecure_catalog: bool,
     /// Expire snapshots committed longer ago than this (`5d`, `12h`, `30m`, `0s`).
     /// Iceberg's own default is five days.
     #[arg(long, default_value = "5d", value_parser = parse_duration_ms)]
@@ -274,6 +358,54 @@ struct ExpireArgs {
     /// is unchanged.
     #[arg(long)]
     summary_json: bool,
+}
+
+#[derive(Parser)]
+struct RelocateArgs {
+    /// The Iceberg table where it is now, after any tool copied or moved it there: a
+    /// directory, or an `s3://` / `gs://` / `az://` / `file://` URL (in a build with
+    /// `--features object_store`). Its data files are not copied, read or rewritten.
+    table: String,
+    /// The original is being retired: the table keeps its identity (`table-uuid`). Needed
+    /// only when a table still answers where this one was written, or that cannot be
+    /// checked; otherwise a relocation is a move.
+    #[arg(long, conflicts_with = "copy")]
+    moved: bool,
+    /// Both tables live on: give this one a new `table-uuid`, so the two can be told apart.
+    #[arg(long)]
+    copy: bool,
+    /// Report what would be rewritten and removed, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Then register the relocated table with the REST catalog at this URI
+    /// (`http(s)://host:port`), as --table: the catalog records where its metadata file is.
+    /// A name the catalog already has for another metadata file is refused, never
+    /// overwritten; the same file again is already done. Credentials come from the
+    /// environment, as for `shape --catalog`. A build with the `object_store` feature.
+    #[arg(long, requires = "register_as")]
+    catalog: Option<String>,
+    /// The name to register the table under, `<namespace>.<name>` (with --catalog).
+    #[arg(long = "table", id = "register_as", requires = "catalog")]
+    register_as: Option<String>,
+    /// Which of the catalog's warehouses to register it in (with --catalog).
+    #[arg(long, requires = "catalog")]
+    warehouse: Option<String>,
+    /// Insecure mode: let the catalog's credentials go over plain `http://` to another
+    /// machine (with --catalog).
+    #[arg(long, requires = "catalog")]
+    insecure_catalog: bool,
+    /// Print one JSON summary to stdout instead of the text report (`summary_version: 1`;
+    /// see the README). On failure stdout carries a JSON error instead; the exit status
+    /// is unchanged.
+    #[arg(long)]
+    summary_json: bool,
+}
+
+/// A run id (`--run-id`), checked as the snapshot will record it.
+fn parse_run_id(s: &str) -> std::result::Result<String, String> {
+    shapeshift_iceberg::validate_run_id(s)
+        .map(|()| s.to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// A duration in milliseconds: a number and a unit (`s`, `m`, `h`, `d`, `w`).
@@ -376,6 +508,7 @@ fn main() -> Result<()> {
         Cmd::Shape(a) if a.summary_json => Some("shape"),
         Cmd::Compact(a) if a.summary_json => Some("compact"),
         Cmd::Expire(a) if a.summary_json => Some("expire"),
+        Cmd::Relocate(a) if a.summary_json => Some("relocate"),
         _ => None,
     };
     let result = match cli.cmd {
@@ -384,9 +517,15 @@ fn main() -> Result<()> {
         Cmd::Inspect(a) => cmd_inspect(a),
         Cmd::Compact(a) => cmd_compact(a),
         Cmd::Expire(a) => cmd_expire(a),
+        Cmd::Relocate(a) => cmd_relocate(a),
         Cmd::Cost(a) => cmd_cost(a),
         #[cfg(feature = "serve")]
         Cmd::Serve(a) => cmd_serve(a),
+        #[cfg(not(feature = "serve"))]
+        Cmd::Serve { .. } => {
+            eprintln!("{SERVE_NOT_BUILT}");
+            std::process::exit(2);
+        }
     };
     let Err(e) = &result else {
         return result;
@@ -408,6 +547,19 @@ fn main() -> Result<()> {
     }
     result
 }
+
+/// What `serve` says in a build without the console (the release binary and image are lean).
+#[cfg(not(feature = "serve"))]
+const SERVE_NOT_BUILT: &str = "error: this shapeshift was built without the web console (`serve`).
+
+The release binary and the container image are the lean build. To get the console, build from
+source with the `serve` feature:
+
+  git clone https://github.com/lucheeseng827/shapeshift && cd shapeshift
+  cargo build --release -p shapeshift-cli --features serve
+  ./target/release/shapeshift serve        # then open http://127.0.0.1:8087/
+
+Every other command works in this build.";
 
 /// Exit status of a run refused by the commit guard (`EX_TEMPFAIL`: try again).
 const EXIT_CONFLICT: i32 = 75;
@@ -460,9 +612,14 @@ fn stem_of(path: &Path) -> String {
         .to_string()
 }
 
-/// Read up to `n` well-formed records (0 = all) for inference; parse errors are
-/// skipped here and surfaced properly during the shaping pass.
-fn sample_records(path: &Path, format: SourceFormat, n: usize) -> Result<Vec<Value>> {
+/// Read up to `n` well-formed records (0 = all) that `filter` keeps, for inference; parse
+/// errors are skipped here and surfaced properly during the shaping pass.
+fn sample_records(
+    path: &Path,
+    format: SourceFormat,
+    n: usize,
+    filter: Option<&Predicate>,
+) -> Result<Vec<Value>> {
     let reader =
         open_reader(path, format).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
     let mut out = Vec::new();
@@ -472,6 +629,9 @@ fn sample_records(path: &Path, format: SourceFormat, n: usize) -> Result<Vec<Val
     for item in reader {
         match item {
             Ok(v) => {
+                if filter.is_some_and(|f| !f.test(&v).keep) {
+                    continue;
+                }
                 out.push(v);
                 if n != 0 && out.len() >= n {
                     break;
@@ -511,12 +671,17 @@ const MAX_REPLAY_REJECTS: usize = 10_000;
 ///
 /// Either way, parse errors met while sampling are still counted and sidecarred by the
 /// shaping pass, in their original order.
+///
+/// With a `filter`, inference sees only the records it keeps, so the schema is theirs
+/// alone. A stream's records the filter drops are buffered for replay like malformed
+/// ones (the shaping pass counts them), under the same bound.
 fn infer_and_chain(
     path: &Path,
     format: SourceFormat,
     n: usize,
     flatten: bool,
-) -> Result<(Vec<ColumnSpec>, ShapeSource)> {
+    filter: Option<&Predicate>,
+) -> Result<(Vec<ColumnSpec>, usize, ShapeSource)> {
     let tape = |what: &str| {
         open_tape_reader(path, format).map_err(|e| anyhow!("{what} {}: {e}", display_input(path)))
     };
@@ -525,10 +690,11 @@ fn infer_and_chain(
         // A file is sampled and then reopened, exactly as before — that is what keeps
         // `infer_sample: 0` bounded and lets inference scan past a malformed head. The
         // shaping pass that follows is the one that gets the tape.
-        let samples = sample_records(path, format, n)?;
+        let samples = sample_records(path, format, n, filter)?;
         let columns = infer_columns(samples.iter(), flatten);
         return Ok((
             columns,
+            samples.len(),
             ShapeSource {
                 reader: tape("reading")?,
                 prefix: Vec::new(),
@@ -551,17 +717,29 @@ fn infer_and_chain(
     let mut reader = tape("opening")?;
 
     let mut prefix: Vec<std::result::Result<Value, JsonError>> = Vec::new();
-    let (mut good, mut rejects) = (0usize, 0usize);
-    while good < n && rejects < MAX_REPLAY_REJECTS {
+    // Which buffered records inference may use: parsed, and kept by the filter.
+    let mut sampled: Vec<bool> = Vec::new();
+    // Records buffered without being sampled — malformed, or dropped by the filter — are
+    // bounded together, since both are held for replay.
+    let (mut good, mut malformed, mut dropped) = (0usize, 0usize, 0usize);
+    while good < n && malformed + dropped < MAX_REPLAY_REJECTS {
         match reader.next_owned() {
             None => break,
             Some(Ok(v)) => {
-                good += 1;
+                // A record the filter drops is replayed (and counted) but not sampled.
+                let keep = !filter.is_some_and(|f| !f.test(&v).keep);
+                if keep {
+                    good += 1;
+                } else {
+                    dropped += 1;
+                }
+                sampled.push(keep);
                 prefix.push(Ok(v));
             }
             // Inference skips a malformed line; shaping still reports it, so it stays.
             Some(Err(e @ JsonError::Parse { .. })) => {
-                rejects += 1;
+                malformed += 1;
+                sampled.push(false);
                 prefix.push(Err(e));
             }
             Some(Err(JsonError::Io(e))) => {
@@ -569,18 +747,45 @@ fn infer_and_chain(
             }
         }
     }
-    if good == 0 && rejects >= MAX_REPLAY_REJECTS {
-        bail!(
-            "the first {rejects} records from {} were all unparseable, so there is nothing to \
-             infer a schema from — is the input really {:?}? Pass a spec with `schema: strict` \
-             to shape it anyway.",
-            display_input(path),
-            format
+    if good == 0 && malformed + dropped >= MAX_REPLAY_REJECTS {
+        match filter {
+            Some(f) if dropped > 0 => bail!(
+                "`where {f}` kept none of the first {} records from {} ({dropped} filtered, \
+                 {malformed} unparseable). A stream is sampled from its head, and no more than \
+                 that is held back, so there is nothing to infer a schema from: declare the \
+                 columns (`schema: strict`), or shape the input from a file.",
+                malformed + dropped,
+                display_input(path)
+            ),
+            _ => bail!(
+                "the first {malformed} records from {} were all unparseable, so there is \
+                 nothing to infer a schema from — is the input really {:?}? Pass a spec with \
+                 `schema: strict` to shape it anyway.",
+                display_input(path),
+                format
+            ),
+        }
+    }
+    // The bound stopped the hunt before the sample filled: say so, since the schema then
+    // rests on fewer records than `infer_sample` asked for.
+    if good < n && malformed + dropped >= MAX_REPLAY_REJECTS {
+        eprintln!(
+            "note: inferred the schema from {good} record(s), not the {n} `infer_sample` asks \
+             for: {} more from the head of {} were held back unsampled ({dropped} filtered, \
+             {malformed} unparseable), which is as many as a stream may hold. A column that \
+             appears only later is not in the schema; declare it, or shape from a file.",
+            malformed + dropped,
+            display_input(path)
         );
     }
     // Infer straight off the buffered records — no second copy of the sample.
-    let columns = infer_columns(prefix.iter().filter_map(|r| r.as_ref().ok()), flatten);
-    Ok((columns, ShapeSource { reader, prefix }))
+    let kept = prefix
+        .iter()
+        .zip(&sampled)
+        .filter(|(_, keep)| **keep)
+        .filter_map(|(r, _)| r.as_ref().ok());
+    let columns = infer_columns(kept, flatten);
+    Ok((columns, good, ShapeSource { reader, prefix }))
 }
 
 /// Open the tape-backed reader for `path` (or standard input) in `format`.
@@ -664,6 +869,8 @@ impl ShapeLoop<'_> {
         };
         match outcome {
             PushOutcome::Appended => self.rows_out += 1,
+            // Counted by the shaper's filter report; nothing to keep or replay.
+            PushOutcome::Filtered => {}
             PushOutcome::Rejected(reason) => {
                 self.rows_rejected += 1;
                 tracing::debug!(reason, "row rejected");
@@ -909,13 +1116,27 @@ fn display_input(path: &Path) -> String {
 
 fn cmd_infer(a: InferArgs) -> Result<()> {
     let dataset = a.dataset.clone().unwrap_or_else(|| stem_of(&a.input));
-    let samples = sample_records(&a.input, a.format.into(), a.sample)?;
+    let filter = a
+        .filter
+        .as_deref()
+        .map(Predicate::parse)
+        .transpose()
+        .map_err(anyhow::Error::from)?;
+    let samples = sample_records(&a.input, a.format.into(), a.sample, filter.as_ref())?;
     if samples.is_empty() {
-        bail!("no records read from {}", a.input.display());
+        match &filter {
+            Some(f) => bail!(
+                "`where {f}` kept none of the records read from {}, so there is nothing to \
+                 infer a schema from",
+                a.input.display()
+            ),
+            None => bail!("no records read from {}", a.input.display()),
+        }
     }
     let columns = infer_columns(samples.iter(), !a.no_flatten);
     let spec = DatasetSpec {
         dataset: dataset.clone(),
+        filter: filter.map(|f| f.text().to_string()),
         source: SourceSpec {
             format: a.format.into(),
             path: Some(a.input.to_string_lossy().into_owned()),
@@ -926,6 +1147,7 @@ fn cmd_infer(a: InferArgs) -> Result<()> {
             compression: Compression::Snappy,
             partition_by: Vec::new(),
             merge_on: Vec::new(),
+            catalog: None,
         },
         schema: SchemaMode::Infer,
         columns,
@@ -984,30 +1206,43 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         Some(p) => {
             let text =
                 std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            DatasetSpec::parse(&text).map_err(anyhow::Error::from)?
+            // Validated below, once the flags have had their say: `--where` can stand in
+            // for a `where` the file gets wrong, as `--output` can for its path.
+            DatasetSpec::decode(&text).map_err(anyhow::Error::from)?
         }
         None => {
             let input = a
                 .input
                 .clone()
                 .ok_or_else(|| anyhow!("--input is required when no --spec is given"))?;
-            let output = a
-                .output
-                .clone()
-                .ok_or_else(|| anyhow!("--output is required when no --spec is given"))?;
+            // A catalog names the table's location, so it stands in for --output.
+            let output = match (&a.output, &a.catalog) {
+                (Some(o), _) => o.clone(),
+                (None, Some(_)) => String::new(),
+                (None, None) => {
+                    bail!("--output (or --catalog) is required when no --spec is given")
+                }
+            };
+            let default_format = if a.catalog.is_some() {
+                OutputFormat::Iceberg
+            } else {
+                OutputFormat::Parquet
+            };
             let dataset = a.dataset.clone().unwrap_or_else(|| stem_of(&input));
             DatasetSpec {
                 dataset,
+                filter: None,
                 source: SourceSpec {
                     format: a.format.into(),
                     path: Some(input.to_string_lossy().into_owned()),
                 },
                 output: OutputSpec {
-                    format: a.to.map(Into::into).unwrap_or(OutputFormat::Parquet),
+                    format: a.to.map(Into::into).unwrap_or(default_format),
                     path: output,
                     compression: a.compression.map(Into::into).unwrap_or(Compression::Snappy),
                     partition_by: Vec::new(),
                     merge_on: Vec::new(),
+                    catalog: None,
                 },
                 schema: SchemaMode::Infer,
                 columns: Vec::new(),
@@ -1027,6 +1262,35 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     if let Some(fmt) = a.to {
         spec.output.format = fmt.into();
     }
+    // --catalog takes the table out of the spec's directory and into the catalog: the
+    // spec's path no longer applies, and the output is an Iceberg table unless --to says
+    // otherwise (which validation then refuses).
+    if let (Some(uri), Some(table)) = (&a.catalog, &a.table) {
+        spec.output.catalog = Some(CatalogSpec {
+            uri: uri.clone(),
+            table: table.clone(),
+            warehouse: None,
+        });
+        spec.output.path.clear();
+        if a.to.is_none() {
+            spec.output.format = OutputFormat::Iceberg;
+        }
+    }
+    if let Some(w) = &a.warehouse {
+        match spec.output.catalog.as_mut() {
+            Some(c) => c.warehouse = Some(w.clone()),
+            None => bail!(
+                "--warehouse names a warehouse of a REST catalog; this run writes to none (give \
+                 --catalog, or `output.catalog` in the spec)"
+            ),
+        }
+    }
+    if a.insecure_catalog && spec.output.catalog.is_none() {
+        bail!(
+            "--insecure-catalog lets a REST catalog's credentials go over plain http; this run \
+             writes to no catalog (give --catalog, or `output.catalog` in the spec)"
+        );
+    }
     if let Some(c) = a.compression {
         spec.output.compression = c.into();
     }
@@ -1039,6 +1303,9 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     }
     if !a.merge_on.is_empty() {
         spec.output.merge_on = a.merge_on.iter().map(|k| k.trim().to_string()).collect();
+    }
+    if let Some(w) = &a.filter {
+        spec.filter = Some(w.clone());
     }
     if let Some(p) = a.on_drift {
         spec.drift.policy = p.into();
@@ -1063,17 +1330,81 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         bail!("--append applies only to Iceberg tables (--to iceberg)");
     }
     let merging = !spec.output.merge_on.is_empty();
+    let run_id = a.run_id.as_deref();
+
+    // A run that an earlier attempt already committed is done: report its snapshot and
+    // read nothing. (An attempt that commits while this one runs is caught at commit.)
+    if let Some(id) = run_id {
+        if spec.output.format != OutputFormat::Iceberg {
+            bail!(
+                "--run-id applies only to Iceberg tables (--to iceberg): a Parquet file has no \
+                 history to record the run in"
+            );
+        }
+        if let Some(found) = find_run(&spec, a.insecure_catalog, id)? {
+            let summary = shapeshift_iceberg::earlier_attempt_summary(&found);
+            let primary = PathBuf::from(match &spec.output.catalog {
+                Some(c) => &c.table,
+                None => &spec.output.path,
+            });
+            if a.summary_json {
+                // Nothing was read, so nothing was filtered; the spec's `where` still shows.
+                let filter = spec.filter.as_ref().map(|expr| FilterReport {
+                    expr: expr.trim().to_string(),
+                    ..FilterReport::default()
+                });
+                let doc = shape_json(
+                    &spec,
+                    &primary,
+                    [0; 5],
+                    &summary,
+                    None,
+                    None,
+                    filter.as_ref(),
+                    run_id,
+                );
+                println!("{doc}");
+            } else {
+                println!(
+                    "run `{id}` is already in {}: an earlier attempt committed snapshot {} \
+                     (sequence number {}). Nothing was read or written.",
+                    primary.display(),
+                    found.snapshot_id,
+                    found.sequence_number
+                );
+            }
+            return Ok(());
+        }
+    }
 
     // 4. Build the shaper (inferring in Infer mode). The source is opened **once**:
     // inference reads the head and hands back a reader that still yields every record,
     // so a pipe or `-` shapes the same rows a regular file would.
     let (inferred, reader) = if spec.schema == SchemaMode::Infer {
-        let (columns, reader) = infer_and_chain(
+        let filter = spec
+            .filter
+            .as_deref()
+            .map(Predicate::parse)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+        let (columns, sampled, reader) = infer_and_chain(
             &input,
             src_format,
             spec.options.infer_sample,
             spec.options.flatten,
+            filter.as_ref(),
         )?;
+        // Only when it kept nothing (records it kept that carry no field to infer from
+        // are the same case they are without a filter), and nothing is declared either.
+        if let (Some(f), 0, true) = (&filter, sampled, spec.columns.is_empty()) {
+            bail!(
+                "`where {f}` kept none of the records sampled from {} (`infer_sample` is {}), \
+                 so there is no schema to infer: check the expression, or declare the \
+                 columns",
+                display_input(&input),
+                spec.options.infer_sample
+            );
+        }
         (columns, Some(reader))
     } else {
         (Vec::new(), None)
@@ -1081,9 +1412,26 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(anyhow::Error::from)?;
     let schema = shaper.schema();
 
-    // 5. Resolve the output + create the sink.
-    let output_is_url = looks_like_url(&spec.output.path);
+    // 5. Resolve the output + create the sink. A catalog table counts as remote output:
+    // its sidecars are named after the dataset in the working directory.
+    let output_is_url = spec.output.catalog.is_some() || looks_like_url(&spec.output.path);
     let (sink, primary): (Box<dyn Sink + Send>, PathBuf) = match spec.output.format {
+        OutputFormat::Iceberg if spec.output.catalog.is_some() => {
+            let cat = spec.output.catalog.as_ref().expect("checked");
+            let s = objstore_catalog_sink(
+                CatalogTarget {
+                    spec: cat,
+                    insecure: a.insecure_catalog,
+                },
+                schema.clone(),
+                spec.output.compression,
+                a.append,
+                &spec.output.partition_by,
+                &spec.output.merge_on,
+                run_id,
+            )?;
+            (s, PathBuf::from(&cat.table))
+        }
         OutputFormat::Parquet if output_is_url => {
             let s =
                 objstore_parquet_sink(&spec.output.path, schema.clone(), spec.output.compression)?;
@@ -1103,12 +1451,13 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 a.append,
                 &spec.output.partition_by,
                 &spec.output.merge_on,
+                run_id,
             )?;
             (s, PathBuf::from(&spec.output.path))
         }
         OutputFormat::Iceberg => {
             let dir = PathBuf::from(&spec.output.path);
-            let s = if merging {
+            let mut s = if merging {
                 IcebergSink::create_merge(
                     &dir,
                     schema.clone(),
@@ -1126,6 +1475,9 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 )
             }
             .map_err(anyhow::Error::from)?;
+            if let Some(id) = run_id {
+                s.set_run_id(id).map_err(anyhow::Error::from)?;
+            }
             (Box::new(s), dir)
         }
     };
@@ -1224,6 +1576,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     let summary: SinkSummary = sink.finish()?;
 
     // 7. Report. The full drift report goes beside the output either way.
+    let filter = shaper.filter_report().cloned();
     let drift = shaper.into_drift_report();
     let drift_report = match &drift {
         Some(report) if !report.is_clean() => {
@@ -1241,6 +1594,8 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             &summary,
             rejects,
             drift.as_ref().map(|r| (r, drift_report)),
+            filter.as_ref(),
+            run_id,
         );
         println!("{doc}");
         return Ok(());
@@ -1251,11 +1606,19 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         primary.display(),
         spec.output.format
     );
+    // `filtered=` appears only with a `where`, so a run without one reports as it did.
+    let filtered = filter
+        .as_ref()
+        .map(|f| format!(" filtered={}", f.filtered))
+        .unwrap_or_default();
     println!(
-        "rows_in={rows_in} rows_out={rows_out} rejected={rows_rejected} parse_errors={parse_errors} \
-         row_groups={batches} bytes={}",
+        "rows_in={rows_in} rows_out={rows_out}{filtered} rejected={rows_rejected} \
+         parse_errors={parse_errors} row_groups={batches} bytes={}",
         summary.bytes
     );
+    if let Some(f) = &filter {
+        print_filter(f, rows_in);
+    }
     if parse_errors > 0 || rows_rejected > 0 {
         println!(
             "malformed / rejected rows → {} ({} parse, {} shaped-out)",
@@ -1273,6 +1636,20 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         {
             println!("iceberg table metadata → {}", meta.display());
         }
+        if summary.earlier_attempt {
+            println!(
+                "an earlier attempt of run `{}` had already committed snapshot {}: this one \
+                 committed nothing, and its files were removed",
+                run_id.unwrap_or_default(),
+                summary.snapshot_id.unwrap_or_default()
+            );
+        } else if summary.rebases > 0 {
+            println!(
+                "another writer committed first: rebuilt onto the new head {} time(s), then \
+                 committed",
+                summary.rebases
+            );
+        }
     }
     if let Some(m) = &summary.merge {
         print_merge(m);
@@ -1286,6 +1663,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
 
 /// The `--summary-json` document of a shape run. Snapshot ids are strings: they are
 /// 64-bit, past what a JSON number holds exactly in most parsers.
+#[allow(clippy::too_many_arguments)]
 fn shape_json(
     spec: &DatasetSpec,
     primary: &Path,
@@ -1293,16 +1671,22 @@ fn shape_json(
     summary: &SinkSummary,
     rejects: Option<&Path>,
     drift: Option<(&DriftReport, Option<&Path>)>,
+    filter: Option<&FilterReport>,
+    run_id: Option<&str>,
 ) -> Value {
-    let table = summary.table_version.map(|version| {
+    // A catalog commit has a snapshot but no `vN` of its own (the catalog numbers its
+    // metadata files), so `version` is null there.
+    let table = summary.snapshot_id.map(|_| {
         let metadata = summary
             .files
             .iter()
             .find(|p| p.to_string_lossy().ends_with(".metadata.json"));
         serde_json::json!({
-            "version": version,
+            "version": summary.table_version,
             "snapshot_id": summary.snapshot_id.map(|id| id.to_string()),
+            "rebases": summary.rebases,
             "metadata": metadata.map(|p| p.display().to_string()),
+            "earlier_attempt": summary.earlier_attempt,
         })
     });
     serde_json::json!({
@@ -1310,17 +1694,31 @@ fn shape_json(
         "command": "shape",
         "ok": true,
         "dataset": spec.dataset,
+        "run_id": run_id,
         "output": {
             "format": spec.output.format,
             "path": primary.display().to_string(),
             "compression": spec.output.compression,
+            "catalog": spec.output.catalog.as_ref().map(|c| serde_json::json!({
+                "uri": c.uri,
+                "table": c.table,
+                "warehouse": c.warehouse,
+            })),
         },
         "rows": {
             "in": rows_in,
             "out": rows_out,
             "rejected": rejected,
+            "filtered": filter.map_or(0, |f| f.filtered),
             "parse_errors": parse_errors,
         },
+        // Present when the run had a `where`.
+        "where": filter.map(|f| serde_json::json!({
+            "expr": f.expr,
+            "filtered": f.filtered,
+            "type_mismatches": f.type_mismatches,
+            "first_mismatch": f.first_mismatch,
+        })),
         "row_groups": row_groups,
         "bytes": summary.bytes,
         "rejects": rejects.map(|p| serde_json::json!({
@@ -1343,6 +1741,25 @@ fn shape_json(
             "report": report.map(|p| p.display().to_string()),
         })),
     })
+}
+
+/// What the `where` did, when it needs saying: a filter that kept nothing, and
+/// comparisons between values of different kinds, which are never true.
+fn print_filter(f: &FilterReport, rows_in: u64) {
+    if rows_in > 0 && f.filtered == rows_in {
+        println!(
+            "note: `where {}` kept none of the {rows_in} record(s)",
+            f.expr
+        );
+    }
+    if f.type_mismatches > 0 {
+        println!(
+            "note: in {} record(s) `where` compared values of different kinds, which is never \
+             true; the first: {}",
+            f.type_mismatches,
+            f.first_mismatch.as_deref().unwrap_or("?")
+        );
+    }
 }
 
 fn merge_json(m: &MergeSummary) -> Value {
@@ -1553,14 +1970,18 @@ fn objstore_iceberg_sink(
     append: bool,
     partition_by: &[String],
     merge_on: &[String],
+    run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     use shapeshift_objstore::ObjectStoreIcebergSink;
-    let s = if merge_on.is_empty() {
+    let mut s = if merge_on.is_empty() {
         ObjectStoreIcebergSink::create(url, schema, compression, append, partition_by)
     } else {
         ObjectStoreIcebergSink::create_merge(url, schema, compression, partition_by, merge_on)
     }
     .map_err(anyhow::Error::from)?;
+    if let Some(id) = run_id {
+        s.set_run_id(id).map_err(anyhow::Error::from)?;
+    }
     Ok(Box::new(s))
 }
 
@@ -1572,10 +1993,162 @@ fn objstore_iceberg_sink(
     _append: bool,
     _partition_by: &[String],
     _merge_on: &[String],
+    _run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     bail!(
         "object-store Iceberg output ({url}) needs a build with `--features object_store` \
          (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
+/// Build a sink committing to a table through a REST catalog (`--catalog`), merging on
+/// `merge_on` when it names key columns. Feature-gated like the object-store sinks: the
+/// catalog's tables live in object stores (or `file:`).
+#[cfg(feature = "object_store")]
+fn objstore_catalog_sink(
+    catalog: CatalogTarget<'_>,
+    schema: shapeshift_core::SchemaRef,
+    compression: Compression,
+    append: bool,
+    partition_by: &[String],
+    merge_on: &[String],
+    run_id: Option<&str>,
+) -> Result<Box<dyn Sink + Send>> {
+    use shapeshift_objstore::ObjectStoreIcebergSink;
+    let conn = catalog.connection()?;
+    let (conn, table) = (&conn, &catalog.spec.table);
+    let mut s = if merge_on.is_empty() {
+        ObjectStoreIcebergSink::create_in_catalog(
+            conn,
+            table,
+            schema,
+            compression,
+            append,
+            partition_by,
+        )
+    } else {
+        ObjectStoreIcebergSink::create_merge_in_catalog(
+            conn,
+            table,
+            schema,
+            compression,
+            partition_by,
+            merge_on,
+        )
+    }
+    .map_err(anyhow::Error::from)?;
+    if let Some(id) = run_id {
+        s.set_run_id(id).map_err(anyhow::Error::from)?;
+    }
+    Ok(Box::new(s))
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_catalog_sink(
+    catalog: CatalogTarget<'_>,
+    _schema: shapeshift_core::SchemaRef,
+    _compression: Compression,
+    _append: bool,
+    _partition_by: &[String],
+    _merge_on: &[String],
+    _run_id: Option<&str>,
+) -> Result<Box<dyn Sink + Send>> {
+    // The URI is not repeated: it may carry credentials, which are refused only when used.
+    bail!(
+        "committing {} through a REST catalog needs a build with `--features object_store`",
+        catalog.spec.table
+    )
+}
+
+/// A REST catalog as this run reaches it: the spec's `output.catalog` (or --catalog), and
+/// whether --insecure-catalog lets its credentials go over plain http.
+#[derive(Clone, Copy)]
+struct CatalogTarget<'a> {
+    spec: &'a CatalogSpec,
+    // Read only where a catalog can be reached: a build with `object_store`.
+    #[cfg_attr(not(feature = "object_store"), allow(dead_code))]
+    insecure: bool,
+}
+
+#[cfg(feature = "object_store")]
+impl CatalogTarget<'_> {
+    fn connection(&self) -> Result<shapeshift_objstore::CatalogConnection> {
+        catalog_connection(
+            &self.spec.uri,
+            self.spec.warehouse.as_deref(),
+            self.insecure,
+        )
+    }
+}
+
+/// The snapshot run `run_id` already committed to the spec's Iceberg output, if any: a
+/// local table, a table in an object store, or one a REST catalog names.
+fn find_run(
+    spec: &DatasetSpec,
+    insecure_catalog: bool,
+    run_id: &str,
+) -> Result<Option<shapeshift_iceberg::RunSnapshot>> {
+    if let Some(cat) = &spec.output.catalog {
+        let target = CatalogTarget {
+            spec: cat,
+            insecure: insecure_catalog,
+        };
+        return objstore_find_run_in_catalog(target, run_id);
+    }
+    if looks_like_url(&spec.output.path) {
+        return objstore_find_run(&spec.output.path, run_id);
+    }
+    shapeshift_iceberg::find_run_local(&spec.output.path, run_id).map_err(anyhow::Error::from)
+}
+
+#[cfg(feature = "object_store")]
+fn objstore_find_run(url: &str, run_id: &str) -> Result<Option<shapeshift_iceberg::RunSnapshot>> {
+    shapeshift_objstore::find_run(url, run_id).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_find_run(url: &str, _run_id: &str) -> Result<Option<shapeshift_iceberg::RunSnapshot>> {
+    bail!(
+        "object-store Iceberg output ({url}) needs a build with `--features object_store` \
+         (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
+#[cfg(feature = "object_store")]
+fn objstore_find_run_in_catalog(
+    catalog: CatalogTarget<'_>,
+    run_id: &str,
+) -> Result<Option<shapeshift_iceberg::RunSnapshot>> {
+    let conn = catalog.connection()?;
+    shapeshift_objstore::find_run_in_catalog(&conn, &catalog.spec.table, run_id)
+        .map_err(anyhow::Error::from)
+}
+
+/// The catalog at `uri`, its `warehouse`, the credentials the environment names
+/// (`SHAPESHIFT_CATALOG_TOKEN`, or `SHAPESHIFT_CATALOG_CREDENTIAL`), and whether
+/// --insecure-catalog lets them go over plain http to another machine.
+#[cfg(feature = "object_store")]
+fn catalog_connection(
+    uri: &str,
+    warehouse: Option<&str>,
+    insecure: bool,
+) -> Result<shapeshift_objstore::CatalogConnection> {
+    let mut conn =
+        shapeshift_objstore::CatalogConnection::from_env(uri, warehouse.map(str::to_string))
+            .map_err(anyhow::Error::from)?;
+    conn.allow_plain_http = insecure;
+    Ok(conn)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_find_run_in_catalog(
+    catalog: CatalogTarget<'_>,
+    _run_id: &str,
+) -> Result<Option<shapeshift_iceberg::RunSnapshot>> {
+    // The URI is not repeated: it may carry credentials, which are refused only when used.
+    bail!(
+        "committing {} through a REST catalog needs a build with `--features object_store`",
+        catalog.spec.table
     )
 }
 
@@ -1614,6 +2187,56 @@ fn objstore_compact_iceberg(
     )
 }
 
+/// Compact a table through a REST catalog (`compact --catalog`). Feature-gated like the
+/// sinks.
+#[cfg(feature = "object_store")]
+fn objstore_compact_in_catalog(
+    uri: &str,
+    warehouse: Option<&str>,
+    insecure: bool,
+    table: &str,
+    options: &shapeshift_iceberg::CompactOptions,
+) -> Result<shapeshift_iceberg::CompactSummary> {
+    let conn = catalog_connection(uri, warehouse, insecure)?;
+    shapeshift_objstore::compact_in_catalog(&conn, table, options).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_compact_in_catalog(
+    _uri: &str,
+    _warehouse: Option<&str>,
+    _insecure: bool,
+    _table: &str,
+    _options: &shapeshift_iceberg::CompactOptions,
+) -> Result<shapeshift_iceberg::CompactSummary> {
+    bail!("compacting through a REST catalog needs a build with `--features object_store`")
+}
+
+/// Expire snapshots through a REST catalog (`expire --catalog`). Feature-gated like the
+/// sinks.
+#[cfg(feature = "object_store")]
+fn objstore_expire_in_catalog(
+    uri: &str,
+    warehouse: Option<&str>,
+    insecure: bool,
+    table: &str,
+    options: &shapeshift_iceberg::ExpireOptions,
+) -> Result<shapeshift_iceberg::ExpireSummary> {
+    let conn = catalog_connection(uri, warehouse, insecure)?;
+    shapeshift_objstore::expire_in_catalog(&conn, table, options).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_expire_in_catalog(
+    _uri: &str,
+    _warehouse: Option<&str>,
+    _insecure: bool,
+    _table: &str,
+    _options: &shapeshift_iceberg::ExpireOptions,
+) -> Result<shapeshift_iceberg::ExpireSummary> {
+    bail!("expiring through a REST catalog needs a build with `--features object_store`")
+}
+
 /// Expire snapshots of an Iceberg table living in an object store. Feature-gated like the
 /// sinks.
 #[cfg(feature = "object_store")]
@@ -1635,6 +2258,26 @@ fn objstore_expire_iceberg(
     )
 }
 
+/// Relocate an Iceberg table living in an object store. Feature-gated like the sinks.
+#[cfg(feature = "object_store")]
+fn objstore_relocate_iceberg(
+    url: &str,
+    options: &shapeshift_iceberg::RelocateOptions,
+) -> Result<shapeshift_iceberg::RelocateSummary> {
+    shapeshift_objstore::relocate_iceberg(url, options).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_relocate_iceberg(
+    url: &str,
+    _options: &shapeshift_iceberg::RelocateOptions,
+) -> Result<shapeshift_iceberg::RelocateSummary> {
+    bail!(
+        "relocating an object-store table ({url}) needs a build with `--features object_store` \
+         (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
 fn resolve_parquet_path(out: &str, dataset: &str) -> PathBuf {
     let p = PathBuf::from(out);
     let is_dir = out.ends_with('/') || out.ends_with(std::path::MAIN_SEPARATOR) || p.is_dir();
@@ -1649,6 +2292,14 @@ fn print_iceberg_info(label: &str, info: &shapeshift_iceberg::IcebergInfo) {
     println!("iceberg table: {label}");
     println!("  format-version: {}", info.format_version);
     println!("  table-uuid: {}", info.table_uuid);
+    if info.moved {
+        // shapeshift reads it where it is; other engines look where the metadata says.
+        println!(
+            "  moved: its metadata says it is at {}; shapeshift reads and writes it here, but \
+             other engines' default readers look for its files there",
+            info.location
+        );
+    }
     println!("  current-snapshot-id: {}", info.current_snapshot_id);
     if info.total_position_deletes > 0 {
         println!(
@@ -1694,7 +2345,15 @@ fn cmd_compact(a: CompactArgs) -> Result<()> {
         compression: a.compression.into(),
         ..shapeshift_iceberg::CompactOptions::default()
     };
-    let s = if looks_like_url(&a.table) {
+    let s = if let Some(uri) = &a.catalog {
+        objstore_compact_in_catalog(
+            uri,
+            a.warehouse.as_deref(),
+            a.insecure_catalog,
+            &a.table,
+            &options,
+        )?
+    } else if looks_like_url(&a.table) {
         objstore_compact_iceberg(&a.table, &options)?
     } else {
         let dir = PathBuf::from(&a.table);
@@ -1720,6 +2379,8 @@ fn compact_json(a: &CompactArgs, s: &shapeshift_iceberg::CompactSummary) -> Valu
         "command": "compact",
         "ok": true,
         "table": a.table,
+        "catalog": a.catalog,
+        "warehouse": a.warehouse,
         "committed": s.snapshot_id.is_some(),
         "version": s.version,
         "snapshot_id": s.snapshot_id.map(|id| id.to_string()),
@@ -1789,7 +2450,15 @@ fn cmd_expire(a: ExpireArgs) -> Result<()> {
         retain_last: a.retain_last as usize,
         dry_run: a.dry_run,
     };
-    let s = if looks_like_url(&a.table) {
+    let s = if let Some(uri) = &a.catalog {
+        objstore_expire_in_catalog(
+            uri,
+            a.warehouse.as_deref(),
+            a.insecure_catalog,
+            &a.table,
+            &options,
+        )?
+    } else if looks_like_url(&a.table) {
         objstore_expire_iceberg(&a.table, &options)?
     } else {
         let dir = PathBuf::from(&a.table);
@@ -1809,6 +2478,238 @@ fn cmd_expire(a: ExpireArgs) -> Result<()> {
     Ok(())
 }
 
+/// Whether a URI names a user (`user:password@host`) in its authority.
+fn uri_has_userinfo(uri: &str) -> bool {
+    let rest = uri.split_once("://").map_or(uri, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.contains('@')
+}
+
+fn cmd_relocate(a: RelocateArgs) -> Result<()> {
+    // The catalog URI is printed (errors, a dry run, the summary), so one that carries
+    // credentials is refused before anything runs, as the catalog client refuses it.
+    if a.catalog.as_deref().is_some_and(uri_has_userinfo) {
+        bail!(
+            "the catalog URI carries credentials (`user:password@`); put them in \
+             SHAPESHIFT_CATALOG_TOKEN or SHAPESHIFT_CATALOG_CREDENTIAL instead"
+        );
+    }
+    let options = shapeshift_iceberg::RelocateOptions {
+        identity: match (a.moved, a.copy) {
+            (true, _) => Some(shapeshift_iceberg::Identity::Moved),
+            (_, true) => Some(shapeshift_iceberg::Identity::Copy),
+            _ => None,
+        },
+        dry_run: a.dry_run,
+    };
+    let s = if looks_like_url(&a.table) {
+        objstore_relocate_iceberg(&a.table, &options)?
+    } else {
+        let dir = PathBuf::from(&a.table);
+        if !dir.join("metadata/version-hint.text").exists() {
+            bail!(
+                "no Iceberg table at {} (no metadata/version-hint.text)",
+                dir.display()
+            );
+        }
+        shapeshift_iceberg::relocate_table(&dir, &options).map_err(anyhow::Error::from)?
+    };
+    // Registered once the table is where its metadata says (never in a dry run): the
+    // catalog then reads paths that are the table's own.
+    let registered = match (&a.catalog, &a.register_as, a.dry_run) {
+        (Some(uri), Some(name), false) => Some(
+            objstore_register_in_catalog(
+                uri,
+                a.warehouse.as_deref(),
+                a.insecure_catalog,
+                name,
+                &s.metadata,
+            )
+            .with_context(|| {
+                format!(
+                    "registering {name} with the catalog at {uri} (the relocation itself {}; run \
+                     relocate again with --catalog to register it)",
+                    if s.committed {
+                        "is committed"
+                    } else {
+                        "had nothing to do"
+                    }
+                )
+            })?,
+        ),
+        _ => None,
+    };
+    if a.summary_json {
+        println!("{}", relocate_json(&a, &s, registered));
+    } else {
+        print_relocate(&a, &s, registered);
+    }
+    Ok(())
+}
+
+/// Register a relocated table with a REST catalog: `true` if this run registered it, `false`
+/// if the catalog already named it at the same metadata file. Feature-gated like the sinks.
+#[cfg(feature = "object_store")]
+fn objstore_register_in_catalog(
+    uri: &str,
+    warehouse: Option<&str>,
+    insecure: bool,
+    table: &str,
+    metadata: &str,
+) -> Result<bool> {
+    let conn = catalog_connection(uri, warehouse, insecure)?;
+    Ok(
+        shapeshift_objstore::register_in_catalog(&conn, table, metadata)
+            .map_err(anyhow::Error::from)?
+            == shapeshift_objstore::Registration::Registered,
+    )
+}
+
+#[cfg(not(feature = "object_store"))]
+fn objstore_register_in_catalog(
+    _uri: &str,
+    _warehouse: Option<&str>,
+    _insecure: bool,
+    _table: &str,
+    _metadata: &str,
+) -> Result<bool> {
+    bail!("registering with a REST catalog needs a build with `--features object_store`")
+}
+
+/// In a dry run, the counts are what a real run would rewrite and remove.
+fn relocate_json(
+    a: &RelocateArgs,
+    s: &shapeshift_iceberg::RelocateSummary,
+    registered: Option<bool>,
+) -> Value {
+    serde_json::json!({
+        "summary_version": SUMMARY_VERSION,
+        "command": "relocate",
+        "ok": true,
+        "table": a.table,
+        "dry_run": a.dry_run,
+        "committed": s.committed,
+        "version": s.version,
+        "already_anchored": s.already_anchored,
+        "from": s.from,
+        "to": s.to,
+        "table_uuid": s.table_uuid,
+        "new_uuid": s.new_uuid,
+        "undecided": s.undecided,
+        "snapshots": s.snapshots,
+        "rewritten": {
+            "manifest_lists": s.manifest_lists_rewritten,
+            "manifests": s.manifests_rewritten,
+            "delete_files": s.delete_files_rewritten,
+        },
+        "data_files": s.data_files,
+        "files_outside_table": s.files_outside_table,
+        "superseded": {
+            "files": s.superseded,
+            "deleted": s.superseded_deleted,
+            "not_deleted": s.superseded_not_deleted,
+        },
+        "metadata": s.metadata,
+        "catalog": a.catalog.as_ref().map(|uri| serde_json::json!({
+            "uri": uri,
+            "table": a.register_as,
+            "warehouse": a.warehouse,
+            // null in a dry run: nothing was registered.
+            "registered": registered,
+        })),
+    })
+}
+
+fn print_relocate(
+    a: &RelocateArgs,
+    s: &shapeshift_iceberg::RelocateSummary,
+    registered: Option<bool>,
+) {
+    let catalog = || {
+        let (Some(uri), Some(name)) = (&a.catalog, &a.register_as) else {
+            return;
+        };
+        match registered {
+            Some(true) => println!(
+                "  registered {name} with the catalog at {uri} ({})",
+                s.metadata
+            ),
+            Some(false) => println!(
+                "  {name} was already registered with the catalog at {uri}, at {}",
+                s.metadata
+            ),
+            None => println!(
+                "  would register {name} with the catalog at {uri} ({})",
+                s.metadata
+            ),
+        }
+    };
+    if s.already_anchored {
+        println!(
+            "{} is already anchored where it is ({}): nothing to relocate",
+            a.table, s.to
+        );
+        catalog();
+        return;
+    }
+    let (relocate, rewrite, remove) = if a.dry_run {
+        ("would relocate", "would rewrite", "would remove")
+    } else {
+        ("relocated", "rewrote", "removed")
+    };
+    println!(
+        "{relocate} {}: {} → {} ({} snapshot(s) kept{}){}",
+        a.table,
+        s.from,
+        s.to,
+        s.snapshots,
+        if s.new_uuid {
+            format!("; a copy, new table-uuid {}", s.table_uuid)
+        } else {
+            String::new()
+        },
+        if a.dry_run {
+            " (dry run: nothing changed)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  {rewrite} {} manifest list(s), {} manifest(s), {} delete file(s); {} data file(s) \
+         unchanged",
+        s.manifest_lists_rewritten, s.manifests_rewritten, s.delete_files_rewritten, s.data_files
+    );
+    let removed = if a.dry_run {
+        s.superseded
+    } else {
+        s.superseded_deleted
+    };
+    if removed > 0 {
+        println!("  {remove} {removed} superseded metadata and delete file(s)");
+    }
+    if s.files_outside_table > 0 {
+        println!(
+            "  left {} file(s) as recorded: their paths are outside every place the table \
+             was written at",
+            s.files_outside_table
+        );
+    }
+    if s.superseded_not_deleted > 0 {
+        println!(
+            "  warning: {} superseded file(s) could not be removed; nothing names them any \
+             more",
+            s.superseded_not_deleted
+        );
+    }
+    catalog();
+    if let Some(why) = &s.undecided {
+        println!(
+            "  note: {why}; a real run needs --moved (the original is being retired) or \
+             --copy (both live on)"
+        );
+    }
+}
+
 /// In a dry run, `deleted` counts what a real run would delete.
 fn expire_json(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) -> Value {
     serde_json::json!({
@@ -1816,6 +2717,8 @@ fn expire_json(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) -> Value {
         "command": "expire",
         "ok": true,
         "table": a.table,
+        "catalog": a.catalog,
+        "warehouse": a.warehouse,
         "dry_run": a.dry_run,
         "committed": s.committed,
         "version": s.version,

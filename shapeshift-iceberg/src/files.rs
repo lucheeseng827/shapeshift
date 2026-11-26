@@ -41,10 +41,39 @@ use parquet::schema::types::SchemaDescriptor;
 
 use shapeshift_core::{Result, SchemaRef, ShapeError};
 
-use crate::reanchor;
+use crate::anchor::Anchors;
 
 fn err(e: impl std::fmt::Display) -> ShapeError {
     ShapeError::Sink(e.to_string())
+}
+
+/// A data or delete file's rows failed to decode. When the reason is a Parquet codec this
+/// build was compiled without, say so and which build reads it: zstd is the default of
+/// PyIceberg and of Iceberg's Java writers since 1.4, and the lean binary leaves it out to
+/// stay free of C code. Any other failure is reported as it came, with the file's path.
+pub(crate) fn batch_err(path: &str, e: impl std::fmt::Display) -> ShapeError {
+    let text = e.to_string();
+    // parquet 54's wording (`compression::create_codec`); its test pins it, so a parquet
+    // upgrade that rewords it fails there rather than silently losing the explanation.
+    let Some(codec) = text.split("Disabled feature at compile time: ").nth(1) else {
+        return err(format!("{path}: {text}"));
+    };
+    let codec: String = codec
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    err(if codec == "zstd" {
+        format!(
+            "{path} is zstd-compressed Parquet (the default of PyIceberg and of Iceberg's \
+             Java writers since 1.4), and this build reads only uncompressed and Snappy \
+             Parquet. Reading it takes a build with `--features zstd`"
+        )
+    } else {
+        format!(
+            "{path} is Parquet compressed with `{codec}`, which this build does not read \
+             (it reads uncompressed and Snappy Parquet, and zstd with `--features zstd`)"
+        )
+    })
 }
 
 /// Read access to a table's existing files. Every `path` is a file's path exactly as the
@@ -398,26 +427,32 @@ pub(crate) fn read_ahead<'a, F: TableFiles>(
     })
 }
 
-/// A local table's files. Paths recorded against an older `location` (a moved or copied
-/// table) are re-anchored to the table's current directory.
+/// A local table's files. A path recorded under any directory the table has lived at (its
+/// [`Anchors`]: a moved or copied table, or one moved, written to and moved again) is read
+/// at the same key under the table's current directory.
 pub struct LocalTableFiles {
     dir: PathBuf,
-    location: String,
+    anchors: Anchors,
 }
 
 impl LocalTableFiles {
-    /// `dir` is where the table is now; `location` is the `location` its metadata
-    /// records (what its file paths were written against).
-    pub fn new(dir: impl AsRef<Path>, location: impl Into<String>) -> Self {
+    /// `dir` is where the table is now; `anchors` are the directories its file paths were
+    /// written against ([`Anchors::of`] its metadata).
+    pub fn new(dir: impl AsRef<Path>, anchors: Anchors) -> Self {
         LocalTableFiles {
             dir: dir.as_ref().to_path_buf(),
-            location: location.into(),
+            anchors,
         }
     }
 
-    /// The local path a recorded file path resolves to.
-    pub fn resolve(&self, path: &str) -> PathBuf {
-        reanchor(&self.dir, &self.location, path)
+    /// The local path a recorded file path resolves to: under the table's directory for a
+    /// path under one of its anchors, else the path as recorded. A path that would lead out
+    /// of the table is refused (see [`Anchors::key`]).
+    pub fn resolve(&self, path: &str) -> Result<PathBuf> {
+        Ok(match self.anchors.key(path)? {
+            Some(key) => self.dir.join(key),
+            None => PathBuf::from(path),
+        })
     }
 }
 
@@ -427,19 +462,19 @@ impl TableFiles for LocalTableFiles {
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         std::fs::read(&p).map_err(|e| err(format!("{}: {e}", p.display())))
     }
 
     fn size(&self, path: &str) -> Result<u64> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         Ok(std::fs::metadata(&p)
             .map_err(|e| err(format!("{}: {e}", p.display())))?
             .len())
     }
 
     fn read_ranges(&self, path: &str, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         let mut f = std::fs::File::open(&p).map_err(|e| err(format!("{}: {e}", p.display())))?;
         ranges
             .iter()
@@ -598,6 +633,11 @@ impl<'a, F: TableFiles> RangedParquet<'a, F> {
         self.meta.metadata().num_row_groups()
     }
 
+    /// The file's own key-value metadata (an engine's `iceberg.schema`, the Arrow schema).
+    pub fn key_value_metadata(&self) -> Option<&Vec<parquet::file::metadata::KeyValue>> {
+        self.meta.metadata().file_metadata().key_value_metadata()
+    }
+
     /// Bytes the footer's read keeps in memory for as long as the file is open.
     pub fn footer_bytes(&self) -> u64 {
         self.footer
@@ -704,6 +744,49 @@ mod tests {
     }
 
     #[test]
+    fn a_codec_this_build_lacks_is_named_with_the_build_that_reads_it() {
+        // What parquet says when a codec was left out at compile time.
+        let zstd = "Parquet argument error: Parquet error: Disabled feature at compile time: zstd";
+        let e = batch_err("s3://b/t/data/a.parquet", zstd).to_string();
+        assert!(
+            e.contains("s3://b/t/data/a.parquet is zstd-compressed")
+                && e.contains("`--features zstd`"),
+            "{e}"
+        );
+        let e = batch_err("a.parquet", "Disabled feature at compile time: brotli").to_string();
+        assert!(e.contains("compressed with `brotli`"), "{e}");
+        // Any other failure is passed on as it was, with the file named.
+        let e = batch_err("a.parquet", "EOF: unexpected end").to_string();
+        assert!(e.contains("a.parquet: EOF: unexpected end"), "{e}");
+    }
+
+    /// parquet's own words for a codec left out, as this build gets them: a parquet upgrade
+    /// that rewords them fails here instead of quietly losing the explanation.
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn parquets_own_error_for_a_missing_codec_is_explained() {
+        use parquet::basic::{Compression, ZstdLevel};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
+        // The writer meets the missing codec as the reader does, in `create_codec`, and
+        // panics with its error rather than returning it; the message is what is pinned.
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut w = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+            w.write(&batch).and_then(|_| w.close().map(drop))
+        }));
+        let text = match failed {
+            Ok(r) => format!("{:?}", r.expect_err("zstd is not in this build")),
+            Err(panic) => panic.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        let e = batch_err("t/data/a.parquet", text).to_string();
+        assert!(e.contains("is zstd-compressed Parquet"), "{e}");
+    }
+
+    #[test]
     fn a_projected_read_fetches_the_footer_and_only_the_projected_chunks() {
         // A narrow key column next to a wide payload, in three row groups.
         let path = tmp("ranged.parquet");
@@ -737,7 +820,7 @@ mod tests {
         w.close().unwrap();
         let file_size = std::fs::metadata(&path).unwrap().len();
 
-        let local = LocalTableFiles::new("/", "");
+        let local = LocalTableFiles::new("/", Anchors::default());
         let files = Counting::new(&local);
         let p = path.to_string_lossy().into_owned();
         let pq = RangedParquet::open(&files, &p, None).unwrap();
@@ -833,7 +916,7 @@ mod tests {
                 .unwrap()
                 .map(|b| b.unwrap())
                 .collect();
-        let local = LocalTableFiles::new("/", "");
+        let local = LocalTableFiles::new("/", Anchors::default());
         let p = path.to_string_lossy().into_owned();
         let pq = RangedParquet::open(&local, &p, None).unwrap();
         let mut got = Vec::new();
@@ -926,7 +1009,7 @@ mod tests {
         .unwrap();
         w.close().unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
-        let local = LocalTableFiles::new("/", "");
+        let local = LocalTableFiles::new("/", Anchors::default());
         let p = path.to_string_lossy().into_owned();
         let rows = |pq: &RangedParquet<Counting>| -> usize {
             let mask = ProjectionMask::all();
@@ -1102,7 +1185,7 @@ mod tests {
     fn read_with(readers: usize, paths: &[String], budget: u64) -> (Seen, usize, usize) {
         let paths = paths.to_vec();
         within(move || {
-            let local = LocalTableFiles::new("/", "");
+            let local = LocalTableFiles::new("/", Anchors::default());
             let files = Slow::new(&local, readers);
             let seen = read_all(&files, &paths, budget).unwrap();
             (seen, files.max.load(Ordering::SeqCst), readers_for(&files))
@@ -1174,7 +1257,7 @@ mod tests {
         let run = |readers: usize, give_up_at: Option<usize>| {
             let paths = paths.clone();
             within(move || {
-                let local = LocalTableFiles::new("/", "");
+                let local = LocalTableFiles::new("/", Anchors::default());
                 let inputs: Vec<(&str, Option<u64>)> =
                     paths.iter().map(|p| (p.as_str(), None)).collect();
                 let mut seen = Vec::new();
@@ -1218,7 +1301,7 @@ mod tests {
         let paths = parquet_files("ahead-cp", &[2000, 3000, 4000, 5000, 1000, 2000], 1000);
         let all = paths.clone();
         let outcome = within(move || {
-            let local = LocalTableFiles::new("/", "");
+            let local = LocalTableFiles::new("/", Anchors::default());
             let inputs: Vec<(&str, Option<u64>)> =
                 paths.iter().map(|p| (p.as_str(), None)).collect();
             read_ahead(
@@ -1248,7 +1331,7 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        let local = LocalTableFiles::new("/", "");
+        let local = LocalTableFiles::new("/", Anchors::default());
         let pq = RangedParquet::open(&local, &path, None).unwrap();
         assert_eq!(pq.num_row_groups(), 3000);
         let kept = pq.footer_bytes();
@@ -1276,7 +1359,7 @@ mod tests {
         paths[1] = bad.to_string_lossy().into_owned();
         let all = paths.clone();
         let outcome = within(move || {
-            let local = LocalTableFiles::new("/", "");
+            let local = LocalTableFiles::new("/", Anchors::default());
             read_all(&Slow::new(&local, 4), &paths, READ_AHEAD_BYTES)
         });
         assert!(outcome.is_err(), "the reader's panic reaches the caller");

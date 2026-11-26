@@ -90,6 +90,7 @@ pub struct MetadataInput<'a> {
     /// `metadata-log` predecessor. The next version continues from the current one, so a
     /// reader looking past the version hint can tell a successor from a leftover.
     pub replaces_metadata_file: Option<&'a str>,
+    pub tags: &'a SnapshotTags,
 }
 
 /// The row and file counts one snapshot's summary records. Data and delete files are
@@ -116,10 +117,88 @@ pub struct SnapshotCounts {
     pub replace: bool,
 }
 
+/// The snapshot summary key naming the run that wrote a snapshot (see [`SnapshotTags`]).
+pub const RUN_ID_KEY: &str = "shapeshift.run-id";
+/// The snapshot summary key naming the shapeshift version that wrote a snapshot.
+pub const VERSION_KEY: &str = "shapeshift.version";
+/// The snapshot summary key counting how many times a catalog append was built again onto
+/// a newer head before this snapshot landed. Absent when it landed as first built.
+pub const REBASES_KEY: &str = "shapeshift.rebases";
+
+/// What a snapshot records about the write itself, beside its counts: the run it belongs to
+/// when the caller names one, and how many times it was rebuilt onto a newer head. Every
+/// snapshot also records the shapeshift version that wrote it. All three are ordinary
+/// summary properties, which any Iceberg reader shows and ignores.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotTags {
+    /// The caller's id for this run (`shape --run-id`). An orchestrator gives the same id
+    /// to every attempt of one run, so an attempt can tell that an earlier one already
+    /// committed (see [`snapshot_of_run`]).
+    pub run_id: Option<String>,
+    pub rebases: u32,
+}
+
+/// The longest run id accepted.
+pub const RUN_ID_MAX: usize = 128;
+
+/// Check a run id: 1 to [`RUN_ID_MAX`] characters, each an ASCII letter, a digit, or one of
+/// `.` `_` `:` `-`, so it reads the same in a summary, a log line and a URL.
+pub fn validate_run_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= RUN_ID_MAX
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ShapeError::Spec(format!(
+            "run id `{id}` is not usable: use 1 to {RUN_ID_MAX} characters, each a letter, a \
+             digit, `.`, `_`, `:` or `-`"
+        )))
+    }
+}
+
+/// A snapshot that a run committed, found by its run id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSnapshot {
+    pub snapshot_id: i64,
+    pub sequence_number: i64,
+    pub timestamp_ms: i64,
+    /// Its `shapeshift.rebases`, 0 when absent.
+    pub rebases: u32,
+}
+
+/// The snapshot in this table's history that run `run_id` committed, if any. An attempt
+/// that finds one must not commit again: the table already took this run's commit.
+///
+/// Any snapshot still in the history counts, on `main` or not. A rollback that took `main`
+/// back past the run is a decision to take its rows off `main`, and a retry of the same run
+/// must not undo it: that retry finds the snapshot and commits nothing, and the rows stay
+/// off `main` (a run started again with a new run id writes them again). An expiry that
+/// removed the snapshot also removes the record (retention is days; a retry comes within
+/// minutes).
+pub fn snapshot_of_run(meta: &Value, run_id: &str) -> Option<RunSnapshot> {
+    meta["snapshots"].as_array()?.iter().find_map(|s| {
+        if s["summary"][RUN_ID_KEY].as_str() != Some(run_id) {
+            return None;
+        }
+        Some(RunSnapshot {
+            snapshot_id: s["snapshot-id"].as_i64()?,
+            sequence_number: s["sequence-number"].as_i64().unwrap_or(0),
+            timestamp_ms: s["timestamp-ms"].as_i64().unwrap_or(0),
+            rebases: s["summary"][REBASES_KEY]
+                .as_str()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(0),
+        })
+    })
+}
+
 /// The snapshot `summary`. A compaction is a `replace`: the rows stay the same, only the
 /// files holding them change. A snapshot that deletes rows is an `overwrite` — the
 /// operation Iceberg names for one that both adds and removes — otherwise an `append`.
-fn summary_json(c: &SnapshotCounts) -> Value {
+fn summary_json(c: &SnapshotCounts, tags: &SnapshotTags) -> Value {
     let operation = if c.replace {
         "replace"
     } else if c.added_position_deletes > 0 {
@@ -151,6 +230,13 @@ fn summary_json(c: &SnapshotCounts) -> Value {
         summary["removed-position-delete-files"] = json!(c.removed_delete_files.to_string());
         summary["removed-position-deletes"] = json!(c.removed_position_deletes.to_string());
     }
+    summary[VERSION_KEY] = json!(env!("CARGO_PKG_VERSION"));
+    if let Some(id) = &tags.run_id {
+        summary[RUN_ID_KEY] = json!(id);
+    }
+    if tags.rebases > 0 {
+        summary[REBASES_KEY] = json!(tags.rebases.to_string());
+    }
     summary
 }
 
@@ -160,7 +246,7 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
         return Err(ShapeError::Sink("iceberg table has no columns".into()));
     }
     let schema = schema_json(inp.fields);
-    let summary = summary_json(&inp.counts);
+    let summary = summary_json(&inp.counts, inp.tags);
     let snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,
@@ -217,6 +303,7 @@ pub struct AppendInput<'a> {
     /// columns — a new schema object is appended and `current-schema-id` /
     /// `last-column-id` advance; otherwise the prior schema is carried forward.
     pub schema_fields: &'a [IceField],
+    pub tags: &'a SnapshotTags,
 }
 
 /// Append a new snapshot onto the prior table metadata: add the snapshot, advance the
@@ -237,10 +324,11 @@ pub fn append_snapshot(inp: &AppendInput) -> Result<Value> {
             "prior iceberg metadata is not a JSON object".into(),
         ));
     }
-    let parent = m["current-snapshot-id"].as_i64();
+    // A table a catalog created empty has no snapshot: the Java catalog writes `-1`.
+    let parent = m["current-snapshot-id"].as_i64().filter(|&id| id != -1);
     let schema_id = advance_schema(&mut m, inp.schema_fields)?;
 
-    let summary = summary_json(&inp.counts);
+    let summary = summary_json(&inp.counts, inp.tags);
     let mut snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,
@@ -420,4 +508,39 @@ fn advance_schema(m: &mut Value, fields: &[IceField]) -> Result<i64> {
     let last = m["last-column-id"].as_i64().unwrap_or(0).max(max_field_id);
     m["last-column-id"] = json!(last);
     Ok(next_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_is_found_in_the_history_even_after_main_was_rolled_back_past_it() {
+        let snap = |id: i64, parent: Option<i64>, run: Option<&str>| {
+            let mut summary = json!({ "operation": "append" });
+            if let Some(run) = run {
+                summary[RUN_ID_KEY] = json!(run);
+                summary[REBASES_KEY] = json!("2");
+            }
+            json!({ "snapshot-id": id, "parent-snapshot-id": parent, "sequence-number": id,
+                    "timestamp-ms": id * 10, "summary": summary })
+        };
+        let mut meta = json!({
+            "snapshots": [snap(1, None, None), snap(2, Some(1), Some("r-7"))],
+            "refs": { "main": { "snapshot-id": 2, "type": "branch" } },
+        });
+        let found = snapshot_of_run(&meta, "r-7").unwrap();
+        assert_eq!((found.snapshot_id, found.rebases), (2, 2));
+        // Rolled back to 1: the run's snapshot is off main but retained, and a retry of the
+        // run still finds it rather than committing the rows again.
+        meta["refs"]["main"]["snapshot-id"] = json!(1);
+        assert_eq!(
+            snapshot_of_run(&meta, "r-7").map(|f| f.snapshot_id),
+            Some(2)
+        );
+        assert_eq!(snapshot_of_run(&meta, "r-8"), None);
+        // Expired: no record.
+        meta["snapshots"] = json!([snap(1, None, None)]);
+        assert_eq!(snapshot_of_run(&meta, "r-7"), None);
+    }
 }

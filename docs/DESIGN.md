@@ -291,8 +291,8 @@ output path — same input, same spec, same table. There is no partial-commit st
 > v0.1 honesty: file paths inside the metadata are **absolute**, so moving the directory breaks the
 > references for a *default* reader — but DuckDB reads a moved/copied table in place with
 > `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and multi-snapshot
-> tables). Appends now ship; catalog-managed relocation (re-anchoring paths so any engine reads with
-> no reader flag) is left to an external Iceberg REST catalog. All additive; none of it changes the engine.
+> tables). Appends now ship, and `shapeshift relocate` (0.5) re-anchors a moved table so any engine
+> reads it with no reader flag. All additive; none of it changes the engine.
 
 ---
 
@@ -455,7 +455,7 @@ The forward-looking ones are roadmap; the rest are permanent boundaries.
 |---|---|---|
 | Append-to-existing / multi-snapshot Iceberg | shipped: `--append` chains a new snapshot onto an existing table (reads prior metadata + manifest list, carries manifests forward, bumps version) | ✅ done — row-level **upsert** shipped in 0.3 (`--merge-on`: single writer, Iceberg v2 position deletes); CDC *capture* stays out of scope (last row) |
 | Partitioning (identity + hidden transforms) | shipped: `--partition-by` accepts columns and transform expressions (`bucket(N, col)` with spec-exact Murmur3, `truncate(W, col)`, `year\|month\|day\|hour(col)`); the spec records the real transform strings, rows fan out per **transformed** value, and the manifest partition tuple stores the transform's result type | ✅ done |
-| Object-store output (S3/GCS/Azure) | shipped for **both Parquet and Iceberg** via `shapeshift-objstore` (a new `Sink` crate, opt-in behind the CLI's `object_store` feature) | ✅ done — a moved table reads with `allow_moved_paths=true`; only **catalog-managed** relocation + multi-writer is left to an external **REST catalog** |
+| Object-store output (S3/GCS/Azure) | shipped for **both Parquet and Iceberg** via `shapeshift-objstore` (a new `Sink` crate, opt-in behind the CLI's `object_store` feature) | ✅ done — a moved table reads with `allow_moved_paths=true`; only **catalog-managed** relocation is left to an external **REST catalog**, which `--catalog` commits through from 0.5 |
 | `zstd` compression | not linked **by default** — it would pull a C codec and break the musl-static single binary; the lean binary gives a **clear error** | ✅ opt-in: `cargo build --features zstd` (the fat build) enables it for Parquet + Iceberg; otherwise `snappy` (default) / `uncompressed` |
 | Streaming json-array input | shipped: `JsonArrayReader` streams one element at a time (a depth- and string-aware boundary scanner, same per-record byte cap as JSONL) | ✅ done — both input formats are bounded-RAM streaming paths |
 | Incremental / CDC, scheduling, connectors, metering | the moment runs relate or must be operated, you need an orchestrator — a different product with different failure modes | an orchestrator (such as **dagron**) |

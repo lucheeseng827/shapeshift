@@ -89,8 +89,8 @@ cp scripts/env.example scripts/.env    # then `source scripts/.env`
 > **Where shapeshift stops.** It writes **append-only** snapshots — no merge/upsert, no
 > CDC state machine, no scheduler. The demos handle deletes/updates the lakehouse way
 > (append the change events, resolve latest-per-key at read time or in a downstream
-> `MERGE`). Connectors, incremental capture, multi-writer catalog commits, and
-> copy-anywhere relocation are out of scope — see the
+> `MERGE`). Connectors, incremental capture and multi-writer catalog commits are out of
+> scope — see the
 > [README](../../README.md) "What shapeshift is NOT" and the [ROADMAP](../../ROADMAP.md).
 
 © 2026 Nicholas Lu Chee Seng and the shapeshift contributors — Apache-2.0.

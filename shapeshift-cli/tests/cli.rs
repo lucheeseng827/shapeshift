@@ -5,6 +5,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde_json::json;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_shapeshift")
 }
@@ -95,6 +97,609 @@ fn shape_to_iceberg_produces_table() {
     assert!(out_s.contains("format-version: 2"));
     assert!(out_s.contains("total-records: 3"));
 
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_catalog_takes_the_place_of_the_output_path() {
+    let d = workdir("catalog");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec!["shape", "--input", input.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let out = Command::new(bin()).args(&args).output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // The catalog names the table's location, so --output conflicts with it, and the two
+    // catalog flags come together.
+    let (code, err) = run(&[
+        "--catalog",
+        "http://127.0.0.1:1",
+        "--table",
+        "a.t",
+        "-o",
+        "x",
+    ]);
+    assert_eq!(code, Some(2), "{err}");
+    let (code, err) = run(&["--table", "a.t", "-o", "x"]);
+    assert_eq!(code, Some(2), "{err}");
+    // Without --output it is accepted, as an Iceberg table. The default build has no
+    // catalog client and says so; a build with one fails to reach this catalog.
+    let (code, err) = run(&["--catalog", "http://127.0.0.1:1", "--table", "a.t"]);
+    assert_eq!(code, Some(1), "{err}");
+    let expected = if cfg!(feature = "object_store") {
+        "could not reach the catalog"
+    } else {
+        "needs a build with `--features object_store`"
+    };
+    assert!(err.contains(expected), "{err}");
+    // An explicit --to parquet is refused rather than silently changed.
+    let (code, err) = run(&[
+        "--catalog",
+        "http://127.0.0.1:1",
+        "--table",
+        "a.t",
+        "--to",
+        "parquet",
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("`output.catalog` applies only to Iceberg tables"),
+        "{err}"
+    );
+    // A merge goes through the catalog too (it was refused before the catalog was reached).
+    let (code, err) = run(&[
+        "--catalog",
+        "http://127.0.0.1:1",
+        "--table",
+        "a.t",
+        "--merge-on",
+        "id",
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(expected), "{err}");
+    // `compact` and `expire` take --catalog, with the table named `<namespace>.<name>`; a
+    // summary still comes out as JSON when the catalog cannot be reached.
+    for cmd in ["compact", "expire"] {
+        let out = Command::new(bin())
+            .args([
+                cmd,
+                "--catalog",
+                "http://127.0.0.1:1",
+                "a.t",
+                "--summary-json",
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{cmd}: {err}");
+        assert!(err.contains(expected), "{cmd}: {err}");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!((&doc["command"], &doc["ok"]), (&json!(cmd), &json!(false)));
+    }
+    fs::remove_dir_all(&d).ok();
+}
+
+/// A table moved after it was written says so in `inspect`, and a write into it warns, since
+/// other engines' default readers look for its files where it was. shapeshift itself reads
+/// and writes it where it is.
+#[test]
+fn a_moved_table_says_so_and_a_write_into_it_warns() {
+    let d = workdir("moved");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+    let (a, b) = (d.join("a"), d.join("b"));
+    let run = |args: &[&str]| {
+        let out = Command::new(bin()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (i, at) = (input.to_str().unwrap(), a.to_str().unwrap());
+    run(&["shape", "-i", i, "-o", at, "--to", "iceberg"]);
+    let (out, _) = run(&["inspect", at]);
+    assert!(!out.contains("moved:"), "{out}");
+    let (_, err) = run(&["shape", "-i", i, "-o", at, "--to", "iceberg", "--append"]);
+    assert!(!err.contains("not where its metadata says"), "{err}");
+
+    fs::rename(&a, &b).unwrap();
+    let to = b.to_str().unwrap();
+    let (out, _) = run(&["inspect", to]);
+    assert!(
+        out.contains("moved: its metadata says it is at") && out.contains(at),
+        "{out}"
+    );
+    assert!(out.contains("total-records: 4"), "{out}");
+    let (_, err) = run(&["shape", "-i", i, "-o", to, "--to", "iceberg", "--append"]);
+    assert!(
+        err.contains("the table is not where its metadata says"),
+        "{err}"
+    );
+    let (out, _) = run(&["inspect", to]);
+    assert!(out.contains("total-records: 6"), "{out}");
+    fs::remove_dir_all(&d).ok();
+}
+
+/// `relocate`: a copy whose original still answers is refused until named one (exit 1, the
+/// way out in the message); `--dry-run` changes nothing; `--copy` re-anchors it with a new
+/// identity, reported in `--summary-json`; `inspect` stops saying it moved; a second run
+/// has nothing to do.
+#[test]
+fn relocate_reanchors_a_copied_table() {
+    let d = workdir("relocate");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1,\"v\":1}\n{\"id\":2,\"v\":2}\n").unwrap();
+    let again = d.join("again.jsonl");
+    fs::write(&again, "{\"id\":2,\"v\":20}\n").unwrap();
+    let (a, b) = (d.join("a"), d.join("b"));
+    let run = |args: &[&str]| {
+        let out = Command::new(bin()).args(args).output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let at = a.to_str().unwrap();
+    for i in [&input, &again] {
+        let (code, _, err) = run(&[
+            "shape",
+            "-i",
+            i.to_str().unwrap(),
+            "-o",
+            at,
+            "--to",
+            "iceberg",
+            "--merge-on",
+            "id",
+        ]);
+        assert_eq!(code, Some(0), "{err}");
+    }
+    let cp = Command::new("cp")
+        .args(["-r", at, b.to_str().unwrap()])
+        .status();
+    assert!(cp.unwrap().success());
+    let to = b.to_str().unwrap();
+
+    let (code, _, err) = run(&["relocate", to]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("still answers at") && err.contains("--copy"),
+        "{err}"
+    );
+    let (code, out, err) = run(&["relocate", to, "--dry-run"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.contains("would relocate") && out.contains("dry run"),
+        "{out}"
+    );
+    assert!(out.contains("a real run needs --moved"), "{out}");
+    let (_, out, _) = run(&["inspect", to]);
+    assert!(out.contains("moved:"), "a dry run changes nothing: {out}");
+    // Registering takes a catalog and a name together; a dry run registers nothing, so it
+    // reaches no catalog (none listens on port 1) and says what it would register.
+    let (code, _, err) = run(&["relocate", to, "--table", "lake.t"]);
+    assert_eq!(code, Some(2), "{err}");
+    let (code, _, err) = run(&["relocate", to, "--catalog", "http://127.0.0.1:1"]);
+    assert_eq!(code, Some(2), "{err}");
+    let (code, out, err) = run(&[
+        "relocate",
+        to,
+        "--dry-run",
+        "--copy",
+        "--catalog",
+        "http://127.0.0.1:1",
+        "--table",
+        "lake.t",
+    ]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.contains("would register lake.t with the catalog at http://127.0.0.1:1"),
+        "{out}"
+    );
+    // Credentials in the catalog URI: refused before anything runs, a dry run included, and
+    // never printed.
+    let (code, out, err) = run(&[
+        "relocate",
+        to,
+        "--dry-run",
+        "--copy",
+        "--catalog",
+        "http://reader:s3cr3t@127.0.0.1:1",
+        "--table",
+        "lake.t",
+    ]);
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains("carries credentials"), "{err}");
+    assert!(
+        !out.contains("s3cr3t") && !err.contains("s3cr3t"),
+        "{out}{err}"
+    );
+
+    let (code, out, err) = run(&["relocate", to, "--copy", "--summary-json"]);
+    assert_eq!(code, Some(0), "{err}");
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(doc["command"], "relocate");
+    assert_eq!(doc["committed"], true);
+    assert_eq!(doc["new_uuid"], true);
+    assert_eq!(doc["to"], b.canonicalize().unwrap().to_str().unwrap());
+    assert_eq!(doc["snapshots"], 2);
+    assert!(
+        doc["rewritten"]["delete_files"].as_u64().unwrap() > 0,
+        "{doc}"
+    );
+    assert_eq!(doc["superseded"]["not_deleted"], 0);
+    let (_, out, _) = run(&["inspect", to]);
+    assert!(!out.contains("moved:"), "{out}");
+    assert!(out.contains("live-records: 2"), "{out}");
+
+    let (code, out, _) = run(&["relocate", to]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("already anchored where it is"), "{out}");
+    let (code, _, err) = run(&["relocate", to, "--moved", "--copy"]);
+    assert_eq!(code, Some(2), "{err}");
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn catalog_credentials_come_from_the_environment_never_the_spec() {
+    let d = workdir("catalog-auth");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let spec = d.join("s.yaml");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = Command::new(bin());
+        cmd.args(args)
+            .env_remove("SHAPESHIFT_CATALOG_TOKEN")
+            .env_remove("SHAPESHIFT_CATALOG_CREDENTIAL")
+            .env_remove("SHAPESHIFT_CATALOG_OAUTH2_SERVER_URI")
+            .env_remove("SHAPESHIFT_CATALOG_SCOPE");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // A token written into a spec is refused, and the error says where it goes instead.
+    fs::write(
+        &spec,
+        "dataset: s\noutput:\n  format: iceberg\n  catalog:\n    uri: http://127.0.0.1:1\n    \
+         table: a.t\n    token: do-not-commit-me\n",
+    )
+    .unwrap();
+    let (code, err) = run(
+        &[
+            "shape",
+            "-s",
+            spec.to_str().unwrap(),
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("unknown field `token`")
+            && err.contains("never go in a spec")
+            && err.contains("SHAPESHIFT_CATALOG_TOKEN"),
+        "{err}"
+    );
+
+    // --warehouse belongs to a catalog.
+    let out = d.join("o.parquet");
+    let (code, err) = run(
+        &[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--warehouse",
+            "w",
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("--warehouse names a warehouse of a REST catalog"),
+        "{err}"
+    );
+    let (code, err) = run(&["compact", "a.t", "--warehouse", "w"], &[]);
+    assert_eq!(code, Some(2), "{err}");
+    // So does --insecure-catalog.
+    let (code, err) = run(
+        &[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--insecure-catalog",
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("writes to no catalog"), "{err}");
+    let (code, err) = run(&["expire", "a.t", "--insecure-catalog"], &[]);
+    assert_eq!(code, Some(2), "{err}");
+
+    let catalog = [
+        "--catalog",
+        "http://127.0.0.1:1",
+        "--table",
+        "a.t",
+        "--warehouse",
+        "w",
+    ];
+    let mut shape = vec!["shape", "-i", input.to_str().unwrap()];
+    shape.extend_from_slice(&catalog);
+    if cfg!(feature = "object_store") {
+        // Two kinds of credentials at once is a mistake, refused before any request.
+        let (code, err) = run(
+            &shape,
+            &[
+                ("SHAPESHIFT_CATALOG_TOKEN", "tok-value"),
+                ("SHAPESHIFT_CATALOG_CREDENTIAL", "id:secret-value"),
+            ],
+        );
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("set one"), "{err}");
+        // A token is used, and never shown.
+        let (code, err) = run(&shape, &[("SHAPESHIFT_CATALOG_TOKEN", "tok-value")]);
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("could not reach the catalog"), "{err}");
+        assert!(!err.contains("tok-value"), "{err}");
+        // Not over plain http to another machine, unless the run asks for the insecure
+        // mode in so many words (and then it is warned about). Likewise for compact and
+        // expire.
+        let token = [("SHAPESHIFT_CATALOG_TOKEN", "tok-value")];
+        let away = "http://catalog.invalid:8181";
+        let mut shape_away = vec!["shape", "-i", input.to_str().unwrap()];
+        shape_away.extend_from_slice(&["--catalog", away, "--table", "a.t"]);
+        for args in [
+            shape_away,
+            vec!["compact", "a.t", "--catalog", away],
+            vec!["expire", "a.t", "--catalog", away],
+        ] {
+            let (code, err) = run(&args, &token);
+            assert_eq!(code, Some(1), "{args:?}: {err}");
+            assert!(
+                err.contains("refusing to send catalog credentials over plain http")
+                    && err.contains("--insecure-catalog"),
+                "{args:?}: {err}"
+            );
+            assert!(!err.contains("tok-value"), "{err}");
+            let insecure = [args.as_slice(), &["--insecure-catalog"]].concat();
+            let (code, err) = run(&insecure, &token);
+            assert_eq!(code, Some(1), "{args:?}: {err}");
+            assert!(!err.contains("refusing"), "{args:?}: {err}");
+            assert!(
+                err.contains("sending catalog credentials over plain http"),
+                "a warning: {args:?}: {err}"
+            );
+            assert!(!err.contains("tok-value"), "{err}");
+        }
+    } else {
+        let (code, err) = run(&shape, &[("SHAPESHIFT_CATALOG_TOKEN", "tok-value")]);
+        assert_eq!(code, Some(1), "{err}");
+        assert!(
+            err.contains("needs a build with `--features object_store`"),
+            "{err}"
+        );
+    }
+    fs::remove_dir_all(&d).ok();
+}
+
+/// On a system with no CA certificates, the HTTP clients cannot start. A catalog run and an
+/// object-store run both say so, and what to do, rather than "builder error". (The system's
+/// roots are hidden with SSL_CERT_FILE and SSL_CERT_DIR, which the TLS setup reads on Linux;
+/// macOS and Windows verify against the system's own store and ignore them.) The remedy the
+/// message gives, SSL_CERT_FILE pointed at a bundle, lets the run reach the catalog.
+#[cfg(all(feature = "object_store", target_os = "linux"))]
+#[test]
+fn a_system_without_ca_certificates_is_named_as_the_cause() {
+    let d = workdir("no-ca-certs");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let empty = d.join("no-certs");
+    fs::create_dir_all(&empty).unwrap();
+    let input = input.to_str().unwrap();
+    for args in [
+        vec![
+            "shape",
+            "-i",
+            input,
+            "--catalog",
+            "http://127.0.0.1:1",
+            "--table",
+            "lake.t",
+        ],
+        vec![
+            "shape",
+            "-i",
+            input,
+            "-o",
+            "s3://bucket/t",
+            "--to",
+            "iceberg",
+        ],
+    ] {
+        // Only these variables: none of the caller's (an AWS_PROFILE, an AWS_ENDPOINT) can
+        // steer the run.
+        let out = Command::new(bin())
+            .args(&args)
+            .env_clear()
+            .env("SSL_CERT_FILE", "/dev/null")
+            .env("SSL_CERT_DIR", &empty)
+            .env("RUST_LOG", "off")
+            .env("AWS_ACCESS_KEY_ID", "x")
+            .env("AWS_SECRET_ACCESS_KEY", "y")
+            .env("AWS_REGION", "us-east-1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            err.contains("no CA certificates were found") && err.contains("ca-certificates"),
+            "{args:?}: {err}"
+        );
+        assert!(
+            !err.contains("sink error: builder error"),
+            "{args:?}: {err}"
+        );
+    }
+
+    // The remedy: SSL_CERT_FILE at a bundle (here one throwaway root, its key discarded).
+    // The client starts and the run reaches the catalog, which answers 401.
+    let bundle = d.join("bundle.pem");
+    fs::write(&bundle, TEST_ROOT_PEM).unwrap();
+    let (addr, seen) = listener();
+    let uri = format!("http://{addr}");
+    let out = Command::new(bin())
+        .args(["shape", "-i", input, "--catalog", &uri, "--table", "lake.t"])
+        .env_clear()
+        .env("SSL_CERT_FILE", &bundle)
+        .env("SSL_CERT_DIR", &empty)
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("no CA certificates"), "{err}");
+    assert!(
+        !seen.lock().unwrap().is_empty(),
+        "the catalog was not reached: {err}"
+    );
+}
+
+/// A self-signed root for the test above; its private key was discarded when it was made.
+#[cfg(all(feature = "object_store", target_os = "linux"))]
+const TEST_ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBlDCCATugAwIBAgIUd8ikWnR+wSdWcAB7PVkqZ89V2+owCgYIKoZIzj0EAwIw\n\
+HzEdMBsGA1UEAwwUc2hhcGVzaGlmdCB0ZXN0IHJvb3QwIBcNMjYxMTI2MTExODAy\n\
+WhgPMjEyNjExMDIxMTE4MDJaMB8xHTAbBgNVBAMMFHNoYXBlc2hpZnQgdGVzdCBy\n\
+b290MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEUpB9y/IgK1Q3ib4ZmL2p8sgB\n\
+ao554Be8tlGJL8M22jSiO4iutQ9WCMcw982jz+cSvp6J1tHLU57t1rHR8G3dWKNT\n\
+MFEwHQYDVR0OBBYEFFifigRTMumd+oRnyZCA6VGYK301MB8GA1UdIwQYMBaAFFif\n\
+igRTMumd+oRnyZCA6VGYK301MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwID\n\
+RwAwRAIgGfYLVroRMnw2gogoyYGoGfuaxcJL8UDlqj5OOJeMARwCIAgR/KX3uw69\n\
+92NhacpfQ9g+eDxNJJGMBP79kv32S2ZW\n\
+-----END CERTIFICATE-----\n";
+
+/// A one-shot HTTP listener on this machine: answers whatever comes with a 401 and keeps
+/// the request head, so a test can tell which address a client actually reached.
+#[cfg(feature = "object_store")]
+fn listener() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = seen.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming().flatten() {
+            let mut r = BufReader::new(conn.try_clone().unwrap());
+            let mut head = String::new();
+            let mut line = String::new();
+            while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                head.push_str(&line);
+                line.clear();
+            }
+            keep.lock().unwrap().push(head);
+            let body = r#"{"error":{"message":"no","type":"NotAuthorizedException","code":401}}"#;
+            let mut out = conn;
+            let _ = write!(
+                out,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (addr, seen)
+}
+
+#[cfg(feature = "object_store")]
+#[test]
+fn credentials_to_this_machine_never_go_through_a_proxy() {
+    // A proxy set for every scheme and nothing exempt from it: a client that honoured it for
+    // a loopback catalog would hand the proxy the token, or the secret, in the clear.
+    let d = workdir("catalog-proxy");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    for credential in [false, true] {
+        let (proxy, trapped) = listener();
+        let (catalog, reached) = listener();
+        let (idp, asked) = listener();
+        let mut cmd = Command::new(bin());
+        cmd.args(["shape", "-i", input.to_str().unwrap()]).args([
+            "--catalog",
+            &format!("http://{catalog}"),
+            "--table",
+            "a.t",
+        ]);
+        for k in [
+            "NO_PROXY",
+            "no_proxy",
+            "SHAPESHIFT_CATALOG_TOKEN",
+            "SHAPESHIFT_CATALOG_CREDENTIAL",
+            "SHAPESHIFT_CATALOG_SCOPE",
+        ] {
+            cmd.env_remove(k);
+        }
+        for k in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            cmd.env(k, format!("http://{proxy}"));
+        }
+        if credential {
+            cmd.env("SHAPESHIFT_CATALOG_CREDENTIAL", "id:secret-value")
+                .env(
+                    "SHAPESHIFT_CATALOG_OAUTH2_SERVER_URI",
+                    format!("http://{idp}/token"),
+                );
+        } else {
+            cmd.env("SHAPESHIFT_CATALOG_TOKEN", "tok-value")
+                .env_remove("SHAPESHIFT_CATALOG_OAUTH2_SERVER_URI");
+        }
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(
+            trapped.lock().unwrap().is_empty(),
+            "the proxy was handed a request: {:?}",
+            trapped.lock().unwrap()
+        );
+        if credential {
+            // The token endpoint was asked directly (and refused), so the catalog never was.
+            let asked = asked.lock().unwrap();
+            assert_eq!(asked.len(), 1, "{err}");
+            assert!(asked[0].starts_with("POST /token"), "{asked:?}");
+            assert!(err.contains("refused the client credentials"), "{err}");
+        } else {
+            let reached = reached.lock().unwrap();
+            assert_eq!(reached.len(), 1, "{err}");
+            assert!(reached[0].starts_with("GET /v1/config"), "{reached:?}");
+            assert!(reached[0].contains("Bearer tok-value"), "{reached:?}");
+        }
+    }
     fs::remove_dir_all(&d).ok();
 }
 
@@ -533,6 +1138,34 @@ fn sample_everything_is_refused_on_a_stream() {
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(bin()).args(args).output().unwrap()
+}
+
+/// A catalog URI that carries credentials is refused, with or without object-store support,
+/// and the secret is never printed: the URI is repeated in errors and summaries, so
+/// credentials belong in the environment.
+#[test]
+fn a_catalog_uri_with_credentials_never_reaches_the_output() {
+    let d = workdir("catalog-userinfo");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let uri = "http://reader:s3cr3t@127.0.0.1:1";
+    let input = input.to_str().unwrap();
+    for args in [
+        vec!["shape", "-i", input, "--catalog", uri, "--table", "lake.t"],
+        vec!["compact", "lake.t", "--catalog", uri],
+        vec!["expire", "lake.t", "--catalog", uri, "--older-than", "1d"],
+    ] {
+        let out = run(&args);
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(!out.status.success(), "{args:?}: {stdout}");
+        assert!(
+            !stdout.contains("s3cr3t") && !stderr.contains("s3cr3t"),
+            "{args:?}\n{stdout}\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1060,4 +1693,393 @@ fn summary_json_reports_a_failure_as_one_document() {
         .as_str()
         .unwrap()
         .contains("left over"));
+}
+
+#[test]
+fn a_run_already_in_the_table_is_not_written_again() {
+    let d = workdir("run-id");
+    let input = d.join("in.jsonl");
+    fs::write(&input, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+    let table = d.join("t");
+    let shape = |id: &str| {
+        let (out, doc) = run_json(&[
+            "shape",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            table.to_str().unwrap(),
+            "--to",
+            "iceberg",
+            "--append",
+            "--run-id",
+            id,
+        ]);
+        assert!(out.status.success(), "{doc}");
+        doc
+    };
+
+    // The first attempt commits, and names its run.
+    let first = shape("r-1");
+    assert_eq!(first["run_id"], "r-1");
+    assert_eq!(first["table"]["earlier_attempt"], false);
+    assert_eq!(first["table"]["version"], 1);
+
+    // A second attempt of the same run finds it, reads nothing and commits nothing.
+    let again = shape("r-1");
+    assert_eq!(again["ok"], true);
+    assert_eq!(again["table"]["earlier_attempt"], true);
+    assert_eq!(again["table"]["snapshot_id"], first["table"]["snapshot_id"]);
+    assert_eq!(again["table"]["version"], serde_json::Value::Null);
+    assert_eq!(again["rows"]["in"], 0);
+    let versions = || {
+        fs::read_dir(table.join("metadata"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".metadata.json"))
+            .count()
+    };
+    assert_eq!(versions(), 1, "no new version");
+
+    // Another run appends as usual.
+    let next = shape("r-2");
+    assert_eq!(next["table"]["version"], 2);
+    assert_eq!(versions(), 2);
+
+    // A run id is an Iceberg notion, and has a shape.
+    let out = run(&[
+        "shape",
+        "-i",
+        input.to_str().unwrap(),
+        "-o",
+        d.join("p.parquet").to_str().unwrap(),
+        "--run-id",
+        "r-3",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--run-id applies only to Iceberg"));
+    let out = run(&[
+        "shape",
+        "-i",
+        input.to_str().unwrap(),
+        "--run-id",
+        "no spaces",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    fs::remove_dir_all(&d).ok();
+}
+
+/// In a build without the console (the release binary, the image), `serve` says how to get
+/// it, with exit status 2, rather than clap's "unrecognized subcommand … similar: 'expire'".
+#[cfg(not(feature = "serve"))]
+#[test]
+fn serve_without_the_console_says_how_to_get_it() {
+    for args in [
+        &["serve"][..],
+        &["serve", "--addr", "0.0.0.0:9000", "--data-dir", "x"][..],
+    ] {
+        let out = Command::new(bin()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("built without the web console"), "{err}");
+        assert!(err.contains("--features serve"), "{err}");
+        assert!(!err.contains("expire"), "{err}");
+    }
+    // Still hidden from --help: this build has no console to offer.
+    let help = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("serve"));
+}
+
+/// One stream, three kinds of record, a non-JSON line: a spec about one kind takes its
+/// rows with `where`, and the others are counted as filtered, never rejected.
+#[test]
+fn where_takes_one_kind_of_record_out_of_a_mixed_stream() {
+    let d = workdir("where");
+    let input = d.join("mixed.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"record_type":"gate","repo":"a/b","head_sha":"abc","duration_ms":812}"#,
+            "\n",
+            r#"{"record_type":"queue","repo":"a/b","pr":17,"position":2}"#,
+            "\n",
+            "starting worker 3 (not json)\n",
+            r#"{"record_type":"gate","repo":"a/c","head_sha":"def","duration_ms":95}"#,
+            "\n",
+            r#"{"record_type":"turnover","repo":"a/b","files":12}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let out = d.join("gate.parquet");
+    let spec = d.join("gate.yaml");
+    fs::write(
+        &spec,
+        format!(
+            "dataset: gate\nwhere: record_type = 'gate'\nschema: strict\n\
+             output: {{ format: parquet, path: {} }}\ncolumns:\n\
+             \x20 - {{ name: repo, type: string, required: true }}\n\
+             \x20 - {{ name: head_sha, type: string, required: true }}\n\
+             \x20 - {{ name: duration_ms, type: int64 }}\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "shape",
+            "-s",
+            spec.to_str().unwrap(),
+            "-i",
+            input.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        Command::new(bin()).args(&args).output().unwrap()
+    };
+
+    // The strict spec lands the two gate rows; nothing of the others reaches the sidecar,
+    // and the field the filter reads is not reported as drift.
+    let o = run(&[]);
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        stdout.contains("rows_in=4 rows_out=2 filtered=2 rejected=0 parse_errors=1"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("drift"), "{stdout}");
+    let rejects = fs::read_to_string(d.join("gate.parquet.rejects.jsonl")).unwrap();
+    assert_eq!(
+        rejects.lines().count(),
+        1,
+        "only the non-JSON line: {rejects}"
+    );
+
+    // --where overrides the spec's; the summary carries the counts and the expression.
+    let o = run(&[
+        "--where",
+        "record_type = 'gate' and duration_ms > 100",
+        "--summary-json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(doc["rows"]["out"], 1);
+    assert_eq!(doc["rows"]["filtered"], 3);
+    assert_eq!(
+        doc["where"]["expr"],
+        "record_type = 'gate' and duration_ms > 100"
+    );
+    assert_eq!(doc["where"]["type_mismatches"], 0);
+
+    // A comparison of different kinds is reported, not silent.
+    let o = run(&["--where", "duration_ms = '812'"]);
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("kept none of the 4 record(s)"), "{stdout}");
+    assert!(
+        stdout.contains("compares a number with a string"),
+        "{stdout}"
+    );
+
+    // A mistake is refused before anything is read, with what to write instead.
+    let o = run(&["--where", "record_type == 'gate'"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("use `=`, not `==`"));
+
+    // `infer --where` samples only the kept records and writes the filter into the spec.
+    let o = Command::new(bin())
+        .args([
+            "infer",
+            "-i",
+            input.to_str().unwrap(),
+            "--where",
+            "record_type = 'gate'",
+        ])
+        .output()
+        .unwrap();
+    let inferred = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        inferred.contains("where: record_type = 'gate'"),
+        "{inferred}"
+    );
+    assert!(inferred.contains("name: head_sha"), "{inferred}");
+    for other in ["position", "files", "pr"] {
+        assert!(
+            !inferred.contains(&format!("name: {other}\n")),
+            "{other}: {inferred}"
+        );
+    }
+    fs::remove_dir_all(&d).ok();
+}
+
+/// A stream is sampled from its head, and only so much of it is held back: when the filter
+/// drops every record of that head, inference stops and says why, naming the filter rather
+/// than calling the records unparseable. Kept records past a dropped head are sampled.
+#[test]
+fn a_stream_whose_head_the_filter_drops_says_so() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let d = workdir("where-stream");
+    let shape = |input: String| {
+        let mut child = Command::new(bin())
+            .args([
+                "shape",
+                "-i",
+                "-",
+                "-o",
+                d.join("s.parquet").to_str().unwrap(),
+            ])
+            .args(["--where", "kind = 'gate'"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let queue = |n: usize| "{\"kind\":\"queue\",\"pos\":1}\n".repeat(n);
+    let gate = "{\"kind\":\"gate\",\"sha\":\"abc\"}\n";
+
+    let o = shape(queue(10_000) + gate);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("kept none of the first 10000 records") && err.contains("10000 filtered"),
+        "{err}"
+    );
+    assert!(!err.contains("unparseable, so"), "{err}");
+
+    let o = shape(queue(500) + gate);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("rows_in=501 rows_out=1 filtered=500"), "{out}");
+    let inspect = Command::new(bin())
+        .args(["inspect", d.join("s.parquet").to_str().unwrap()])
+        .output()
+        .unwrap();
+    let cols = String::from_utf8_lossy(&inspect.stdout);
+    assert!(cols.contains("sha") && !cols.contains("pos"), "{cols}");
+    // Kept one, then the bound: the run goes ahead on a smaller sample, and says so.
+    let o = shape(gate.to_string() + &queue(10_000) + gate);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("inferred the schema from 1 record(s), not the 1000")
+            && err.contains("(10000 filtered, 0 unparseable)"),
+        "{err}"
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("rows_in=10002 rows_out=2 filtered=10000"),
+        "{out}"
+    );
+    // A sample the bound did not cut short says nothing of the kind.
+    let o = shape(queue(500) + gate);
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("inferred the schema from"));
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn where_on_the_command_line_stands_in_for_a_bad_one_in_the_spec() {
+    let d = workdir("where-override");
+    let input = d.join("in.jsonl");
+    fs::write(
+        &input,
+        "{\"kind\":\"gate\",\"a\":1}\n{\"kind\":\"q\",\"b\":2}\n",
+    )
+    .unwrap();
+    let spec = d.join("s.yaml");
+    fs::write(
+        &spec,
+        format!(
+            "dataset: g\nwhere: kind == 'gate'\noutput: {{ format: parquet, path: {} }}\n",
+            d.join("o.parquet").display()
+        ),
+    )
+    .unwrap();
+    let run = |extra: &[&str]| {
+        Command::new(bin())
+            .args([
+                "shape",
+                "-s",
+                spec.to_str().unwrap(),
+                "-i",
+                input.to_str().unwrap(),
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("use `=`, not `==`"));
+    let o = run(&["--where", "kind = 'gate'"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("rows_in=2 rows_out=1 filtered=1"), "{out}");
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_record_nested_past_the_limit_is_a_parse_error_not_a_crash() {
+    // 50,000 levels used to overflow the stack and abort the whole run. Now the line is
+    // a parse error like any other, sidecarred for repair, and the rest of the file
+    // shapes, whether `infer` samples it first or a strict spec reads it straight.
+    let d = workdir("deep");
+    let input = d.join("in.jsonl");
+    let deep = format!("{}1{}", "{\"a\":".repeat(50_000), "}".repeat(50_000));
+    fs::write(&input, format!("{{\"id\":1}}\n{deep}\n{{\"id\":2}}\n")).unwrap();
+    let spec = d.join("s.yaml");
+    fs::write(
+        &spec,
+        format!(
+            "dataset: s\nschema: strict\noutput: {{ format: parquet, path: {} }}\n\
+             columns:\n  - {{ name: id, type: int64 }}\n",
+            d.join("strict.parquet").display()
+        ),
+    )
+    .unwrap();
+    for (name, args) in [
+        (
+            "inferred.parquet",
+            vec![
+                "-o".to_string(),
+                d.join("inferred.parquet").display().to_string(),
+            ],
+        ),
+        (
+            "strict.parquet",
+            vec!["-s".to_string(), spec.display().to_string()],
+        ),
+    ] {
+        let o = Command::new(bin())
+            .args(["shape", "-i", input.to_str().unwrap()])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            out.contains("rows_in=2 rows_out=2 rejected=0 parse_errors=1"),
+            "{name}: {out}"
+        );
+        let rejects = fs::read_to_string(d.join(format!("{name}.rejects.jsonl"))).unwrap();
+        let reject: serde_json::Value = serde_json::from_str(rejects.trim()).unwrap();
+        assert_eq!(reject["line"], 2, "{name}");
+        assert!(
+            reject["error"]
+                .as_str()
+                .unwrap()
+                .contains("nests deeper than 512 levels"),
+            "{name}: {reject}"
+        );
+        assert_eq!(reject["raw"].as_str().unwrap().len(), deep.len(), "{name}");
+    }
+    fs::remove_dir_all(&d).ok();
 }

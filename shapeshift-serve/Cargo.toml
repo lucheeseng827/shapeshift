@@ -30,3 +30,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# A run id's random suffix: ids recorded in snapshots must never repeat (a fresh run log, or
+# another console writing the same table, would otherwise take a new run for an earlier one).
+uuid = { workspace = true }

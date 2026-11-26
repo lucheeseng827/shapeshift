@@ -51,7 +51,7 @@ use uuid::Uuid;
 use shapeshift_core::{Compression, MergeSummary, Result, ShapeError};
 
 use crate::avro::{read_manifest_entries, ManifestEntry};
-use crate::files::{read_each, RangedParquet, TableFiles};
+use crate::files::{batch_err, read_each, RangedParquet, TableFiles};
 use crate::partition::{
     partition_dir, PartVal, PartitionDataFile, PartitionField, PartitionedWriter, Placement,
 };
@@ -452,7 +452,7 @@ impl MergeTracker {
         let mut next_deleted = deleted.iter().peekable();
         for rg in 0..pq.num_row_groups() {
             for batch in pq.row_group(rg, &mask)? {
-                let batch = batch.map_err(err)?;
+                let batch = batch.map_err(|e| batch_err(path, e))?;
                 let arrs = self
                     .keys
                     .iter()
@@ -667,7 +667,7 @@ fn read_position_deletes<F: TableFiles>(
         batches.extend(pq.row_group(rg, &all)?);
     }
     for batch in batches {
-        let batch = batch.map_err(err)?;
+        let batch = batch.map_err(|e| batch_err(path, e))?;
         let col = |id: i32, name: &str| -> Result<&ArrayRef> {
             let schema = batch.schema_ref();
             let i = schema
@@ -931,7 +931,7 @@ mod tests {
 
         let prior = crate::load_current_local(&dir).unwrap();
         let location = prior.metadata["location"].as_str().unwrap().to_string();
-        let local = crate::LocalTableFiles::new(&dir, &location);
+        let local = crate::LocalTableFiles::new(&dir, crate::Anchors::of(&prior.metadata));
         let fields = crate::table_fields(&prior.metadata).unwrap();
         let delta = batch((0..1500).step_by(3).collect(), 99);
         let run = |readers: usize| {

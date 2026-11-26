@@ -317,6 +317,10 @@ struct Node {
     children: Vec<(String, Node)>,
     /// A column selects exactly here, so this whole subtree is consumed.
     terminal: bool,
+    /// Only the row filter reads through here — no column does. The filter reads the
+    /// one value its path selects, so a scalar met where it expects to descend is read
+    /// by nothing (see [`walk`]).
+    filter_only: bool,
 }
 
 impl Node {
@@ -382,6 +386,28 @@ impl ConsumedPaths {
         ConsumedPaths { root, consumes_all }
     }
 
+    /// Mark one more path covered, given as its segments (which may hold dots). An empty
+    /// path is the whole record.
+    pub(crate) fn cover<'s>(&mut self, segs: impl IntoIterator<Item = &'s str>) {
+        let mut node = &mut self.root;
+        let mut any = false;
+        for seg in segs {
+            let fresh = !node.children.iter().any(|(k, _)| k == seg);
+            node = node.child_mut(seg);
+            // A node a column already reaches keeps the column's meaning.
+            if fresh {
+                node.filter_only = true;
+            }
+            any = true;
+        }
+        if any {
+            node.terminal = true;
+            self.root.sort();
+        } else {
+            self.consumes_all = true;
+        }
+    }
+
     /// Call `out` once per uncovered leaf in `record`. `buf` is a scratch path buffer
     /// owned by the caller so a steady-state scan allocates nothing.
     fn scan<'a, R: Record<'a>, F: FnMut(&str, R)>(
@@ -422,13 +448,22 @@ fn walk<'a, R: Record<'a>, F: FnMut(&str, R)>(
             // A column reaches deeper. Descend if we can; if the value is not an object
             // the column is indexing into it (or its shape changed under the column),
             // which the coercion path reports — not a new field.
-            Some(child) => {
-                if v.kind() == Kind::Object {
+            Some(child) => match v.kind() {
+                Kind::Object => {
                     let mark = push_segment(buf, k);
                     walk(v, child, flatten, buf, out);
                     buf.truncate(mark);
                 }
-            }
+                // Only the filter reaches deeper, and a scalar has nothing below it to
+                // read: the filter saw a null, no column keeps the value, so it is lost
+                // like any uncovered one. (An array is indexed into, as by a column.)
+                Kind::Bool | Kind::Int | Kind::Float | Kind::Str if child.filter_only => {
+                    let mark = push_segment(buf, k);
+                    out(buf, v);
+                    buf.truncate(mark);
+                }
+                _ => {}
+            },
             // Nothing in the schema reaches this key: everything under it is lost.
             None => {
                 let mark = push_segment(buf, k);
@@ -491,6 +526,10 @@ pub(crate) struct DriftTracker {
     consumed: ConsumedPaths,
     buf: String,
     report: DriftReport,
+    /// 1-based position of the record being scanned among every record the shaper was
+    /// given, the ones its filter set aside included — so "first at record N" names the
+    /// record in the input, not the Nth one scanned.
+    position: u64,
 }
 
 impl DriftTracker {
@@ -510,6 +549,7 @@ impl DriftTracker {
                 policy: spec.policy,
                 ..Default::default()
             },
+            position: 0,
         }
     }
 
@@ -517,12 +557,23 @@ impl DriftTracker {
         &self.report
     }
 
+    /// Count `segs` as a path the spec reads, so it is never reported as drift.
+    pub(crate) fn cover<'s>(&mut self, segs: impl IntoIterator<Item = &'s str>) {
+        self.consumed.cover(segs);
+    }
+
     pub(crate) fn into_report(self) -> DriftReport {
         self.report
     }
 
-    pub(crate) fn rows_scanned(&self) -> u64 {
-        self.report.rows_scanned
+    /// The position (see the field) of the record scanned last.
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// A record the filter set aside: never scanned, but it still has a position.
+    pub(crate) fn skip(&mut self) {
+        self.position += 1;
     }
 
     /// Scan one record for uncovered paths. `rescue` collects the dropped values when
@@ -533,7 +584,8 @@ impl DriftTracker {
         rescue: Option<&mut Map<String, Value>>,
     ) -> Option<String> {
         self.report.rows_scanned += 1;
-        let record_idx = self.report.rows_scanned;
+        self.position += 1;
+        let record_idx = self.position;
         let DriftTracker {
             consumed,
             buf,
@@ -569,7 +621,7 @@ impl DriftTracker {
         reason: &str,
         value: &Value,
     ) {
-        let record_idx = self.report.rows_scanned.max(1);
+        let record_idx = self.position.max(1);
         self.report.note_type_mismatch(
             column,
             declared,

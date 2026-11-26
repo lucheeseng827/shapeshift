@@ -36,7 +36,8 @@ use shapeshift_core::{Kind, Record};
 use simd_json::prelude::*;
 
 use crate::error::JsonError;
-use crate::source::{JsonArrayReader, JsonlReader, DEFAULT_MAX_LINE, SIMD_SLACK};
+use crate::source::{too_deep, JsonArrayReader, JsonlReader, DEFAULT_MAX_LINE, SIMD_SLACK};
+use shapeshift_core::MAX_RECORD_DEPTH;
 
 /// One record, read straight off the tape.
 ///
@@ -184,6 +185,56 @@ fn tape_to_serde(v: simd_json::tape::Value<'_, '_>) -> Value {
     }
 }
 
+/// Whether a parsed record nests deeper than `max` (objects and arrays together).
+///
+/// Parsing onto the tape is iterative, so a record of any depth gets this far safely;
+/// everything after it (converting to a `Value`, a `json` column, drift detection)
+/// recurses once per level, so the tape readers refuse a deeper record here.
+///
+/// A container's node says how many nodes its subtree holds, and each level below it
+/// is at least one of them, so a subtree too small to reach past `max` is stepped over
+/// whole. A record of under `max` nodes is decided in one step; a wide, shallow one
+/// costs a step per top-level field. `ends` is scratch the reader keeps, so the walk
+/// allocates nothing.
+pub(crate) fn nodes_nest_deeper_than(
+    nodes: &[simd_json::Node<'_>],
+    max: usize,
+    ends: &mut Vec<usize>,
+) -> bool {
+    use simd_json::Node;
+    // Where each container we are inside ends: one per level, so at most `max` long.
+    ends.clear();
+    let mut i = 0;
+    while i < nodes.len() {
+        while ends.last().is_some_and(|&end| i >= end) {
+            ends.pop();
+        }
+        match nodes[i] {
+            Node::Object { count, .. } | Node::Array { count, .. } => {
+                let level = ends.len() + 1;
+                if level > max {
+                    return true;
+                }
+                if level + count <= max {
+                    i += count + 1;
+                } else {
+                    ends.push(i + count + 1);
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// The tape readers' check: whether a record whose text is `len` bytes and whose tape is
+/// `nodes` nests deeper than [`MAX_RECORD_DEPTH`]. A record too short to be that deep
+/// (see [`crate::source::nests_deeper_than`]) is not walked at all.
+fn tape_too_deep(len: usize, nodes: &[simd_json::Node<'_>], ends: &mut Vec<usize>) -> bool {
+    len >= 2 * (MAX_RECORD_DEPTH + 1) && nodes_nest_deeper_than(nodes, MAX_RECORD_DEPTH, ends)
+}
+
 /// A JSONL reader that parses onto a reusable tape.
 ///
 /// Same framing, limits, and error semantics as [`JsonlReader`] — it borrows that
@@ -197,6 +248,8 @@ pub struct TapeJsonlReader<R> {
     /// simd-json's own working buffers, reused across records — the reason a record
     /// costs no allocation at all in the steady state.
     buffers: simd_json::Buffers,
+    /// The nesting check's scratch, reused for the same reason.
+    depth: Vec<usize>,
 }
 
 impl<R: BufRead> TapeJsonlReader<R> {
@@ -205,6 +258,7 @@ impl<R: BufRead> TapeJsonlReader<R> {
             lines: JsonlReader::new(inner).with_max_line(DEFAULT_MAX_LINE),
             scratch: Vec::with_capacity(4096),
             buffers: simd_json::Buffers::new(4096),
+            depth: Vec::new(),
         }
     }
 
@@ -223,6 +277,7 @@ impl<R: BufRead> TapeJsonlReader<R> {
             Some(Err(e)) => Some(Err(e)),
             Some(Ok(())) => {
                 let line = self.lines.current_line();
+                let len = line.len();
                 self.scratch.clear();
                 self.scratch.extend_from_slice(line);
                 // simd-json's stage-1 scan reads the slice it is *given* in SIMD-width
@@ -232,6 +287,10 @@ impl<R: BufRead> TapeJsonlReader<R> {
                 // too.
                 self.scratch.reserve(SIMD_SLACK);
                 match simd_json::to_tape_with_buffers(&mut self.scratch, &mut self.buffers) {
+                    Ok(t) if tape_too_deep(len, &t.0, &mut self.depth) => Some(Err(too_deep(
+                        self.lines.line_number(),
+                        self.lines.raw_line_text(),
+                    ))),
                     Ok(t) => Some(Ok(t)),
                     Err(e) => Some(Err(JsonError::Parse {
                         line: self.lines.line_number(),
@@ -301,6 +360,8 @@ pub struct TapeJsonArrayReader<R> {
     /// simd-json's own working buffers, reused across elements — the reason an
     /// element costs no allocation at all in the steady state.
     buffers: simd_json::Buffers,
+    /// The nesting check's scratch, reused for the same reason.
+    depth: Vec<usize>,
 }
 
 impl<R: BufRead> TapeJsonArrayReader<R> {
@@ -311,6 +372,7 @@ impl<R: BufRead> TapeJsonArrayReader<R> {
             elems: JsonArrayReader::new(inner)?.with_max_record(DEFAULT_MAX_LINE),
             scratch: Vec::with_capacity(4096),
             buffers: simd_json::Buffers::new(4096),
+            depth: Vec::new(),
         })
     }
 
@@ -334,6 +396,7 @@ impl<R: BufRead> TapeJsonArrayReader<R> {
             None => None,
             Some(Err(e)) => Some(Err(e)),
             Some(Ok(())) => {
+                let len = self.elems.current_element().len();
                 self.scratch.clear();
                 self.scratch.extend_from_slice(self.elems.current_element());
                 // Stage one scans the slice it is *given*, so the allocation must
@@ -341,6 +404,10 @@ impl<R: BufRead> TapeJsonArrayReader<R> {
                 // `Buffers` pads its own internal copy, not this one.
                 self.scratch.reserve(SIMD_SLACK);
                 match simd_json::to_tape_with_buffers(&mut self.scratch, &mut self.buffers) {
+                    Ok(t) if tape_too_deep(len, &t.0, &mut self.depth) => Some(Err(too_deep(
+                        self.elems.element_index(),
+                        self.elems.raw_element_text(),
+                    ))),
                     Ok(t) => Some(Ok(t)),
                     Err(e) => Some(Err(JsonError::Parse {
                         line: self.elems.element_index(),
@@ -357,6 +424,81 @@ impl<R: BufRead> TapeJsonArrayReader<R> {
 mod tests {
     use super::*;
 
+    /// The tape readers measure depth on the tape, the owned readers on the bytes. The
+    /// two must agree, or a record's fate would depend on which reader met it.
+    #[test]
+    fn depth_on_the_tape_agrees_with_depth_on_the_bytes() {
+        use crate::source::nests_deeper_than;
+        let max = MAX_RECORD_DEPTH;
+        let nest =
+            |open: &str, close: &str, d: usize| format!("{}1{}", open.repeat(d), close.repeat(d));
+        let cases: Vec<(String, bool)> = vec![
+            (nest("{\"a\":", "}", max), false),
+            (nest("{\"a\":", "}", max + 1), true),
+            (nest("[", "]", max), false),
+            (nest("[", "]", max + 1), true),
+            (nest("{\"a\":[", "]}", max / 2), false),
+            (format!("[{}]", nest("{\"a\":[", "]}", max / 2)), true),
+            // Deep at the end of a wide record, past many shallow siblings.
+            (
+                format!(
+                    "{{{}\"z\":{}}}",
+                    "\"k\":[{},[]],".repeat(2000),
+                    nest("[", "]", max)
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "{{{}\"z\":{}}}",
+                    "\"k\":[{},[]],".repeat(2000),
+                    nest("[", "]", max - 1)
+                ),
+                false,
+            ),
+            // Brackets in strings, escaped quotes included, are text.
+            (
+                format!(
+                    r#"{{"s":"\"{}\"","t":["{}"]}}"#,
+                    "[{".repeat(max),
+                    "{".repeat(max)
+                ),
+                false,
+            ),
+            // Empty containers nest too.
+            (
+                format!("{}{}", "[".repeat(max + 1), "]".repeat(max + 1)),
+                true,
+            ),
+            (format!("{}{{}}{}", "[".repeat(max), "]".repeat(max)), true),
+            (
+                format!("{}{{}}{}", "[".repeat(max - 1), "]".repeat(max - 1)),
+                false,
+            ),
+        ];
+        for (text, deep) in cases {
+            let mut bytes = text.clone().into_bytes();
+            let tape = simd_json::to_tape(&mut bytes).expect("valid JSON");
+            let short = &text[..text.len().min(40)];
+            let mut ends = Vec::new();
+            assert_eq!(
+                nodes_nest_deeper_than(&tape.0, max, &mut ends),
+                deep,
+                "tape: {short}…"
+            );
+            assert_eq!(
+                tape_too_deep(text.len(), &tape.0, &mut ends),
+                deep,
+                "tape: {short}…"
+            );
+            assert_eq!(
+                nests_deeper_than(text.as_bytes(), max),
+                deep,
+                "bytes: {short}…"
+            );
+        }
+    }
+
     /// The two record models must answer identically, or a run's output depends on which
     /// reader produced it. This walks every value of a sample through both and compares
     /// each accessor — the check that makes the tape path safe to default to.
@@ -371,6 +513,53 @@ mod tests {
         let mut buffers = simd_json::Buffers::new(1024);
         let tape = simd_json::to_tape_with_buffers(&mut bytes, &mut buffers).unwrap();
         compare(&owned, TapeRecord::new(tape.as_value()), "$");
+    }
+
+    /// The row filter runs on whichever record model the reader produced, so it must
+    /// keep and drop the same records, and see the same type mismatches, on both.
+    #[test]
+    fn the_row_filter_answers_alike_on_tape_and_serde() {
+        use shapeshift_core::Predicate;
+        let lines = [
+            r#"{"kind":"gate","status":500,"score":2.5,"ok":true,"user":{"plan":"pro"},"tags":["a","b"]}"#,
+            r#"{"kind":"queue","status":"500","score":null,"ok":false,"user":{},"tags":[]}"#,
+            r#"{"kind":"gate","status":200,"score":1e3,"user":{"plan":"free"},"big":9223372036854775807}"#,
+            r#"{"status":-7,"neg":-9223372036854775808,"esc":"it's \"q\" é","umax":18446744073709551615}"#,
+            r#"[1,2,3]"#,
+        ];
+        let exprs = [
+            "kind = 'gate'",
+            "kind != 'gate' or kind is null",
+            "status >= 500",
+            "status = '500'",
+            "score > 2 and score < 1001",
+            "ok = true or ok = false",
+            "user.plan in ('pro', 'team')",
+            "user.plan not in ('pro')",
+            "tags.1 = 'b'",
+            "tags is not null and user is not null",
+            "big = 9223372036854775807 or neg < -9223372036854775000",
+            "esc = 'it''s \"q\" é'",
+            "umax > 18446744073709551000",
+            "not (status < 300 and kind = 'gate')",
+            "$ is not null",
+        ];
+        for line in lines {
+            let owned: serde_json::Value = serde_json::from_str(line).unwrap();
+            let mut bytes = line.as_bytes().to_vec();
+            let mut buffers = simd_json::Buffers::new(1024);
+            let tape = simd_json::to_tape_with_buffers(&mut bytes, &mut buffers).unwrap();
+            for e in exprs {
+                let p = Predicate::parse(e).unwrap();
+                let on_tape = TapeRecord::new(tape.as_value());
+                assert_eq!(p.test(&owned), p.test(on_tape), "{e} on {line}");
+                assert_eq!(
+                    p.explain_mismatch(&owned),
+                    p.explain_mismatch(on_tape),
+                    "{e} on {line}"
+                );
+            }
+        }
     }
 
     fn compare(a: &serde_json::Value, b: TapeRecord<'_, '_>, path: &str) {

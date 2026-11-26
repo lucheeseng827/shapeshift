@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use shapeshift_core::{ColumnSpec, ColumnType, Compression, MergeSummary, Shaper, Sink};
 use shapeshift_iceberg::{
-    current_data_files, current_scan_files, inspect, read_manifest_entries, read_manifest_list,
-    IcebergSink, PartVal,
+    compact_table, current_data_files, current_scan_files, expire_table, inspect,
+    read_manifest_entries, read_manifest_list, CompactOptions, ExpireOptions, IcebergSink, PartVal,
 };
 
 fn tmp_dir(name: &str) -> std::path::PathBuf {
@@ -415,6 +415,72 @@ fn partitioned_tables_list_their_data_files() {
     }
     assert_eq!(by_region.len(), 2);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A table moved, merged into and moved again records paths written at two places, neither
+/// of them where it is now. Every one is read at the same key under the table's directory
+/// (RELOCATE-PLAN §4): the merge and compaction that used to fail with "No such file" on
+/// the paths written at the middle place now leave what the same merges leave in a table
+/// that never moved, and an expiry deletes the files written at every place as the table's
+/// own.
+#[test]
+fn a_table_moved_merged_into_and_moved_again_reads_its_own_files() {
+    let root = tmp_dir("moved");
+    std::fs::create_dir_all(&root).unwrap();
+    let (a, b, c, still) = (
+        root.join("a"),
+        root.join("b"),
+        root.join("c"),
+        root.join("still"),
+    );
+    let rounds = [
+        vec![row(1, "eu", 1), row(2, "us", 2), row(3, "eu", 3)],
+        // id 1 moves partition; id 2 is updated.
+        vec![row(1, "us", 10), row(2, "us", 20), row(4, "ap", 40)],
+        vec![row(2, "eu", 22), row(3, "eu", 33), row(5, "us", 50)],
+    ];
+    let both = |dir: &std::path::Path, rows: &[Value]| {
+        let at = merge(dir, rows, &["id"], &["region"]);
+        assert_eq!(at, merge(&still, rows, &["id"], &["region"]));
+    };
+    both(&a, &rounds[0]);
+    std::fs::rename(&a, &b).unwrap();
+    both(&b, &rounds[1]);
+    std::fs::rename(&b, &c).unwrap();
+    both(&c, &rounds[2]);
+    assert_eq!(live(&c), live(&still));
+
+    // It says where its metadata places it; a table that never moved says nothing.
+    let info = inspect(&c).unwrap();
+    assert!(info.moved && info.location.ends_with("/a"), "{info:?}");
+    assert!(!inspect(&still).unwrap().moved);
+
+    compact_table(&c, &CompactOptions::default()).unwrap();
+    assert_eq!(live(&c), live(&still));
+    let s = expire_table(
+        &c,
+        &ExpireOptions {
+            older_than_ms: i64::MAX,
+            retain_last: 1,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(s.expired_snapshots.len(), 3, "{s:?}");
+    assert_eq!(s.files_outside_table, 0, "{s:?}");
+    assert_eq!(s.files_not_deleted, 0, "{s:?}");
+    assert_eq!(live(&c), live(&still));
+    // What is left on disk is what the one remaining snapshot reads.
+    let mut on_disk = walk(&c.join("data"));
+    let mut read: Vec<String> = current_scan_files(&c)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    on_disk.sort();
+    read.sort();
+    assert_eq!(on_disk, read);
+    std::fs::remove_dir_all(&root).ok();
 }
 
 fn walk(dir: &std::path::Path) -> Vec<String> {

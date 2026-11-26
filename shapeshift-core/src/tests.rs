@@ -258,6 +258,35 @@ fn spec_validation_rejects_bad_specs() {
 }
 
 #[test]
+fn a_catalog_output_is_an_iceberg_table_with_no_path() {
+    let ok = DatasetSpec::parse(
+        r#"{"dataset":"t","output":{"format":"iceberg","catalog":{"uri":"http://c:8181","table":"lake.t"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(ok.output.catalog.as_ref().unwrap().table, "lake.t");
+    assert!(ok.output.path.is_empty());
+    let err = |json: &str| DatasetSpec::parse(json).unwrap_err().to_string();
+    // A path beside a catalog names the table twice.
+    assert!(err(r#"{"dataset":"t","output":{"format":"iceberg","path":"o","catalog":{"uri":"http://c","table":"a.t"}}}"#)
+        .contains("drop the path"));
+    // A catalog holds Iceberg tables.
+    assert!(err(r#"{"dataset":"t","output":{"format":"parquet","catalog":{"uri":"http://c","table":"a.t"}}}"#)
+        .contains("only to Iceberg"));
+    // Both halves are needed, and an empty one is refused.
+    assert!(DatasetSpec::parse(
+        r#"{"dataset":"t","output":{"format":"iceberg","catalog":{"uri":"http://c"}}}"#
+    )
+    .is_err());
+    assert!(err(
+        r#"{"dataset":"t","output":{"format":"iceberg","catalog":{"uri":" ","table":"a.t"}}}"#
+    )
+    .contains("both a `uri` and a `table`"));
+    // Without a catalog, the path is required.
+    assert!(err(r#"{"dataset":"t","output":{"format":"parquet"}}"#)
+        .contains("`output.path` is required"));
+}
+
+#[test]
 fn effective_columns_merges_declared_then_inferred() {
     let spec = DatasetSpec::parse(
         r#"{"dataset":"t","output":{"format":"parquet","path":"o"},"columns":[{"name":"id","type":"int64"}]}"#,
@@ -338,6 +367,7 @@ fn mar_estimate_is_honest_both_ways() {
 fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
     DatasetSpec {
         dataset: "t".into(),
+        filter: None,
         source: Default::default(),
         output: OutputSpec {
             format: OutputFormat::Parquet,
@@ -345,6 +375,7 @@ fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
             compression: Compression::Snappy,
             partition_by: Vec::new(),
             merge_on: Vec::new(),
+            catalog: None,
         },
         schema: SchemaMode::Infer,
         columns: vec![
@@ -595,4 +626,312 @@ fn drift_spec_round_trips_and_defaults_to_warn() {
     assert_eq!(spec.drift.policy, DriftPolicy::Warn);
     // A default block is not re-emitted, so `shapeshift infer` stays terse.
     assert!(!spec.to_yaml().unwrap().contains("drift:"));
+}
+
+// ---------------------------------------------------------------------------
+// Row filter (`where:`)
+// ---------------------------------------------------------------------------
+
+/// Three kinds of record in one stream; the specs below are about the gate rows.
+fn mixed_records() -> Vec<serde_json::Value> {
+    vec![
+        json!({"record_type": "gate", "repo": "a/b", "head_sha": "abc", "duration_ms": 812}),
+        json!({"record_type": "queue", "repo": "a/b", "pr": 17, "position": 2}),
+        json!({"record_type": "gate", "repo": "a/c", "head_sha": "def", "duration_ms": 95}),
+        json!({"record_type": "turnover", "repo": "a/b", "files": 12}),
+    ]
+}
+
+fn gate_spec(extra: &str) -> DatasetSpec {
+    DatasetSpec::parse(&format!(
+        "dataset: gate
+where: record_type = 'gate'
+schema: strict
+output: {{ format: parquet, path: g.parquet }}
+columns:
+  - {{ name: repo, type: string, required: true }}
+  - {{ name: head_sha, type: string, required: true }}
+  - {{ name: duration_ms, type: int64 }}
+{extra}"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_filtered_record_is_neither_shaped_nor_rejected() {
+    // Without the filter a strict spec aborts on the first queue row; with it, the
+    // other kinds are set aside before a required column or a coercion sees them.
+    let mut sh = Shaper::from_spec(&gate_spec(""), &[]).unwrap();
+    let outcomes: Vec<PushOutcome> = mixed_records()
+        .iter()
+        .map(|r| sh.push(r).unwrap())
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            PushOutcome::Appended,
+            PushOutcome::Filtered,
+            PushOutcome::Appended,
+            PushOutcome::Filtered
+        ]
+    );
+    let report = sh.filter_report().unwrap().clone();
+    assert_eq!(
+        report,
+        FilterReport {
+            expr: "record_type = 'gate'".into(),
+            filtered: 2,
+            type_mismatches: 0,
+            first_mismatch: None,
+        }
+    );
+    let batch = sh.flush().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch.num_columns(), 3, "no column of another kind");
+
+    let mut no_filter = gate_spec("");
+    no_filter.filter = None;
+    let mut sh = Shaper::from_spec(&no_filter, &[]).unwrap();
+    sh.push(&mixed_records()[0]).unwrap();
+    assert!(
+        sh.push(&mixed_records()[1]).is_err(),
+        "strict aborts on the queue row"
+    );
+}
+
+#[test]
+fn the_filters_fields_are_not_drift_and_filtered_records_are_not_scanned() {
+    // `record_type` is read by the filter, not kept by a column: the spec knows it, so it
+    // is not reported as drift (nor rescued). The queue and turnover rows' fields are
+    // never scanned at all.
+    for policy in [DriftPolicy::Warn, DriftPolicy::Rescue] {
+        let p = format!("{policy:?}").to_lowercase();
+        let spec = gate_spec(&format!("drift: {{ policy: {p} }}"));
+        let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+        for r in mixed_records() {
+            sh.push(&r).unwrap();
+        }
+        let drift = sh.drift_report().unwrap();
+        assert_eq!(drift.rows_scanned, 2, "{p}");
+        assert!(drift.is_clean(), "{p}: {:?}", drift.new_fields);
+    }
+    // A field the filter does not read is still drift.
+    let spec = gate_spec("drift: { policy: warn }");
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&json!({"record_type": "gate", "repo": "r", "head_sha": "s", "extra": 1}))
+        .unwrap();
+    assert!(sh.drift_report().unwrap().new_fields.contains_key("extra"));
+}
+
+#[test]
+fn drift_names_the_record_in_the_input_although_the_filter_set_some_aside() {
+    // The two rows the filter takes out still have positions: the drifted row is the
+    // third one given, and an `error` policy says so too.
+    let records = [
+        json!({"record_type": "queue", "repo": "a/b"}),
+        json!({"record_type": "queue", "repo": "a/b"}),
+        json!({"record_type": "gate", "repo": "r", "head_sha": "s", "extra": 1}),
+    ];
+    let mut sh = Shaper::from_spec(&gate_spec("drift: { policy: warn }"), &[]).unwrap();
+    for r in &records {
+        sh.push(r).unwrap();
+    }
+    let drift = sh.drift_report().unwrap();
+    assert_eq!(drift.rows_scanned, 1);
+    assert_eq!(drift.new_fields["extra"].first_record, 3);
+
+    let mut sh = Shaper::from_spec(&gate_spec("drift: { policy: error }"), &[]).unwrap();
+    sh.push(&records[0]).unwrap();
+    sh.push(&records[1]).unwrap();
+    let err = sh.push(&records[2]).unwrap_err().to_string();
+    assert!(err.contains("record 3: new field `extra`"), "{err}");
+}
+
+#[test]
+fn a_scalar_where_only_the_filter_reads_deeper_is_still_drift() {
+    // `payload.kind is null` keeps a row whose `payload` is 7, and reads nothing from it:
+    // no column keeps the 7, so it is lost like any uncovered value.
+    let mut spec = gate_spec("drift: { policy: warn }");
+    spec.filter = Some("payload.kind is null".into());
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let base = json!({"repo": "r", "head_sha": "s"});
+    let with = |payload: serde_json::Value| {
+        let mut r = base.clone();
+        r["payload"] = payload;
+        r
+    };
+    for payload in [json!({"kind": null}), json!(null), json!([1, 2])] {
+        sh.push(&with(payload)).unwrap();
+    }
+    assert!(sh.drift_report().unwrap().is_clean());
+    sh.push(&with(json!(7))).unwrap();
+    let drift = sh.drift_report().unwrap();
+    assert_eq!(drift.new_fields["payload"].first_record, 4);
+
+    // A column reaching through the same path keeps its own meaning: the scalar under a
+    // column's path is that column's business, as before.
+    let mut spec =
+        gate_spec("  - { name: kind, from: payload.kind, type: string }\ndrift: { policy: warn }");
+    spec.filter = Some("payload.kind is null".into());
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    sh.push(&with(json!(7))).unwrap();
+    assert!(sh.drift_report().unwrap().is_clean());
+}
+
+#[test]
+fn a_shaper_takes_one_filter() {
+    let sh = Shaper::from_spec(&gate_spec(""), &[]).unwrap();
+    let err = match sh.with_where("repo = 'a/b'") {
+        Ok(_) => panic!("a second `where` was taken"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("already filters with `where record_type = 'gate'`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_path_is_bounded_in_a_column_and_in_the_filter() {
+    let path = |n: usize| vec!["a"; n].join(".");
+    let too_long = format!("more than {MAX_PATH_SEGMENTS} segments");
+    // A `where` as long as it may be, all one path: refused when it loads, not built into
+    // a trie as deep as the text is long.
+    let mut spec = gate_spec("drift: { policy: warn }");
+    spec.filter = Some(format!("{} is null", path(MAX_WHERE_BYTES / 2 - 8)));
+    let err = spec.validate().unwrap_err().to_string();
+    assert!(err.contains(&too_long), "{err}");
+    let mut col = spec.clone();
+    col.filter = None;
+    col.columns[0].from = Some(path(MAX_PATH_SEGMENTS + 1));
+    let err = col.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("column `repo`: its path") && err.contains(&too_long),
+        "{err}"
+    );
+
+    // The longest accepted paths, in a column and in the filter at once, are built into
+    // the drift tracker and freed again on a stack far smaller than any thread's: what a
+    // spec's text alone can make the process do.
+    spec.filter = Some(format!("{} is not null", path(MAX_PATH_SEGMENTS)));
+    spec.columns[2].from = Some(format!("b.{}", path(MAX_PATH_SEGMENTS - 1)));
+    spec.validate().unwrap();
+    let small = spec.clone();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || drop(Shaper::from_spec(&small, &[]).unwrap()))
+        .unwrap()
+        .join()
+        .unwrap();
+    // A record that deep is scanned all the way down: the one field the filter does not
+    // read, beside the last segment it does, is found.
+    let mut deep = json!({ "a": 1, "x": 2 });
+    for _ in 1..MAX_PATH_SEGMENTS - 1 {
+        deep = json!({ "a": deep });
+    }
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    assert_eq!(
+        sh.push(&json!({"repo": "r", "head_sha": "s", "a": deep}))
+            .unwrap(),
+        PushOutcome::Appended
+    );
+    let found: Vec<&String> = sh.drift_report().unwrap().new_fields.keys().collect();
+    assert_eq!(found, [&format!("{}.x", path(MAX_PATH_SEGMENTS - 1))]);
+
+    // Columns that never pass a spec's validation (inferred ones, or a library caller's)
+    // are bounded where every column enters the shaper.
+    let deep = ColumnSpec {
+        name: path(MAX_PATH_SEGMENTS + 1),
+        from: None,
+        ty: ColumnType::String,
+        transform: None,
+        required: false,
+    };
+    let refused = |r: Result<Shaper>| match r {
+        Ok(_) => panic!("a {}-segment path was taken", MAX_PATH_SEGMENTS + 1),
+        Err(e) => e.to_string(),
+    };
+    let mut infer = gate_spec("");
+    infer.schema = SchemaMode::Infer;
+    infer.filter = None;
+    let err = refused(Shaper::from_spec(&infer, std::slice::from_ref(&deep)));
+    let says = format!(
+        "has {} segments, more than {MAX_PATH_SEGMENTS}",
+        MAX_PATH_SEGMENTS + 1
+    );
+    assert!(err.contains(&says), "{err}");
+    assert!(err.len() < 200, "the message prints the path whole: {err}");
+    let drift = DriftSpec {
+        policy: DriftPolicy::Warn,
+        ..Default::default()
+    };
+    let err = refused(Shaper::with_drift(vec![deep], false, &drift, true));
+    assert!(err.contains(&says), "{err}");
+}
+
+#[test]
+fn type_mismatches_are_counted_and_the_first_described() {
+    let mut spec = gate_spec("");
+    spec.filter = Some("duration_ms = '812' or head_sha = 'def'".into());
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let outcomes: Vec<PushOutcome> = mixed_records()
+        .iter()
+        .map(|r| sh.push(r).unwrap())
+        .collect();
+    // Only the second gate row passes, on its other test.
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == PushOutcome::Appended)
+            .count(),
+        1
+    );
+    let r = sh.filter_report().unwrap();
+    assert_eq!((r.filtered, r.type_mismatches), (3, 2));
+    assert_eq!(
+        r.first_mismatch.as_deref(),
+        Some("`duration_ms = '812'` compares a number with a string, which is never true")
+    );
+}
+
+#[test]
+fn run_pipeline_counts_filtered_rows() {
+    struct Null;
+    impl Sink for Null {
+        fn write_batch(&mut self, _: &RecordBatch) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<SinkSummary> {
+            Ok(SinkSummary::default())
+        }
+    }
+    let spec = gate_spec("");
+    let sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let (report, _) = run_pipeline(sh, mixed_records(), &mut Null, 10).unwrap();
+    assert_eq!(
+        (
+            report.rows_in,
+            report.rows_out,
+            report.rows_rejected,
+            report.rows_filtered
+        ),
+        (4, 2, 0, 2)
+    );
+    assert_eq!(report.filter.unwrap().filtered, 2);
+}
+
+#[test]
+fn a_spec_names_its_filter_as_where_and_refuses_a_bad_one() {
+    let spec = gate_spec("");
+    let yaml = spec.to_yaml().unwrap();
+    assert!(yaml.contains("where: record_type = 'gate'"), "{yaml}");
+    assert_eq!(DatasetSpec::parse(&yaml).unwrap(), spec);
+    // A spec without one says nothing about it.
+    let mut none = spec.clone();
+    none.filter = None;
+    assert!(!none.to_yaml().unwrap().contains("where"));
+    let err = DatasetSpec::parse(&yaml.replace("= 'gate'", "== 'gate'"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("use `=`, not `==`"), "{err}");
 }

@@ -44,7 +44,7 @@ use uuid::Uuid;
 use shapeshift_core::{Compression, Result, ShapeError};
 
 use crate::avro::{self, DataFileMeta, EntryOut, EntryStatus, ManifestContent, ManifestEntry};
-use crate::files::{read_ahead, AheadFile, TableFiles, READ_AHEAD_BYTES};
+use crate::files::{batch_err, read_ahead, AheadFile, TableFiles, READ_AHEAD_BYTES};
 use crate::merge::live_files;
 use crate::metadata::{self, AppendInput, SnapshotCounts};
 use crate::partition::{partition_dir, PartVal, PartitionDataFile, PartitionField};
@@ -373,7 +373,7 @@ impl<'c> BinWriter<'c> {
         let mut next_deleted = 0usize;
         while let Some(group) = file.next_group()? {
             for batch in group {
-                let batch = batch.map_err(|e| err(format!("{path}: {e}")))?;
+                let batch = batch.map_err(|e| batch_err(path, e))?;
                 let n = batch.num_rows();
                 let batch = drop_deleted(&batch, pos, &c.deleted, &mut next_deleted)?;
                 pos += n as u64;
@@ -642,6 +642,7 @@ fn build_replace_artifacts(b: &ReplaceBuild) -> Result<MetadataArtifacts> {
         added_rows,
         existing_rows: rows(b.kept),
         deleted_rows: rows(b.removed),
+        partitions: None,
     }];
 
     let delete_manifest = if b.removed_deletes.is_empty() {
@@ -680,6 +681,7 @@ fn build_replace_artifacts(b: &ReplaceBuild) -> Result<MetadataArtifacts> {
             added_rows: 0,
             existing_rows: 0,
             deleted_rows: rows(b.removed_deletes),
+            partitions: None,
         });
         Some((key, bytes))
     };
@@ -713,6 +715,7 @@ fn build_replace_artifacts(b: &ReplaceBuild) -> Result<MetadataArtifacts> {
         manifest_list_path: &manifest_list_uri,
         counts,
         schema_fields: b.ice_fields,
+        tags: &metadata::SnapshotTags::default(),
     })?;
     let metadata_bytes = serde_json::to_vec_pretty(&metadata_value).map_err(err)?;
 
@@ -829,7 +832,7 @@ mod tests {
 
         let table = crate::load_current_local(&dir).unwrap();
         let location = table.metadata["location"].as_str().unwrap().to_string();
-        let local = crate::LocalTableFiles::new(&dir, &location);
+        let local = crate::LocalTableFiles::new(&dir, crate::Anchors::of(&table.metadata));
         let data: HashSet<String> = live_files(&local, &table)
             .unwrap()
             .data

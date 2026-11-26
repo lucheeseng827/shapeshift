@@ -111,6 +111,8 @@ impl Sink for ParquetSink {
         Ok(SinkSummary {
             table_version: None,
             snapshot_id: None,
+            rebases: 0,
+            earlier_attempt: false,
             files: vec![self.path.clone()],
             rows: self.rows,
             bytes,

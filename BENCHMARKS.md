@@ -499,6 +499,46 @@ arms equally; the figure is the median of 6.
 - The drifting rows here are cheaper in absolute terms because that spec declares one column
   (`id`) instead of eight — compare down the `vs ignore` column, not across the rows.
 
+### Row filter (`where`): what testing every record costs
+
+`where` is tested on every record before it is shaped. **A different machine from the tables above
+(Intel Xeon @ 2.30 GHz, 4 vCPU, glibc release build); compare down the ratio column.** 1,000,000
+rows / 156 MB of the `benchmarks/bench.py` shape → Parquet, the four arms interleaved, median of
+6.
+
+| run | median wall | vs no filter | peak RSS | rows out |
+|---|---|---|---|---|
+| no filter | 1.71s | 1.00× | 22.9 MiB | 1,000,000 |
+| keeps every row, one test (`id is not null`) | 1.74s | **1.02×** | 21.3 MiB | 1,000,000 |
+| keeps every row, compound (`id >= 0 and (user.plan in (…) or user.plan is null) and active is not null`) | 1.80s | **1.05×** | 21.4 MiB | 1,000,000 |
+| keeps a quarter (`user.plan = 'pro'`) | 0.85s | 0.50× | 19.3 MiB | 250,000 |
+
+- **A filter costs 2–5% on a run that keeps every row**, the case where it does nothing useful: each
+  test is a path walk and a comparison on the parser's tape, with no copy and no allocation.
+- **A filter that drops rows pays for itself:** the dropped ones are never shaped, so keeping a
+  quarter of the rows halves the run.
+- Memory does not move: the filter holds nothing per row.
+
+### The nesting limit: what checking every record costs
+
+A record nested deeper than 512 levels is refused before anything recurses over it (CHANGELOG,
+Fixed). The tape readers read the depth off the parsed tape, stepping over every subtree too
+small to matter; the owned readers decide from the bytes, counting brackets with `memchr` only
+for a record over 1 KiB. **Intel Xeon @ 2.10 GHz, 4 vCPU, glibc release build (`opt-level = "z"`,
+as shipped)**, the binary before and after the check, interleaved, median of the last 5 of 6:
+
+| input → Parquet | before | after | change |
+|---|---|---|---|
+| 1,000,000 rows / 157 MB, the `benchmarks/bench.py` shape (157 B a row) | 2.500s | 2.489s | −0.4% |
+| 100,000 rows / 238 MB, 40 nested fields a row (2.4 KB, ~520 tape nodes: the walk runs) | 8.670s | 8.309s | −4.2% |
+
+- **Within run-to-run noise either way** (single runs varied by ±5%). Per record, measured
+  directly: the tape check is one step for a record under 512 nodes and about 3% of the tape
+  parse for a wide one; the owned check is free under 1 KiB and 2–10% of building the `Value`
+  above it.
+- The same input with one line nested 50,000 deep: before, `stack overflow, aborting`; after,
+  `parse_errors=1` and the other rows land.
+
 ### Upsert (`--merge-on`): what a merge costs over an append
 
 A merge does everything an append does, then finds the rows the delta supersedes — reading only

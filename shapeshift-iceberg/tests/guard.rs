@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 
 use shapeshift_core::{ColumnSpec, ColumnType, Compression, ShapeError, Shaper, Sink};
 use shapeshift_iceberg::{
-    compact_table, current_scan_files, expire_table, inspect, local_version, CompactOptions,
-    ExpireOptions, IcebergSink,
+    compact_table, current_scan_files, expire_table, find_run_local, inspect, local_version,
+    read_local_history, table_events, CompactOptions, ExpireOptions, IcebergSink, RUN_ID_KEY,
+    VERSION_KEY,
 };
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -147,6 +148,111 @@ fn of_two_writers_on_one_version_the_second_is_refused_and_leaves_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The metadata of the table's current version.
+fn current_meta(dir: &Path) -> Value {
+    let v = local_version(dir).unwrap().unwrap();
+    let text = std::fs::read_to_string(dir.join(format!("metadata/v{v}.metadata.json"))).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn an_attempt_that_loses_to_an_earlier_attempt_of_its_run_reports_that_snapshot() {
+    for how in ["append", "merge"] {
+        let dir = tmp_dir(&format!("run-{how}"));
+        commit(&dir, &[row(1, 1)], "append");
+        // Two attempts of one run (a worker that went quiet, and the one that took over),
+        // both built on version 1. The first commits; the second must not add the rows again.
+        let mut first = open(&dir, &[row(2, 2)], how);
+        let mut second = open(&dir, &[row(2, 2)], how);
+        first.set_run_id("r-7").unwrap();
+        second.set_run_id("r-7").unwrap();
+        let won = first.finish().unwrap();
+        assert!(!won.earlier_attempt);
+
+        let lost = second.finish().unwrap();
+        assert!(
+            lost.earlier_attempt,
+            "{how}: reported as the earlier attempt's commit"
+        );
+        assert_eq!(lost.snapshot_id, won.snapshot_id, "{how}");
+        assert!(
+            lost.files.is_empty(),
+            "{how}: it reports no file of its own"
+        );
+        assert_eq!(
+            data_files(&dir),
+            referenced(&dir),
+            "{how}: its data file was removed"
+        );
+        assert_eq!(live(&dir), 2, "{how}: the run's row is in the table once");
+        assert_eq!(
+            local_version(&dir).unwrap(),
+            Some(2),
+            "{how}: nothing more was committed"
+        );
+
+        let meta = current_meta(&dir);
+        let head = meta["snapshots"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(head["summary"][RUN_ID_KEY], "r-7", "{how}");
+        assert_eq!(
+            head["summary"][VERSION_KEY],
+            env!("CARGO_PKG_VERSION"),
+            "{how}"
+        );
+        let found = find_run_local(&dir, "r-7").unwrap().unwrap();
+        assert_eq!(Some(found.snapshot_id), won.snapshot_id, "{how}");
+        assert_eq!(find_run_local(&dir, "r-8").unwrap(), None, "{how}");
+
+        // An attempt that only begins once the run has committed finds it in the table it
+        // loads, whoever calls the sink.
+        let mut late = open(&dir, &[row(2, 2)], how);
+        late.set_run_id("r-7").unwrap();
+        let late = late.finish().unwrap();
+        assert!(late.earlier_attempt, "{how}");
+        assert_eq!(late.snapshot_id, won.snapshot_id, "{how}");
+        assert_eq!(
+            data_files(&dir),
+            referenced(&dir),
+            "{how}: its data file was removed"
+        );
+        assert_eq!(live(&dir), 2, "{how}");
+        assert_eq!(local_version(&dir).unwrap(), Some(2), "{how}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn an_attempt_that_loses_to_a_different_run_is_still_refused() {
+    let dir = tmp_dir("run-other");
+    commit(&dir, &[row(1, 1)], "append");
+    let mut a = open(&dir, &[row(2, 2)], "append");
+    let mut b = open(&dir, &[row(3, 3)], "append");
+    a.set_run_id("r-1").unwrap();
+    b.set_run_id("r-2").unwrap();
+    a.finish().unwrap();
+    assert_conflict(b.finish().unwrap_err());
+    assert_eq!(data_files(&dir), referenced(&dir));
+    assert_eq!(live(&dir), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_run_id_is_checked_before_it_is_recorded() {
+    let dir = tmp_dir("run-bad");
+    let mut s = open(&dir, &[row(1, 1)], "append");
+    for bad in ["", "has space", "slash/no", &"x".repeat(129)] {
+        assert!(s.set_run_id(bad).is_err(), "{bad:?} is refused");
+    }
+    s.set_run_id("ok.1_A:b-2").unwrap();
+    s.finish().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_merge_that_started_before_a_compaction_loses_loudly() {
     let dir = tmp_dir("compact");
@@ -262,5 +368,54 @@ fn a_leftover_from_an_earlier_table_is_reported_not_retried() {
     let msg = err.to_string();
     assert!(msg.contains("left over from an earlier table"), "{msg}");
     assert_eq!(data_files(&dir), before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_tables_history_reads_back_as_its_events() {
+    let dir = tmp_dir("history");
+    let mut first = open(&dir, &[row(1, 1), row(2, 2)], "append");
+    first.set_run_id("r-1").unwrap();
+    first.finish().unwrap();
+    commit(&dir, &[row(3, 3)], "append");
+    commit(&dir, &[row(1, 10)], "merge");
+    compact_table(&dir, &CompactOptions::default()).unwrap();
+    expire_table(
+        &dir,
+        &ExpireOptions {
+            older_than_ms: i64::MAX,
+            retain_last: 2,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+
+    let (current, earlier) = read_local_history(&dir, 100).unwrap().unwrap();
+    assert_eq!(earlier.len(), 4, "v1..v4 beside the current v5");
+    let events = table_events(&current, &earlier);
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["append", "append", "overwrite", "replace", "expire"]
+    );
+    // Every snapshot was made before the expiry: the expired ones still show, from the
+    // version that held them, as what the expiry removed.
+    let expiry = events.last().unwrap();
+    assert_eq!(expiry.removed.len(), 2);
+    assert_eq!(
+        events.iter().map(|e| e.expired).collect::<Vec<_>>(),
+        [true, true, false, false, false]
+    );
+    assert!(events[..4]
+        .iter()
+        .all(|e| e.writer.engine_version.is_some()));
+    assert_eq!(events[0].writer.run_id.as_deref(), Some("r-1"));
+    assert_eq!(events[2].counts.added_position_deletes, 1);
+    assert_eq!(
+        events[3].counts.live_records(),
+        3,
+        "the compaction keeps the rows"
+    );
+    assert_eq!(read_local_history(dir.join("nothing"), 10).unwrap(), None);
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -17,7 +17,7 @@ members = [
 # parquet / simd-json / avro stack resolves independently of the shared workspace.
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/shapeshift"
@@ -45,6 +45,9 @@ clap = { version = "4", features = ["derive"] }
 # bridge to land straight in a `serde_json::Value`, so downstream code stays on
 # the ubiquitous value model while the hot lexing stays SIMD.
 simd-json = "0.14"
+# SIMD byte search, already linked through serde_json: the readers count a long record's
+# brackets with it, whatever opt-level the release build uses.
+memchr = "2"
 # Columnar core. arrow 54 to match the proven musl-static Snappy build
 # (parquet default-features=false + snap avoids the zstd/brotli C codecs). The
 # arrow-array/arrow-schema major MUST match parquet's arrow-rs major.
@@ -52,6 +55,11 @@ arrow-array = "54"
 arrow-schema = "54"
 arrow-select = "54"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+# Compressed Avro manifests other engines write (S3): raw DEFLATE (Java's and PyIceberg's
+# default) through a pure-Rust inflater, and snappy through the `snap` parquet already links.
+# Both keep the lean binary free of C codecs.
+miniz_oxide = "0.8"
+snap = "1"
 uuid = { version = "1", features = ["v4"] }
 # Byte buffers for ranged reads: parquet's ChunkReader and object_store both speak `Bytes`.
 bytes = "1"

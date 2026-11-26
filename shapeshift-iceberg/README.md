@@ -150,28 +150,45 @@ Paths are **location-anchored** (absolute): a table reads
 back at the location it was written to. It is also **relocatable for reading** — copy or move
 the whole table directory anywhere and DuckDB reads it with
 `iceberg_scan('<new path>', allow_moved_paths=true)` (verified for partitioned and
-multi-snapshot tables; predicate pruning still works). What is out of scope: **catalog-managed
-relocation** — re-anchoring the embedded paths so *any* engine reads the moved table with no
-special flag, plus multi-writer atomic commits (a REST catalog's job).
+multi-snapshot tables; predicate pruning still works), and `relocate_table` re-anchors it so
+*any* engine reads it with no flag (below).
 
 ## Relocating a table (copy-anywhere)
 
-The embedded paths are absolute, so a table moved to a new location fails a *default* reader.
-Two ways to work with a moved/copied table today — no catalog, no rewrite:
+The embedded paths are absolute, so a table moved to a new location fails a *default* reader, and
+a copy whose original is still there quietly reads the original's files. Without rewriting
+anything:
 
 ```sh
 # Copy the whole table directory somewhere new (any tool: cp -r, aws s3 cp --recursive, …).
 cp -r ./events_tbl /mnt/archive/events_tbl
 
-# `shapeshift inspect` reads a moved table directly — it follows the version-hint pointer and
-# reads metadata.json, never the embedded data-file paths.
+# `shapeshift inspect` reads a moved table directly and says it has moved:
+#   moved: its metadata says it is at /data/events_tbl; shapeshift reads and writes it here, …
 shapeshift inspect /mnt/archive/events_tbl
 ```
+
+shapeshift reads and writes a moved table where it is (`--append`, `--merge-on`, `compact`,
+`expire`), however many times it has moved and been written to in between: a path recorded
+under any directory the table has been written at is read at the same key under the table's
+directory. A write into a moved table logs a warning, since other engines' default readers
+still look for its files at the recorded place.
 
 ```sql
 -- DuckDB resolves the moved data/manifest paths relative to the new location:
 SELECT * FROM iceberg_scan('/mnt/archive/events_tbl', allow_moved_paths = true);
 ```
 
-For a table that *any* engine reads after a move with no reader flag — paths re-anchored on
-commit, plus multi-writer atomic commits — you want an external Iceberg **REST catalog**.
+For a table that *any* engine reads with no flag, relocate it (`shapeshift relocate`, or
+`relocate_table` / `plan_relocation` as a library): one new metadata version names a rewritten
+manifest list and manifest for every one that named a moved file (transcoded: every field
+another engine wrote is kept), and a rewritten position delete file for every one whose rows
+name a moved data file (paths replaced, rows re-sorted). Data files are not touched, every
+snapshot is kept, the files the rewrite supersedes are removed after the commit, an incomplete
+copy is refused before anything is written, and a copy whose original still answers needs
+`Identity::Copy` (a new `table-uuid`) or `Identity::Moved`. A catalog does not do this: it
+records where a table's metadata is, and the paths inside stay as written.
+
+```sh
+shapeshift relocate /mnt/archive/events_tbl --copy   # the original is still in ./events_tbl
+```

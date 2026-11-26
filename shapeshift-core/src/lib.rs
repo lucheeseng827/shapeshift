@@ -37,6 +37,7 @@ mod drift;
 mod error;
 mod infer;
 mod mar;
+mod predicate;
 mod record;
 mod shaper;
 mod sink;
@@ -52,15 +53,16 @@ pub use drift::{DriftPolicy, DriftReport, DriftSpec, NewField, TypeMismatch, MAX
 pub use error::{Result, ShapeError};
 pub use infer::{infer_columns, looks_like_date, looks_like_timestamp};
 pub use mar::{estimate as estimate_mar, MarInputs, MarReport};
-pub use shaper::{effective_columns, run_pipeline, PushOutcome, RunReport, Shaper};
+pub use predicate::{Predicate, Tested, MAX_WHERE_BYTES};
+pub use shaper::{effective_columns, run_pipeline, FilterReport, PushOutcome, RunReport, Shaper};
 pub use sink::{MergeSummary, Sink, SinkSummary};
 pub use spec::{
-    partition_source_column, ColumnSpec, Compression, DatasetSpec, Options, OutputFormat,
-    OutputSpec, SchemaMode, SourceFormat, SourceSpec,
+    partition_source_column, CatalogSpec, ColumnSpec, Compression, DatasetSpec, Options,
+    OutputFormat, OutputSpec, SchemaMode, SourceFormat, SourceSpec,
 };
 pub use transform::Transform;
 pub use types::ColumnType;
-pub use value::{flatten_leaves, segments, select};
+pub use value::{flatten_leaves, segments, select, MAX_PATH_SEGMENTS, MAX_RECORD_DEPTH};
 
 // Re-export the Arrow types embedders need to work with emitted batches without
 // pinning arrow themselves.

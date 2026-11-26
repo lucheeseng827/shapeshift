@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use shapeshift_core::MAX_RECORD_DEPTH;
+
 use crate::error::JsonError;
 
 /// A JSON record plus its 1-based source line (the 1-based **element index** in
@@ -27,6 +29,62 @@ pub(crate) const SIMD_SLACK: usize = 64;
 /// (not buffered whole), so a pathological huge/unterminated line can't OOM the
 /// process. Generous — real records are far smaller — but bounds the worst case.
 pub const DEFAULT_MAX_LINE: usize = 256 * 1024 * 1024;
+
+/// Whether `bytes`, one record's text, nests deeper than `max` (objects and arrays
+/// together). The owned readers ask this before parsing, because building a
+/// `serde_json::Value` recurses once per level; the tape readers parse first (that is
+/// iterative) and ask [`crate::tape::nodes_nest_deeper_than`] instead.
+///
+/// It is close to free for the records a run sees. A valid record nested `d` deep has
+/// `d` openers and `d` closers, so one shorter than `2(max + 1)` bytes cannot exceed
+/// `max`; an invalid one fails to parse anyway, before anything recurses. Nor can a
+/// record with no more than `max` opening brackets in all, counted with `memchr`'s SIMD
+/// search (the release build is size-optimized, so a plain loop would not be
+/// vectorized). Only a record past both, a long one with many brackets, is walked
+/// exactly, minding strings: about a nanosecond a byte, where building its `Value`
+/// costs over ten.
+pub(crate) fn nests_deeper_than(bytes: &[u8], max: usize) -> bool {
+    if bytes.len() < 2 * (max + 1) {
+        return false;
+    }
+    if memchr::memchr2_iter(b'{', b'[', bytes).nth(max).is_none() {
+        return false;
+    }
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for &b in bytes {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The parse error for a record nested deeper than [`MAX_RECORD_DEPTH`].
+pub(crate) fn too_deep(line: u64, raw: String) -> JsonError {
+    JsonError::Parse {
+        line,
+        message: format!("record nests deeper than {MAX_RECORD_DEPTH} levels; skipped"),
+        raw,
+    }
+}
 
 /// Streaming JSONL reader: one JSON value per non-blank line. Blank / whitespace-
 /// only lines are skipped (not errors). Bounded RAM — at most one line (capped at
@@ -198,6 +256,9 @@ impl<R: BufRead> Iterator for JsonlReader<R> {
         match self.next_line_bytes()? {
             Err(e) => Some(Err(e)),
             Ok(()) => {
+                if nests_deeper_than(&self.buf, MAX_RECORD_DEPTH) {
+                    return Some(Err(too_deep(self.line, self.raw_line())));
+                }
                 // simd-json parses **destructively**, so it gets a scratch copy and
                 // `buf` keeps the original bytes — that way the raw line is only
                 // materialized on the error path, not allocated for every good row.
@@ -525,6 +586,9 @@ impl<R: BufRead> Iterator for JsonArrayReader<R> {
         match self.next_element_bytes()? {
             Err(e) => Some(Err(e)),
             Ok(()) => {
+                if nests_deeper_than(&self.buf, MAX_RECORD_DEPTH) {
+                    return Some(Err(too_deep(self.index, self.raw_element())));
+                }
                 // simd-json parses **destructively**, so it gets a scratch copy and
                 // `buf` keeps the original bytes — that way the raw element is only
                 // materialized on the error path, not allocated for every good one.
@@ -796,6 +860,78 @@ mod tests {
             }
             other => panic!("expected an oversize reject, got {other:?}"),
         }
+        assert_eq!(it.next().unwrap().unwrap()["a"], 2);
+        assert!(it.next().is_none());
+    }
+
+    /// `d` objects, one inside the next, around a 1.
+    fn nested(d: usize) -> String {
+        format!("{}1{}", "{\"a\":".repeat(d), "}".repeat(d))
+    }
+
+    #[test]
+    fn nesting_is_measured_exactly_and_only_outside_strings() {
+        let max = MAX_RECORD_DEPTH;
+        assert!(!nests_deeper_than(nested(max).as_bytes(), max));
+        assert!(nests_deeper_than(nested(max + 1).as_bytes(), max));
+        // Arrays count as objects do, and mixed nesting adds up.
+        let arrays = format!("{}{}", "[".repeat(max + 1), "]".repeat(max + 1));
+        assert!(nests_deeper_than(arrays.as_bytes(), max));
+        let mixed = format!("{}1{}", "{\"a\":[".repeat(max / 2), "]}".repeat(max / 2));
+        assert!(!nests_deeper_than(mixed.as_bytes(), max));
+        let mixed = format!("[{mixed}]");
+        assert!(nests_deeper_than(mixed.as_bytes(), max));
+        // Brackets in strings (escaped quotes included) are text, however many.
+        let text = format!(
+            r#"{{"s":"\"{}\"","t":["{}"]}}"#,
+            "[{".repeat(max),
+            "{".repeat(max)
+        );
+        assert!(serde_json::from_str::<Value>(&text).is_ok());
+        assert!(!nests_deeper_than(text.as_bytes(), max));
+        // Many shallow containers side by side are not deep.
+        let wide = format!("[{}0]", "{},[],".repeat(max));
+        assert!(!nests_deeper_than(wide.as_bytes(), max));
+    }
+
+    #[test]
+    fn a_record_nested_too_deep_is_a_parse_error_and_the_reader_goes_on() {
+        let max = MAX_RECORD_DEPTH;
+        let expect_deep = |r: Option<Result<Value, JsonError>>, at: u64| match r {
+            Some(Err(JsonError::Parse { line, message, raw })) => {
+                assert_eq!(line, at);
+                assert!(
+                    message.contains(&format!("nests deeper than {max} levels")),
+                    "{message}"
+                );
+                assert!(
+                    raw.starts_with("{\"a\":{\"a\":"),
+                    "the raw text is kept for the sidecar"
+                );
+            }
+            other => panic!("expected a depth reject, got {other:?}"),
+        };
+        let data = format!(
+            "{{\"a\":1}}\n{}\n{}\n{{\"a\":2}}\n",
+            nested(max + 1),
+            nested(max)
+        );
+        let mut it = JsonlReader::new(Cursor::new(data.clone()));
+        assert_eq!(it.next().unwrap().unwrap()["a"], 1);
+        expect_deep(it.next(), 2);
+        assert!(it.next().unwrap().is_ok(), "exactly the limit is accepted");
+        assert_eq!(it.next().unwrap().unwrap()["a"], 2);
+        assert!(it.next().is_none());
+
+        let data = format!(
+            "[{{\"a\":1}}, {}, {}, {{\"a\":2}}]",
+            nested(max + 1),
+            nested(max)
+        );
+        let mut it = JsonArrayReader::from_reader(Cursor::new(data)).unwrap();
+        assert_eq!(it.next().unwrap().unwrap()["a"], 1);
+        expect_deep(it.next(), 2);
+        assert!(it.next().unwrap().is_ok());
         assert_eq!(it.next().unwrap().unwrap()["a"], 2);
         assert!(it.next().is_none());
     }

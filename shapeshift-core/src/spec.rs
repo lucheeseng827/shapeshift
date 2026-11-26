@@ -22,6 +22,12 @@ pub struct DatasetSpec {
     /// the output path is a directory).
     pub dataset: String,
 
+    /// Which source records the run takes (`where:`): a subset of SQL's `WHERE` over
+    /// `from:`-style paths, tested on each record before it is shaped. A record it does
+    /// not keep is counted as filtered, not rejected. See [`crate::Predicate`].
+    #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+
     /// How to read the input.
     #[serde(default)]
     pub source: SourceSpec,
@@ -90,7 +96,9 @@ pub struct OutputSpec {
     pub format: OutputFormat,
 
     /// Destination path. For `parquet`, a file or directory; for `iceberg`, the
-    /// table root directory.
+    /// table root directory. Left empty when `catalog` names the table: the catalog
+    /// decides where it lives.
+    #[serde(default)]
     pub path: String,
 
     /// Parquet page compression. Snappy by default (musl-static, no C codecs).
@@ -111,6 +119,54 @@ pub struct OutputSpec {
     /// there is none. Empty (the default) = a plain write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_on: Vec<String>,
+
+    /// Iceberg only: commit through this REST catalog instead of a table directory. The
+    /// catalog names the table's location and is its commit point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogSpec>,
+}
+
+/// A spec error, with a word added when it is a catalog credential written into the spec:
+/// say where credentials go instead of only that the key is unknown.
+fn secret_hint(error: String) -> String {
+    let secret = [
+        "token",
+        "credential",
+        "client_secret",
+        "client_id",
+        "password",
+    ]
+    .iter()
+    .any(|k| error.contains(&format!("unknown field `{k}`")));
+    if secret && error.contains("`warehouse`") {
+        format!(
+            "{error}. A catalog's credentials never go in a spec, which is meant to be \
+             committed: set SHAPESHIFT_CATALOG_TOKEN, or SHAPESHIFT_CATALOG_CREDENTIAL \
+             (client_id:client_secret), in the environment"
+        )
+    } else {
+        error
+    }
+}
+
+/// An Iceberg REST catalog and a table in it (`output.catalog`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSpec {
+    /// The catalog's base URI, `http(s)://host:port` (the client adds `/v1/…`).
+    pub uri: String,
+    /// The table, `<namespace>.<name>`; a namespace may have several levels
+    /// (`analytics.raw.events`).
+    pub table: String,
+    /// Which of the catalog's warehouses holds the table (sent as `?warehouse=` when the
+    /// client asks for the catalog's config): a Polaris catalog's name, a Lakekeeper
+    /// warehouse. A catalog with one needs none.
+    ///
+    /// The catalog's credentials are deliberately not here: a spec is meant to be
+    /// committed, so they come from the environment (`SHAPESHIFT_CATALOG_TOKEN`, or
+    /// `SHAPESHIFT_CATALOG_CREDENTIAL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warehouse: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,14 +276,22 @@ fn default_sample() -> usize {
 impl DatasetSpec {
     /// Parse a spec from YAML or JSON (auto-detected: a leading `{` is JSON).
     pub fn parse(text: &str) -> crate::error::Result<Self> {
-        let trimmed = text.trim_start();
-        let spec: DatasetSpec = if trimmed.starts_with('{') {
-            serde_json::from_str(text).map_err(|e| crate::error::ShapeError::Spec(e.to_string()))?
-        } else {
-            serde_yaml::from_str(text).map_err(|e| crate::error::ShapeError::Spec(e.to_string()))?
-        };
+        let spec = DatasetSpec::decode(text)?;
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Read a spec from YAML or JSON **without** validating it: for a caller that
+    /// changes it first (the CLI's flags override what the file says) and then calls
+    /// [`DatasetSpec::validate`] on the result.
+    pub fn decode(text: &str) -> crate::error::Result<Self> {
+        let trimmed = text.trim_start();
+        let decoded = if trimmed.starts_with('{') {
+            serde_json::from_str(text).map_err(|e| e.to_string())
+        } else {
+            serde_yaml::from_str(text).map_err(|e| e.to_string())
+        };
+        decoded.map_err(|e| crate::error::ShapeError::Spec(secret_hint(e)))
     }
 
     /// Serialize to YAML (the canonical on-disk form).
@@ -240,6 +304,9 @@ impl DatasetSpec {
         use crate::error::ShapeError;
         if self.dataset.trim().is_empty() {
             return Err(ShapeError::Spec("`dataset` must not be empty".into()));
+        }
+        if let Some(w) = &self.filter {
+            crate::predicate::Predicate::parse(w)?;
         }
         if self.schema == SchemaMode::Strict && self.columns.is_empty() {
             return Err(ShapeError::Spec(
@@ -254,6 +321,13 @@ impl DatasetSpec {
                 return Err(ShapeError::Spec(format!(
                     "duplicate column name `{}`",
                     c.name
+                )));
+            }
+            if crate::value::segments(c.source_path()).len() > crate::value::MAX_PATH_SEGMENTS {
+                return Err(ShapeError::Spec(format!(
+                    "column `{}`: its path has more than {} segments",
+                    c.name,
+                    crate::value::MAX_PATH_SEGMENTS
                 )));
             }
         }
@@ -273,6 +347,45 @@ impl DatasetSpec {
                      (pick another name)"
                 )));
             }
+        }
+        // A catalog table lives where the catalog says, so it takes no path; any other
+        // output needs one.
+        match &self.output.catalog {
+            Some(c) => {
+                if self.output.format != OutputFormat::Iceberg {
+                    return Err(ShapeError::Spec(
+                        "`output.catalog` applies only to Iceberg tables (`format: iceberg`)"
+                            .into(),
+                    ));
+                }
+                if !self.output.path.trim().is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`output.path` and `output.catalog` both name the table: the catalog \
+                         decides its location, so drop the path"
+                            .into(),
+                    ));
+                }
+                if c.uri.trim().is_empty() || c.table.trim().is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`output.catalog` needs both a `uri` and a `table`".into(),
+                    ));
+                }
+                if c.warehouse.as_deref().is_some_and(|w| w.trim().is_empty()) {
+                    return Err(ShapeError::Spec(
+                        "`output.catalog.warehouse` is empty: name the warehouse, or leave the \
+                         key out"
+                            .into(),
+                    ));
+                }
+            }
+            None if self.output.path.trim().is_empty() => {
+                return Err(ShapeError::Spec(
+                    "`output.path` is required (or `output.catalog` for an Iceberg table a \
+                     REST catalog names)"
+                        .into(),
+                ));
+            }
+            None => {}
         }
         // In strict schema mode, partition columns must be among the declared columns.
         // In infer mode `columns` may be only a partial pin-list (the rest ride along from

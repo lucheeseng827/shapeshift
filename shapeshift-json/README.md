@@ -54,7 +54,7 @@ sequenceDiagram
         A->>P: parse element
         alt valid JSON
             P-->>D: Ok(Value)
-        else invalid / oversized
+        else invalid / oversized / nested past 512
             P-->>D: Err(Parse { line: element index, raw }) — recoverable
         end
     end
@@ -76,6 +76,13 @@ sequenceDiagram
   index), so the CLI can sidecar it to `<output>.rejects.jsonl` for repair and
   re-ingest — the reader recovers and continues. Structural array problems (truncated
   array, trailing comma/garbage) are reported once, then iteration ends.
+- **Bounded nesting** — a record nested deeper than `MAX_RECORD_DEPTH` (512 levels of
+  objects and arrays) is refused the same way: everything downstream recurses once per
+  level, and one deliberately deep line would otherwise exhaust the stack and abort the
+  process. The tape readers read the depth off the parsed tape (parsing is iterative),
+  stepping over subtrees too small to matter; the owned readers decide from the bytes
+  before building a `Value`. A record under 1 KiB cannot be that deep and is not
+  looked at.
 - **`open_reader`** — a boxed `RecordSource` for a path in the requested
   `shapeshift_core::SourceFormat` (both formats stream).
 

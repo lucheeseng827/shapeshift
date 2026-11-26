@@ -1,12 +1,14 @@
-//! The console's JSON API — thin wrappers over the OSS shaper's four verbs
-//! (`infer`, `shape`, `inspect`, `cost`). Every handler reuses the exact engine
+//! The console's JSON API — thin wrappers over the OSS shaper's verbs
+//! (`infer`, `shape`, `inspect`), plus the run log and table history. Every handler reuses the exact engine
 //! the CLI uses; nothing here is a second implementation of the shaping logic.
 //!
-//! The server is single-user and stateless beyond the files it writes: shaped
-//! output and reject sidecars land under the configured data directory, and
-//! `inspect` reads them (or any local table) back. There is no run queue, no
-//! persistence of specs, and no metering — that is orchestration, and out of scope
-//! here.
+//! The server is single-user and keeps nothing beyond the files it writes: shaped
+//! output and reject sidecars land under the configured data directory, `inspect`
+//! reads them (or any local table) back, and every shape is a run in the run log
+//! (`runs.jsonl`), whose snapshot carries the run's id. `runs`, `tables` and `table`
+//! read those back; a table's history comes from its own metadata. There is no run
+//! queue, no persistence of specs, and no metering — that is orchestration, and out
+//! of scope here.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,20 +18,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use shapeshift_core::{
-    estimate_mar, infer_columns, Compression, DatasetSpec, DriftPolicy, DriftReport, MarInputs,
-    OutputFormat, OutputSpec, PushOutcome, SchemaMode, Shaper, SourceFormat, SourceSpec,
+    infer_columns, Compression, DatasetSpec, DriftPolicy, DriftReport, OutputFormat, OutputSpec,
+    Predicate, PushOutcome, SchemaMode, Shaper, SourceFormat, SourceSpec,
 };
-use shapeshift_iceberg::IcebergSink;
+use shapeshift_iceberg::{parse_metadata_json, read_local_history, table_events, IcebergSink};
 use shapeshift_json::{open_reader, JsonError};
 use shapeshift_parquet::ParquetSink;
 
 use crate::http::{Request, Response};
+use crate::runs::{Run, RunLog};
 
 /// Shared server state: where output lands, plus a monotonic counter for unique
 /// temp-file names (so concurrent requests never clobber each other's input).
 pub struct Ctx {
     data_dir: PathBuf,
     counter: AtomicU64,
+    /// The runs this console started (`runs.jsonl` in the data dir).
+    runs: RunLog,
 }
 
 /// Cap on reject rows returned inline to the console (all rows are still counted and
@@ -43,9 +48,11 @@ impl Ctx {
             .with_context(|| format!("creating {}/tmp", data_dir.display()))?;
         std::fs::create_dir_all(data_dir.join("outputs"))
             .with_context(|| format!("creating {}/outputs", data_dir.display()))?;
+        let runs = RunLog::open(&data_dir)?;
         Ok(Ctx {
             data_dir,
             counter: AtomicU64::new(0),
+            runs,
         })
     }
 
@@ -119,13 +126,14 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
     }
     let dataset = clean_dataset(r.dataset.as_deref());
     let input_path = write_temp_input(ctx, &r.input, r.format)?;
-    let samples = sample_records(&input_path, r.format, r.sample)?;
+    let samples = sample_records(&input_path, r.format, r.sample, None)?;
     if samples.is_empty() {
         bail!("no well-formed records were read from the input");
     }
     let columns = infer_columns(samples.iter(), r.flatten);
     let spec = DatasetSpec {
         dataset: dataset.clone(),
+        filter: None,
         source: SourceSpec {
             format: r.format,
             path: None,
@@ -136,6 +144,7 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
             compression: Compression::Snappy,
             partition_by: Vec::new(),
             merge_on: Vec::new(),
+            catalog: None,
         },
         schema: SchemaMode::Infer,
         columns,
@@ -283,6 +292,8 @@ fn drift_resp(r: &DriftReport) -> DriftResp {
 
 #[derive(Serialize)]
 struct ShapeResp {
+    /// This run's id in the run log, also recorded in the snapshot it commits.
+    run_id: String,
     dataset: String,
     format: String,
     output_path: String,
@@ -291,12 +302,27 @@ struct ShapeResp {
     rows_in: u64,
     rows_out: u64,
     rejected: u64,
+    /// Records the spec's `where` did not keep (0 without one).
+    filtered: u64,
+    /// Records in which the `where` compared values of different kinds, which is never
+    /// true (`status = '500'` against a number), and the first such comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_mismatches: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_mismatch: Option<String>,
     parse_errors: u64,
     row_groups: u64,
     bytes: u64,
     rejects_total: u64,
     rejects_path: Option<String>,
     rejects_sample: Vec<RejectRow>,
+    /// The snapshot an Iceberg write committed (a string: it is 64-bit), and the version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table_version: Option<u64>,
+    /// The table already held this run's snapshot, so nothing was written.
+    earlier_attempt: bool,
     /// What the source did that the schema does not cover — absent under
     /// `drift.policy: ignore`, or when the run matched its schema exactly.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,13 +334,41 @@ pub fn shape(ctx: &Ctx, req: &Request) -> Response {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    match do_shape(ctx, r) {
-        Ok(resp) => Response::json(200, &resp),
-        Err(e) => Response::error(400, e.to_string()),
+    // Every shape is a run in the log, from the moment it starts.
+    let mut run = ctx.runs.start(
+        json!({
+            "command": "shape",
+            "dataset": clean_dataset(r.dataset.as_deref()),
+            "format": format!("{:?}", r.to).to_lowercase(),
+            "append": r.append,
+        }),
+        "shaping",
+    );
+    match do_shape(ctx, r, &mut run) {
+        Ok(resp) => {
+            run.succeed(json!({
+                "rows_in": resp.rows_in,
+                "rows_out": resp.rows_out,
+                "rejected": resp.rejected,
+                "parse_errors": resp.parse_errors,
+                "row_groups": resp.row_groups,
+                "bytes": resp.bytes,
+                "snapshot_id": resp.snapshot_id,
+                "table_version": resp.table_version,
+                "rejects_path": resp.rejects_path,
+                "earlier_attempt": resp.earlier_attempt,
+            }));
+            Response::json(200, &resp)
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            run.fail(&e);
+            Response::error(400, message)
+        }
     }
 }
 
-fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
+fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
     let dataset = clean_dataset(r.dataset.as_deref());
 
     // 1. Assemble the effective spec (parsed, or synthesized for on-the-fly inference).
@@ -324,9 +378,10 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(text) => DatasetSpec::parse(text).map_err(|e| anyhow!("spec: {e}"))?,
+        Some(text) => DatasetSpec::parse(text).map_err(anyhow::Error::from)?,
         None => DatasetSpec {
             dataset: dataset.clone(),
+            filter: None,
             source: SourceSpec {
                 format: r.format,
                 path: None,
@@ -337,6 +392,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
                 compression: r.compression,
                 partition_by: Vec::new(),
                 merge_on: Vec::new(),
+                catalog: None,
             },
             schema: SchemaMode::Infer,
             columns: Vec::new(),
@@ -368,7 +424,18 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         OutputFormat::Iceberg => (ctx.out_dir().join(&dataset), true),
     };
     spec.output.path = output_path.to_string_lossy().into_owned();
-    spec.validate().map_err(|e| anyhow!("spec: {e}"))?;
+    spec.validate()
+        .map_err(|e| anyhow::Error::from(e).context("spec"))?;
+    run.set(
+        "output",
+        json!(output_path
+            .strip_prefix(ctx.data_dir())
+            .unwrap_or(&output_path)
+            .to_string_lossy()),
+    );
+    if !spec.output.merge_on.is_empty() {
+        run.set("merge_on", json!(spec.output.merge_on));
+    }
 
     if !spec.output.partition_by.is_empty() && !is_iceberg {
         bail!("`partition_by` applies only to Iceberg output");
@@ -392,12 +459,25 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
 
     // 5. Build the shaper (inferring in Infer mode).
     let inferred = if spec.schema == SchemaMode::Infer {
-        let samples = sample_records(&input_path, spec.source.format, spec.options.infer_sample)?;
+        // Inference sees only the records the run keeps, so the schema is theirs alone.
+        let filter = spec.filter.as_deref().map(Predicate::parse).transpose()?;
+        let samples = sample_records(
+            &input_path,
+            spec.source.format,
+            spec.options.infer_sample,
+            filter.as_ref(),
+        )?;
+        if let (Some(f), true) = (&filter, samples.is_empty() && spec.columns.is_empty()) {
+            bail!(
+                "`where {f}` kept none of the records sampled, so there is no schema to infer: \
+                 check the expression, or declare the columns"
+            );
+        }
         infer_columns(samples.iter(), spec.options.flatten)
     } else {
         Vec::new()
     };
-    let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(|e| anyhow!("{e}"))?;
+    let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(anyhow::Error::from)?;
     let schema = shaper.schema();
 
     // 6. For a fresh (non-append) Iceberg write, start from a clean table dir so a
@@ -412,7 +492,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
 
     // 7. Create the sink (local filesystem only — object-store URLs are CLI-only).
     let mut sink: Box<dyn shapeshift_core::Sink> = if is_iceberg {
-        let s = if merging {
+        let mut s = if merging {
             IcebergSink::create_merge(
                 &output_path,
                 schema,
@@ -428,12 +508,15 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
                 r.append,
                 &spec.output.partition_by,
             )
-        };
-        Box::new(s.map_err(|e| anyhow!("{e}"))?)
+        }
+        .map_err(anyhow::Error::from)?;
+        // The snapshot records which of this console's runs wrote it.
+        s.set_run_id(&run.id()).map_err(anyhow::Error::from)?;
+        Box::new(s)
     } else {
         Box::new(
             ParquetSink::create(&output_path, schema, spec.output.compression)
-                .map_err(|e| anyhow!("{e}"))?,
+                .map_err(anyhow::Error::from)?,
         )
     };
 
@@ -456,8 +539,9 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         match item {
             Ok(v) => {
                 rows_in += 1;
-                match shaper.push(&v).map_err(|e| anyhow!("{e}"))? {
+                match shaper.push(&v).map_err(anyhow::Error::from)? {
                     PushOutcome::Appended => rows_out += 1,
+                    PushOutcome::Filtered => {}
                     PushOutcome::Rejected(reason) => {
                         rejected += 1;
                         let rec = json!({ "error": reason, "raw": v });
@@ -472,8 +556,8 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
                     }
                 }
                 if shaper.pending() >= rg {
-                    if let Some(batch) = shaper.flush().map_err(|e| anyhow!("{e}"))? {
-                        sink.write_batch(&batch).map_err(|e| anyhow!("{e}"))?;
+                    if let Some(batch) = shaper.flush().map_err(anyhow::Error::from)? {
+                        sink.write_batch(&batch).map_err(anyhow::Error::from)?;
                         batches += 1;
                     }
                 }
@@ -493,15 +577,17 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
             Err(JsonError::Io(e)) => return Err(anyhow!("read error: {e}")),
         }
     }
-    if let Some(batch) = shaper.flush().map_err(|e| anyhow!("{e}"))? {
-        sink.write_batch(&batch).map_err(|e| anyhow!("{e}"))?;
+    if let Some(batch) = shaper.flush().map_err(anyhow::Error::from)? {
+        sink.write_batch(&batch).map_err(anyhow::Error::from)?;
         batches += 1;
     }
     if let Some(mut w) = reject_writer {
         use std::io::Write as _;
         w.flush()?;
     }
-    let summary = sink.finish().map_err(|e| anyhow!("{e}"))?;
+    run.phase(if is_iceberg { "committing" } else { "closing" });
+    let summary = sink.finish().map_err(anyhow::Error::from)?;
+    let filter_report = shaper.filter_report().cloned();
     let drift = shaper.into_drift_report();
 
     if temp_input {
@@ -520,6 +606,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
     let rejects_total = rejected + parse_errors;
 
     Ok(ShapeResp {
+        run_id: run.id(),
         dataset,
         format: format!("{:?}", spec.output.format).to_lowercase(),
         output_path: output_path.to_string_lossy().into_owned(),
@@ -527,6 +614,10 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         rows_in,
         rows_out,
         rejected,
+        filtered: filter_report.as_ref().map_or(0, |f| f.filtered),
+        // Present only for a run with a `where`.
+        type_mismatches: filter_report.as_ref().map(|f| f.type_mismatches),
+        first_mismatch: filter_report.and_then(|f| f.first_mismatch),
         parse_errors,
         row_groups: batches,
         bytes: summary.bytes,
@@ -534,6 +625,9 @@ fn do_shape(ctx: &Ctx, r: ShapeReq) -> Result<ShapeResp> {
         rejects_path: (rejects_total > 0).then(|| reject_path.to_string_lossy().into_owned()),
         rejects_sample,
         drift: drift.as_ref().filter(|r| !r.is_clean()).map(drift_resp),
+        snapshot_id: summary.snapshot_id.map(|id| id.to_string()),
+        table_version: summary.table_version,
+        earlier_attempt: summary.earlier_attempt,
     })
 }
 
@@ -570,7 +664,9 @@ fn do_inspect(ctx: &Ctx, path: &str) -> Result<Value> {
             "path": resolved.to_string_lossy(),
             "format_version": info.format_version,
             "table_uuid": info.table_uuid,
-            "current_snapshot_id": info.current_snapshot_id,
+            // A string, like every other snapshot id this API returns: Iceberg's are 64-bit,
+            // and a JSON number that large loses its last digits in a JavaScript client.
+            "current_snapshot_id": info.current_snapshot_id.to_string(),
             "total_records": info.total_records,
             "position_deletes": info.total_position_deletes,
             "live_records": info.live_records(),
@@ -588,37 +684,148 @@ fn do_inspect(ctx: &Ctx, path: &str) -> Result<Value> {
     }
 }
 
-// ---- cost -------------------------------------------------------------------
+// ---- runs and tables (read-only) ---------------------------------------------
 
-#[derive(Deserialize)]
-struct CostReq {
-    rows: u64,
-    vendor_per_million: f64,
-    #[serde(default)]
-    self_host_cost: f64,
+/// The runs this console started, newest first.
+pub fn runs(ctx: &Ctx) -> Response {
+    Response::json(200, &json!({ "runs": ctx.runs.list() }))
 }
 
-pub fn cost(_ctx: &Ctx, req: &Request) -> Response {
-    let r: CostReq = match parse_body(req) {
+/// The Iceberg tables under the data dir's `outputs/`, most recently changed first.
+pub fn tables(ctx: &Ctx) -> Response {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(ctx.out_dir()) {
+        for e in entries.flatten() {
+            let dir = e.path();
+            if !dir.join("metadata").is_dir() {
+                continue;
+            }
+            let Ok(Some((current, _))) = read_local_history(&dir, 0) else {
+                continue;
+            };
+            let rel = dir.strip_prefix(ctx.data_dir()).unwrap_or(&dir);
+            out.push(table_card(&rel.to_string_lossy(), &current));
+        }
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t["last_updated_ms"].as_i64().unwrap_or(0)));
+    Response::json(200, &json!({ "tables": out }))
+}
+
+#[derive(Deserialize)]
+struct TableReq {
+    path: String,
+}
+
+/// One table's history as events, read from its metadata files (a local table directory:
+/// one under the data dir's `outputs/`, or any path given).
+pub fn table(ctx: &Ctx, req: &Request) -> Response {
+    let r: TableReq = match parse_body(req) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let report = estimate_mar(MarInputs {
-        rows: r.rows,
-        vendor_per_million: r.vendor_per_million,
-        self_host_cost: r.self_host_cost,
+    let dir = ctx.resolve(r.path.trim());
+    match read_local_history(&dir, 200) {
+        Ok(Some((current, earlier))) => {
+            let mut card = table_card(&r.path, &current);
+            let info = parse_metadata_json(&current.to_string()).ok();
+            card["schema"] = json!(info
+                .map(|i| i
+                    .fields
+                    .iter()
+                    .map(|(n, t)| json!({ "name": n, "type": t }))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default());
+            // A partition field is shown as its transform of the source column it reads
+            // (`day(event_at)`), not of its own name (`event_at_day`).
+            let columns = column_names(&current);
+            card["partition"] = json!(current["partition-specs"]
+                .as_array()
+                .and_then(|specs| specs
+                    .iter()
+                    .find(|s| s["spec-id"] == current["default-spec-id"]))
+                .and_then(|s| s["fields"].as_array())
+                .map(|f| f
+                    .iter()
+                    .map(|f| format!(
+                        "{}({})",
+                        f["transform"].as_str().unwrap_or("?"),
+                        f["source-id"]
+                            .as_i64()
+                            .and_then(|id| columns.get(&id).cloned())
+                            .or_else(|| f["name"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| "?".into())
+                    ))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default());
+            card["versions_read"] = json!(earlier.len() + 1);
+            card["events"] = json!(table_events(&current, &earlier)
+                .iter()
+                .map(|e| e.to_json())
+                .collect::<Vec<_>>());
+            Response::json(200, &card)
+        }
+        Ok(None) => Response::error(404, format!("no Iceberg table at {}", dir.display())),
+        Err(e) => Response::error(400, format!("{e}")),
+    }
+}
+
+/// The current schema's columns by field id (nested struct fields as `parent.child`).
+fn column_names(meta: &Value) -> std::collections::HashMap<i64, String> {
+    fn walk(fields: &Value, prefix: &str, out: &mut std::collections::HashMap<i64, String>) {
+        for f in fields.as_array().into_iter().flatten() {
+            let (Some(id), Some(name)) = (f["id"].as_i64(), f["name"].as_str()) else {
+                continue;
+            };
+            let full = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            if f["type"]["type"] == "struct" {
+                walk(&f["type"]["fields"], &full, out);
+            }
+            out.insert(id, full);
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    if let Some(schema) = meta["schemas"].as_array().and_then(|a| {
+        a.iter()
+            .find(|s| s["schema-id"] == meta["current-schema-id"])
+    }) {
+        walk(&schema["fields"], "", &mut out);
+    }
+    out
+}
+
+/// What a table list shows of one table, from its current metadata.
+fn table_card(path: &str, meta: &Value) -> Value {
+    let current = meta["current-snapshot-id"].as_i64().filter(|&id| id != -1);
+    let head = current.and_then(|id| {
+        meta["snapshots"]
+            .as_array()?
+            .iter()
+            .find(|s| s["snapshot-id"].as_i64() == Some(id))
     });
-    Response::json(
-        200,
-        &json!({
-            "rows": report.rows,
-            "vendor_cost": report.vendor_cost,
-            "self_host_cost": report.self_host_cost,
-            "saved": report.saved,
-            "saved_fraction": report.saved_fraction,
-            "vendor_per_million": r.vendor_per_million,
-        }),
-    )
+    let num = |k: &str| -> i64 {
+        head.and_then(|s| s["summary"][k].as_str())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    json!({
+        "path": path,
+        "location": meta["location"],
+        "table_uuid": meta["table-uuid"],
+        "format_version": meta["format-version"],
+        "last_updated_ms": meta["last-updated-ms"],
+        "current_snapshot_id": current.map(|id| id.to_string()),
+        "snapshots": meta["snapshots"].as_array().map_or(0, |a| a.len()),
+        "schema_id": meta["current-schema-id"],
+        // Equality deletes (another engine's) match by value: with any, the live count is unknown.
+        "rows": (num("total-equality-deletes") == 0)
+            .then(|| num("total-records") - num("total-position-deletes")),
+        "data_files": num("total-data-files"),
+        "delete_files": num("total-delete-files"),
+    })
 }
 
 // ---- health -----------------------------------------------------------------
@@ -689,15 +896,24 @@ fn write_temp_input(ctx: &Ctx, text: &str, format: SourceFormat) -> Result<PathB
     Ok(path)
 }
 
-/// Read up to `n` well-formed records (0 = all) for inference; malformed *lines* are
-/// tolerated here (surfaced during the shaping pass) but a real I/O error aborts.
-fn sample_records(path: &Path, format: SourceFormat, n: usize) -> Result<Vec<Value>> {
+/// Read up to `n` well-formed records (0 = all) that `filter` keeps, for inference;
+/// malformed *lines* are tolerated here (surfaced during the shaping pass) but a real I/O
+/// error aborts.
+fn sample_records(
+    path: &Path,
+    format: SourceFormat,
+    n: usize,
+    filter: Option<&Predicate>,
+) -> Result<Vec<Value>> {
     let reader =
         open_reader(path, format).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
     let mut out = Vec::new();
     for item in reader {
         match item {
             Ok(v) => {
+                if filter.is_some_and(|f| !f.test(&v).keep) {
+                    continue;
+                }
                 out.push(v);
                 if n != 0 && out.len() >= n {
                     break;

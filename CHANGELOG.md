@@ -10,6 +10,276 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-26
+
+### Upgrading
+
+Specs and command lines that worked in 0.4 work unchanged. Two things are new to look for:
+`output.path` may now be left out when `output.catalog` names the table (without either,
+validation reports it instead of the parser), and `--summary-json` gains `output.catalog`.
+
+- `OutputSpec` gained `catalog: Option<CatalogSpec>`; a struct literal needs `catalog: None`.
+  `CatalogSpec` gained `warehouse: Option<String>`.
+- `shapeshift-objstore`'s catalog functions (`ObjectStoreIcebergSink::create_in_catalog`,
+  `create_merge_in_catalog`, `find_run_in_catalog`, `compact_in_catalog`, `expire_in_catalog`)
+  take a `&CatalogConnection` (URI, warehouse, `CatalogAuth`) where they took the URI;
+  `CatalogConnection::new(uri)` is the old behaviour, and `CatalogAuth::from_env()` reads the
+  credentials the CLI uses. `--summary-json` gains `output.catalog.warehouse`, and `warehouse`
+  for `compact` and `expire`.
+- `SinkSummary` gained `rebases` (0 for every sink but a catalog commit) and
+  `earlier_attempt`; a struct literal needs them, or `..Default::default()`.
+- `MetadataBuild` gained `tags: SnapshotTags` (`SnapshotTags::default()` records only the
+  version), and `metadata::{MetadataInput, AppendInput}` gained `tags: &SnapshotTags`.
+- A moved table's paths resolve through `Anchors` (`Anchors::of(&metadata)`):
+  `LocalTableFiles::new` and `StoreFiles::open` take them where they took the `location`, and
+  `LocalTableFiles::resolve` returns a `Result`; `plan_expiry` takes `&Anchors` after the table;
+  `current_manifest_list_key` takes only the metadata. `IcebergInfo` gained `location` and
+  `moved`.
+- Every snapshot shapeshift writes now carries `shapeshift.version` in its summary (an
+  ordinary summary property; readers show it and ignore it).
+- The console's `POST /api/inspect` returns an Iceberg table's `current_snapshot_id` as a
+  string, like every other snapshot id its API returns (it was a JSON number).
+- `shapeshift-objstore` depends on `reqwest` directly: the same version and features
+  `object_store` already links, so no crate is added to the object-store build.
+- `DatasetSpec` gained `filter: Option<String>` (the spec's `where`); a struct literal needs
+  `filter: None`. `PushOutcome` gained `Filtered`, so a `match` on it needs that arm, and
+  `RunReport` gained `rows_filtered` and `filter`. `DatasetSpec::decode` reads a spec without
+  validating it, for a caller that changes it first.
+- **A record nested more than 512 levels deep** (objects and arrays together) is now a parse
+  error: counted in `parse_errors=`, sidecarred, and skipped, as an unparseable line is. Nothing
+  real nests that deep. `MAX_RECORD_DEPTH` is the limit.
+- A path has at most as many segments as a record may nest (512, `MAX_PATH_SEGMENTS`). A
+  column's `from:` path longer than that is refused when the spec loads, and so is a `where`
+  path. A longer path could never resolve, and the drift tracker handled paths recursively, so
+  a long enough one (a spec's text alone, sent to `serve`) aborted the process.
+- `--summary-json` for `shape` gains `rows.filtered` (0 without a filter) and `where`
+  (null without one). The text report adds `filtered=` only when the run has a `where`.
+- `ManifestFileEntry` gained `partitions: Option<Vec<FieldSummary>>` (the manifest's partition
+  summaries; `ManifestFileEntry::added` sets `None`), and is `PartialEq`; a struct literal needs
+  the field. The manifest lists shapeshift writes carry the optional `partitions` field (null
+  for its own manifests), which every Iceberg reader accepts.
+- `shapeshift-iceberg` depends on `miniz_oxide` (pure Rust, with `adler2`) to inflate
+  `deflate` manifests, and on `snap` directly (parquet already linked it). The lean binary
+  stays free of C code.
+- A write onto an existing table of format version 1 or 3 is now refused before anything is
+  written (it used to fail late, or graft version 2 snapshots onto it).
+
+### Added
+
+- **Commits through an Iceberg REST catalog.** `shape … --catalog <uri> --table
+  <namespace>.<name>` (or `output.catalog: { uri, table }` in a spec, with no `path`) writes to
+  a table the catalog names, in a build with the `object_store` feature. The catalog decides
+  the table's location (any store the object-store build writes to, or a local `file:` path)
+  and is the commit point: the run asks it to add its snapshot only if the table is still the
+  one it loaded and `main` has not moved (`assert-table-uuid`, `assert-ref-snapshot-id`). A
+  table the catalog lacks is created empty, with the run's schema and partitioning, in a
+  namespace that must exist; a table that already holds data needs `--append`. Added columns
+  travel in the same commit (`add-schema`, asserting the schema and last field id they evolved
+  from).
+- **`shapeshift relocate` (S2).** A table copied or moved to a new place (any tool: `cp -r`, `aws s3
+  sync`) is re-anchored there, so any Iceberg reader opens it with no flag, and a copy reads its own
+  files rather than the original's. One new metadata version names a rewritten manifest list and
+  manifest for each one that named a moved file (transcoded: decoded against its own schema and
+  written back with every field another engine wrote kept), and a rewritten position delete file for
+  each one whose rows name a moved data file (paths replaced, rows re-sorted; its size, bounds,
+  column sizes and split offsets recorded anew). Data files are never touched, every snapshot is
+  kept, nothing is overwritten (the commit guard; exit 75), and the superseded files are removed
+  after the commit. Every file a snapshot reads is checked against one listing first: an incomplete
+  copy is refused, naming what is missing, before anything is written. A move keeps the
+  `table-uuid`; when a table still answers where this one was written, or that cannot be checked, it
+  asks for `--moved` or `--copy` (a new `table-uuid`). `--dry-run` and `--summary-json`; local
+  tables and object stores (`relocate_table`, `relocate_iceberg`, `plan_relocation`). Running it
+  again does nothing. Checked by `verify_duckdb.py` after every scenario on local paths, `file://`
+  and S3 (a moved table fails DuckDB's default read until relocated, then reads every snapshot;
+  merges go on; moved, written to and moved again; a copy gets its own identity while the original
+  reads as before) and by `verify_foreign.py` (a table PyIceberg and shapeshift wrote, relocated,
+  read and appended to by PyIceberg, its partition summaries intact); a build that skips the
+  delete-file rewrite is caught by deleted rows coming back. The docs no longer say a REST catalog
+  re-anchors a moved table: none does.
+- **`relocate --catalog <uri> --table <namespace>.<name>` (S2, R3).** After relocating, the table's
+  metadata file is registered with the REST catalog (`POST …/register`), and `shape`, `compact` and
+  `expire` then write through the catalog onto it, a local table at its plain path included (the
+  catalog write path opens an absolute path as `file://`). A name the catalog already has is never
+  overwritten: the same metadata file again is already done, so a run that relocated but failed to
+  register is repeated, and so is a later version of it written through the catalog since (its
+  metadata log names the file); any other table is refused, this one at its old place included. `--warehouse`, `--insecure-catalog` and the
+  environment's credentials work as for `shape --catalog`; a dry run registers nothing. A
+  `--catalog` URI that carries `user:password@` is refused before anything runs, a dry run
+  included, since the URI is printed. A catalog's table at an `s3a://` or `s3n://` location
+  (Spark's spellings, which a relocation keeps) now opens as S3 for `shape`, `compact` and
+  `expire` through the catalog.
+  `--summary-json` gains `metadata` and `catalog`. Checked against a stand-in catalog and, in CI,
+  against Iceberg's reference REST fixture (plain path, `file://`, S3).
+- **Catalog credentials, from the environment (S1).** A catalog that asks for credentials gets a
+  bearer token from `SHAPESHIFT_CATALOG_TOKEN`, or OAuth2 client credentials from
+  `SHAPESHIFT_CATALOG_CREDENTIAL` (`client_id:client_secret`), exchanged with the
+  `client_credentials` grant at the catalog's `{uri}/v1/oauth/tokens` (or
+  `SHAPESHIFT_CATALOG_OAUTH2_SERVER_URI`), scope `catalog` unless `SHAPESHIFT_CATALOG_SCOPE` says
+  otherwise (`PRINCIPAL_ROLE:ALL` for Polaris). The token is fetched again once nine tenths of its
+  life have passed. `--warehouse` (or `output.catalog.warehouse`) is sent as `?warehouse=` with `GET
+  /v1/config`, for catalogs that hold several (Polaris, Lakekeeper); `shape`, `compact` and `expire`
+  take it. Credentials never come from a spec: a `token:` there is refused with where it goes
+  instead. A 401 or 403 names the variable to set, or says the one set was refused. No token or
+  secret appears in an error, a log or `--summary-json`: a token endpoint's refusal is reported by
+  status and a known OAuth error code only, and a catalog URI or token endpoint carrying
+  `user:password@` is refused. Credentials are not sent over plain `http://` to another machine
+  unless the run passes `--insecure-catalog` (a compose network; warned about, and never set by a
+  variable or a spec); without credentials plain http is fine, and a catalog or token endpoint on
+  this machine is never reached through an `HTTP_PROXY`. `expires_in` is read as a number or a
+  numeric string, as some providers send it, and counted from before the token was asked for.
+  Checked against a stand-in catalog that demands a token, issues short-lived ones and refuses
+  expired ones; six mutants (a token never refreshed, a commit sent without one, a token request
+  that follows a 307 and so re-sends the secret to its target, credentials sent over plain http, a
+  loopback catalog reached through the proxy, `--insecure-catalog` ignored) are caught.
+- **A commit's outcome is settled, never guessed.** A 409 is a refusal: exit 75, the run's
+  files removed. A 5xx, a timeout or a dropped connection can hide a commit that landed, so the
+  table is loaded again: this run's snapshot in it means committed; `main` moved elsewhere
+  means refused (75, files removed); `main` unmoved without it means the commit may still be
+  applied: the same commit is sent again (up to 3 times; every copy asserts the same head and
+  adds the same snapshot, so at most one can apply), and if that never settles it, the run
+  fails with an ordinary error that leaves its files in place. A copy that is refused is
+  checked against the table, since the first attempt may have landed after all. A create
+  whose answer was lost is settled the same way, by loading the table.
+- **Appends retry instead of exiting 75.** An append the catalog refuses because another
+  writer committed first is built again on the new head and committed again, up to 16 times,
+  with a short random pause between: its data files are reused, and only its small manifest
+  and manifest list are written again (the refused attempt's are removed). A table whose
+  schema, partitioning, location or identity changed meanwhile is not rebased onto: that run
+  still exits 75. Against Apache Iceberg's reference REST server, 12 writers starting
+  together three times over all committed (up to 5 rebases each); without rebasing, 24 of 30
+  runs of a 6-writer race exited 75.
+- **Merge, compaction and expiry through the catalog.** `shape --catalog … --merge-on <key>`
+  upserts into the catalog's table (creating it if the catalog has none), and `compact
+  --catalog <uri> <namespace>.<name>` and `expire --catalog <uri> <namespace>.<name>` maintain
+  it. A merge's delete files and a compaction's rewritten files go to the table's location like
+  an append's, and their snapshot is committed with the same requirements. An expiry commits
+  `remove-snapshots`, asserting `main` and every other branch and tag where it found them (it
+  keeps the snapshots they point at), and deletes the files only the expired snapshots read once
+  the catalog has taken it. None of the three is rebuilt when another writer commits first, since
+  each was planned against the head it loaded: they exit 75, with nothing published and a merge's
+  or compaction's files removed. A lost answer is settled by loading the table, as for an append;
+  an expiry whose outcome stays unknown deletes nothing. A merge that cannot read a file because
+  another writer moved `main` meanwhile (a compaction and an expiry remove files) exits 75 too.
+- **Row filter `where`.** A spec's `where:` (or `shape --where`) names the source records the
+  run takes, so one spec can take one kind of record out of a mixed stream: `where:
+  record_type = 'gate'`. The expression is a subset of SQL's `WHERE` (`=`, `!=`, `<`, `<=`, `>`,
+  `>=`, `in`, `not in`, `is [not] null`, `and`, `or`, `not`, single-quoted strings) over the paths
+  `from:` takes, with SQL's three-valued logic. It is tested on the source record before
+  shaping: a record it does not keep is counted as filtered (`filtered=` in the report,
+  `rows.filtered` in `--summary-json`), never rejected, never seen by drift detection or
+  inference, and a strict spec no longer aborts on another kind's row. The fields it reads are
+  not reported as drift. A comparison of different kinds (`status = '500'` against a number) is
+  never true, and the run counts and describes it. Mistakes are refused when the spec loads,
+  naming the character and what to write instead (`==`, `<>`, `= null`, …). `infer --where`
+  samples only the kept records and writes the filter into the spec. CI holds it to DuckDB's
+  answer for the same text (`examples/where/verify_duckdb.py`, 300 generated expressions); it
+  costs 2–5% on a run that keeps every row (BENCHMARKS).
+- `shapeshift-core`: `Predicate` (parse, `test`, `explain_mismatch`), `Tested`,
+  `MAX_WHERE_BYTES`, `FilterReport`, `Shaper::with_where` and `Shaper::filter_report`.
+- **Writing into tables other engines made.** Manifests and manifest lists compressed with
+  Avro `deflate` (Iceberg's `gzip`, the default of Iceberg's Java writers and of PyIceberg) or
+  `snappy` are read; manifest lists are read by the schema they carry, so other engines'
+  extra fields (`partitions`, `key_metadata`) and v1's field names read right, and the partition
+  summaries are kept on every manifest carried into a new snapshot. Appending to, merging into,
+  compacting and expiring a table PyIceberg made all work, with PyIceberg writing to it in
+  between; DuckDB and PyIceberg read exactly the expected rows after every step
+  (`examples/merge/verify_foreign.py`, in CI). Merging into or compacting a table whose data
+  files are zstd (PyIceberg's and Java's default) needs `--features zstd`, and the lean build
+  says so instead of "Disabled feature at compile time". `zstandard` manifests, encrypted
+  manifests and format version 1 and 3 tables are refused by name.
+- **Run ids: a retry never appends twice.** `shape --run-id <id>` names the run, for an
+  orchestrator that may start it more than once (a retry, or another worker taking over from
+  one that went quiet while it may still be running). The id is recorded in the snapshot
+  (`shapeshift.run-id`), and checked three times: before anything is read (a run the table
+  already holds is reported as done, with its snapshot, and nothing is written); when the sink
+  finishes (an attempt that began after the run committed keeps nothing); and whenever a commit
+  is refused (the snapshot that won may be an earlier attempt of the same run: then that is the
+  run's commit, and this attempt's files are removed instead of rebased, refused or appended
+  again). Local tables, tables in object stores and tables in a REST catalog. Against Apache
+  Iceberg's reference REST server, 20 runs started as 4 concurrent attempts each, beside one
+  another, landed exactly once each (60 attempts found an earlier one), late retries of every
+  run read nothing, and DuckDB read each run's rows once. Parquet output refuses `--run-id`.
+- Snapshot summaries record `shapeshift.version`, and `shapeshift.rebases` when a catalog append
+  was rebuilt before it landed.
+- **`shapeshift serve` shows what happened.** A **Runs** view lists every run the console
+  started, drawn as its phases with its outcome (committed, conflict 75, failed 1) and counts,
+  kept in `runs.jsonl` in the data dir; each run's id is recorded in the snapshot it commits.
+  A **Tables** view reads a local table's history from its own metadata: every snapshot an
+  event (append, overwrite, replace), schema changes, expiries (expired snapshots stay listed,
+  marked), rows and files in and out, and the data files after each snapshot, each linked to
+  the run that wrote it. New endpoints `GET /api/runs`, `GET /api/tables`, `POST /api/table`.
+  The console now takes the look of the product site (its palette, square ruled panels, mono
+  headings, a light theme), and lays out on a phone.
+- `shapeshift-iceberg`: `table_events` (a table's history as events, from its current and
+  earlier metadata), `TableEvent`, `EventCounts`, `Writer`, `SchemaChange`, `RemovedSnapshot`,
+  and `read_local_history`.
+- `--summary-json`: `run_id` (or null), and `table.earlier_attempt` (true when an earlier attempt
+  of the run had committed `table.snapshot_id`; `version` and `metadata` are then null).
+- `--summary-json`: `output.catalog` (`{uri, table}`, or null), and `table.rebases`. For a
+  catalog commit `table` is present with `version` null (the catalog numbers its own metadata
+  files), `metadata` the file the catalog wrote, and `rebases` how many times the append was
+  built again onto a newer head (0 everywhere else). The text report says so too. `compact` and
+  `expire` report `catalog` (the `--catalog` URI, or null), with `version` null for a catalog
+  commit.
+- `shapeshift-iceberg`: `TableIdent`, `catalog_commit`, `create_table_request`,
+  `judge_reload`, `main_snapshot`, `rebase_blocked`. `PartitionDataFile` and `Stats` are
+  `Clone`. For merge, compaction and expiry: `CatalogCommit` carries a `CommitEffect`
+  (`AddsSnapshot` or `RemovesSnapshots`) and judges itself (`CatalogCommit::judge`), with
+  `expiry_commit` and `judge_removal`. `shapeshift-objstore`:
+  `ObjectStoreIcebergSink::create_in_catalog`, `ObjectStoreIcebergSink::create_merge_in_catalog`,
+  `compact_in_catalog` and `expire_in_catalog`.
+- Run ids in the crates: `shapeshift-iceberg` has `SnapshotTags`, `RunSnapshot`,
+  `snapshot_of_run`, `validate_run_id`, `find_run_local`, `run_in`, `earlier_attempt_summary`,
+  the `RUN_ID_KEY` / `VERSION_KEY` / `REBASES_KEY` names, and `IcebergSink::set_run_id`;
+  `shapeshift-objstore` has `ObjectStoreIcebergSink::set_run_id`, `find_run` and
+  `find_run_in_catalog`.
+
+### Removed
+
+- **The console's Cost page** and its `POST /api/cost`. Pricing a run is a one-off question,
+  not part of shaping: `shapeshift cost` stays on the CLI, and the website has the same
+  arithmetic as [a calculator](https://shapeshift.mancube.net/#cost).
+
+### Fixed
+
+- **A table moved, written to and moved again could no longer be merged into or compacted.** A
+  write into a moved table records its files under the new directory and keeps the old
+  `location`, so the table holds paths written at two places; only paths under `location` were
+  re-anchored, and after a second move a merge or a compaction failed with "No such file". Every
+  reader now resolves a path under any directory the table has been written at (its
+  `location`, and the directory of every manifest list and logged metadata file) at the same
+  key where the table is now, cut on a path-component boundary (`orders-archive/` is no longer
+  taken for `orders/`); a recorded path that climbs out of the table (`..`) is refused.
+  `expire` deletes the files written at every one of those places as the table's own: a copy's
+  expired files are deleted in the copy (never the original's), where they used to be counted
+  as outside the table and left behind. `inspect` now says when a table has moved, and a write
+  into a moved table warns, since other engines' default readers still look for its files at
+  the recorded place (0.5 S2, phase R1).
+- **A deeply nested record crashed the run.** One line nested some tens of thousands of levels
+  deep (a few thousand on a 2 MiB thread, as serve's workers have) overflowed the stack and
+  aborted the whole process, instead of being reported as a bad line. Building the record,
+  converting it, inferring from it and freeing it all recurse once per level. The readers now
+  refuse a record past 512 levels before any of that runs, as a parse error the rest of the run
+  survives. The check does not show in a run's time (BENCHMARKS, "The nesting limit").
+- **Console: an Iceberg table's snapshot id read wrong in Inspect.** A 64-bit id sent as a JSON
+  number lost its last digits in the browser (`…521819` shown as `…521800`), the id an engine's
+  time travel needs. It is sent as a string now.
+- **Console: the spec editor showed settings the run would not use.** The console's controls
+  (dataset, source and output format, compression; the path is managed) win over the spec, but
+  an inferred spec still said `format: parquet` after Output was set to Iceberg. The editor now
+  follows the controls, after Infer and as they change.
+- **An `object_store` build on a system without CA certificates** (an image on `scratch`,
+  distroless-static or a slim base) failed every catalog and object-store call with only
+  "builder error". It now says that no CA certificates were found, that they are needed even for
+  plain http, and to install `ca-certificates` or point `SSL_CERT_FILE` at a PEM bundle. Any other
+  client that cannot start shows its whole cause, not only "builder error".
+- **`shapeshift serve` in a build without the console** said "unrecognized subcommand" and
+  suggested `expire`. It now says the release binary and image are the lean build and how to
+  build the console, and exits 2.
+- A snapshot appended onto a table with no snapshot yet (`current-snapshot-id: -1`, as a
+  catalog writes a table it created empty) recorded `parent-snapshot-id: -1`; it now records
+  no parent.
+
 ## [0.4.0] - 2026-11-24
 
 ### Upgrading
@@ -752,7 +1022,8 @@ build musl-static and ships as a single binary.
 - **Not in the engine:** no incremental / CDC, no scheduling, and no connectors — those
   belong to an orchestrator.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.1.2...v0.2.0

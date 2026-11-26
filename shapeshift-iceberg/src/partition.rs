@@ -482,6 +482,7 @@ pub(crate) fn partition_dir(fields: &[PartitionField], key: &[PartVal]) -> Strin
 
 /// One finished data file: its table-relative key, partition values, row count, byte
 /// size, and per-column statistics.
+#[derive(Clone)]
 pub struct PartitionDataFile {
     pub data_key: String,
     pub partition: Vec<PartVal>,

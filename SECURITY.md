@@ -86,13 +86,21 @@ Output paths are **caller-controlled**. `shapeshift` writes exactly where the sp
 or `--output` flag points (Parquet files, or an Iceberg table directory laid out
 as `data/`, `metadata/`, and `version-hint.text`). It does not sandbox or
 canonicalize the destination and, in v0.1, the Iceberg table records **absolute**
-file paths (a moved table reads via DuckDB's `allow_moved_paths=true`; catalog-managed
-relocation is roadmap). Write only to locations you trust and
+file paths (a moved table reads via DuckDB's `allow_moved_paths=true`, or is re-anchored with
+`shapeshift relocate`). Write only to locations you trust and
 control, and do not point the output at a shared or sensitive directory whose
 contents could be overwritten. The tool logs to stderr and prints run summaries to
 stdout; it reads no credentials and emits no secrets *of its own*. The one caveat is
 the reject sidecar above, which echoes rejected **input** verbatim and so is only as
 sensitive as the data you feed it.
+
+`shapeshift relocate` looks at the places a table's own metadata says it was written at,
+to tell a move from a copy: whether a table still answers there. On this machine that is a
+directory listing of the place's `metadata/`; in an object store, one `LIST` of
+`<place>/metadata/` with the run's own credentials, in another bucket of the same kind of
+store too (a bucket-to-bucket move is the common case), never in another kind of store (an
+`s3://` place named by a `file://` table, say). To relocate a table whose metadata you do not
+trust without any such request, pass `--moved` or `--copy`: either skips the check.
 
 ## Third-party crates
 

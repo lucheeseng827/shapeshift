@@ -42,14 +42,23 @@
 //! merges back: it applies every delete and packs small files in one `replace` snapshot
 //! (see the `compact` module), and [`expire_table`] lets old snapshots go with the files
 //! only they read (see the `expire` module).
+//!
+//! A table a REST catalog names commits through the catalog instead of its own metadata
+//! file: [`catalog_commit`] turns the same artifacts (an append's, a merge's, a
+//! compaction's) into the catalog's requirements and updates, and [`expiry_commit`] an
+//! expiry's plan (see the `catalog` module). The HTTP client lives in `shapeshift-objstore`.
 
+mod anchor;
 mod avro;
+mod catalog;
 mod compact;
 mod expire;
 mod files;
+mod history;
 mod merge;
 mod metadata;
 mod partition;
+mod relocate;
 mod stats;
 
 use std::fs::File;
@@ -70,9 +79,14 @@ use shapeshift_core::{Compression, Result, ShapeError, Sink, SinkSummary};
 use crate::avro::{DataFileMeta, ManifestContent};
 use crate::metadata::{MetadataInput, SnapshotCounts};
 
+pub use crate::anchor::{is_elsewhere, same_store, warn_if_elsewhere, Anchors};
 pub use crate::avro::{
-    read_manifest_data_files, read_manifest_entries, read_manifest_list, ManifestDataFile,
-    ManifestEntry, ManifestFileEntry,
+    read_manifest_data_files, read_manifest_entries, read_manifest_list, FieldSummary,
+    ManifestDataFile, ManifestEntry, ManifestFileEntry,
+};
+pub use crate::catalog::{
+    catalog_commit, create_table_request, expiry_commit, judge_reload, judge_removal,
+    main_snapshot, rebase_blocked, CatalogCommit, CommitEffect, Reloaded, TableIdent,
 };
 pub use crate::compact::{
     compact, staged_paths, CompactContext, CompactOptions, CompactOutcome, CompactSummary,
@@ -83,11 +97,21 @@ pub use crate::expire::{
     DEFAULT_MAX_SNAPSHOT_AGE_MS,
 };
 pub use crate::files::{LocalTableFiles, TableFiles};
+pub use crate::history::{
+    table_events, EventCounts, RemovedSnapshot, SchemaChange, TableEvent, Writer,
+};
 pub use crate::merge::{resolve_key_columns, KeyColumn, MergeContext, MergeOutcome, MergeWriter};
-pub use crate::metadata::{join_location, IceField};
+pub use crate::metadata::{
+    join_location, snapshot_of_run, validate_run_id, IceField, RunSnapshot, SnapshotTags,
+    REBASES_KEY, RUN_ID_KEY, RUN_ID_MAX, VERSION_KEY,
+};
 pub use crate::partition::{
     parse_partition_expr, resolve_partition_fields, PartVal, PartitionDataFile, PartitionField,
     PartitionedWriter, Transform,
+};
+pub use crate::relocate::{
+    decide_identity, local_old_place, plan_relocation, relocate_table, undecided_error, Identity,
+    OldPlace, RelocateCommit, RelocateContext, RelocateOptions, RelocatePlan, RelocateSummary,
 };
 pub use crate::stats::Stats;
 
@@ -176,10 +200,7 @@ pub(crate) fn table_partition_fields(
     meta: &serde_json::Value,
     fields: &[IceField],
 ) -> Result<Vec<PartitionField>> {
-    let empty = Vec::new();
-    let spec = meta["partition-specs"][0]["fields"]
-        .as_array()
-        .unwrap_or(&empty);
+    let spec = writable_spec_fields(meta)?;
     let mut exprs = Vec::with_capacity(spec.len());
     for pf in spec {
         let source_id = pf["source-id"].as_i64().unwrap_or(-1);
@@ -489,6 +510,8 @@ pub struct MetadataBuild<'a> {
     /// fresh table replaces (a write without `append`). The fresh table is committed as the
     /// next version, never over an existing metadata file.
     pub replaces: Option<u64>,
+    /// What the snapshot records about the write: its run id and rebases.
+    pub tags: SnapshotTags,
 }
 
 /// Build the manifest, manifest-list, `metadata.json`, and `version-hint.text` for one
@@ -670,6 +693,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
                 manifest_list_path: &manifest_list_uri,
                 counts,
                 replaces_metadata_file: replaced_file.as_deref(),
+                tags: &b.tags,
             })?,
             b.replaces.map_or(1, |n| n + 1),
         ),
@@ -684,6 +708,7 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
                 manifest_list_path: &manifest_list_uri,
                 counts,
                 schema_fields: b.ice_fields,
+                tags: &b.tags,
             })?,
             p.version + 1,
         ),
@@ -713,6 +738,61 @@ fn last_sequence_number(meta: &serde_json::Value) -> Result<i64> {
         .ok_or_else(|| ShapeError::Sink("prior metadata has no last-sequence-number".into()))
 }
 
+/// The fields of the partition spec a write lays its files out by: the table's default
+/// spec, found by its id. This writer's manifests name partition spec 0, so a table whose
+/// partitioning has evolved (another default spec) is refused rather than written under a
+/// spec that is no longer the table's — or under an id no spec has.
+///
+/// Every write onto an existing table (append, merge, compaction) passes here, so the
+/// table's format version is checked here too: this writer writes version 2 snapshots and
+/// manifests, so it writes onto version 2 tables only.
+fn writable_spec_fields(meta: &serde_json::Value) -> Result<&[serde_json::Value]> {
+    match meta["format-version"].as_i64() {
+        None | Some(2) => {}
+        Some(1) => {
+            return Err(ShapeError::Sink(
+                "cannot write: the table is Iceberg format version 1, and this writer writes \
+                 version 2 snapshots; upgrade the table with the engine that made it (its \
+                 `format-version` table property) and write again"
+                    .into(),
+            ))
+        }
+        Some(v) => {
+            return Err(ShapeError::Sink(format!(
+                "cannot write: the table is Iceberg format version {v}, and this writer \
+                 writes version 2 tables only"
+            )))
+        }
+    }
+    let default_id = meta["default-spec-id"].as_i64().unwrap_or(0);
+    if default_id != 0 {
+        return Err(ShapeError::Sink(format!(
+            "cannot write: the table's partitioning has evolved (its default partition spec is \
+             {default_id}), and this writer writes partition spec 0 only"
+        )));
+    }
+    let spec = meta["partition-specs"].as_array().and_then(|specs| {
+        specs
+            .iter()
+            .find(|s| s["spec-id"].as_i64().unwrap_or(0) == 0)
+    });
+    Ok(match spec {
+        Some(s) => s["fields"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+        None if meta["partition-specs"]
+            .as_array()
+            .map_or(true, |a| a.is_empty()) =>
+        {
+            &[]
+        }
+        None => {
+            return Err(ShapeError::Sink(
+                "cannot write: the table has no partition spec 0, the one this writer writes"
+                    .into(),
+            ))
+        }
+    })
+}
+
 /// Reject an append whose partitioning differs from the existing table's — a table's
 /// partition spec is fixed, and changing it (partition evolution) is a separate item.
 /// Public so both the local and object-store sinks fail-fast at `create` the same way.
@@ -720,10 +800,7 @@ pub fn ensure_partition_compatible(
     fields: &[PartitionField],
     prior_meta: &serde_json::Value,
 ) -> Result<()> {
-    let empty = Vec::new();
-    let prior = prior_meta["partition-specs"][0]["fields"]
-        .as_array()
-        .unwrap_or(&empty);
+    let prior = writable_spec_fields(prior_meta)?;
     if prior.len() != fields.len() {
         return Err(ShapeError::Sink(format!(
             "cannot append: the table is partitioned by {} column(s) but this write has {} \
@@ -846,12 +923,10 @@ pub fn evolve_fields(fields: &mut [IceField], prior_meta: &serde_json::Value) ->
 }
 
 /// The table-relative key (`metadata/snap-….avro`) of the current snapshot's manifest
-/// list, derived from the prior metadata by stripping the table base location. Exposed
-/// so both the local and object-store sinks resolve the prior manifest list the same way.
-pub fn current_manifest_list_key(
-    metadata: &serde_json::Value,
-    base_location: &str,
-) -> Result<String> {
+/// list: its recorded path with the table's anchor cut off ([`Anchors::key`]), so a moved
+/// table's list is found where the table is now. Exposed so both the local and
+/// object-store sinks resolve the prior manifest list the same way.
+pub fn current_manifest_list_key(metadata: &serde_json::Value) -> Result<String> {
     let current = &metadata["current-snapshot-id"];
     let uri = metadata["snapshots"]
         .as_array()
@@ -860,32 +935,27 @@ pub fn current_manifest_list_key(
         .ok_or_else(|| {
             ShapeError::Sink("prior metadata has no current-snapshot manifest-list".into())
         })?;
-    Ok(relative_key(uri, base_location))
-}
-
-/// Strip a table's base location off a fully-qualified file URI to get its table-relative
-/// key. Falls back to the segment from `metadata/` if the prefix doesn't match (e.g. a
-/// table copied to a new location before a catalog rewrite).
-fn relative_key(uri: &str, base_location: &str) -> String {
-    if let Some(rest) = uri.strip_prefix(base_location) {
-        return rest.trim_start_matches('/').to_string();
+    match Anchors::of(metadata).key(uri)? {
+        Some(key) => Ok(key.to_string()),
+        None => Err(ShapeError::Sink(format!(
+            "the current snapshot's manifest list {uri} is not in the table's `metadata/` \
+             directory; shapeshift reads a table opened by its path from that directory"
+        ))),
     }
-    if let Some(idx) = uri.rfind("/metadata/") {
-        return uri[idx + 1..].to_string();
-    }
-    uri.trim_start_matches('/').to_string()
 }
 
 /// Load the current state of an existing local Iceberg table for append, or `None` if no
-/// table is present at `table_dir` yet (a first write).
-fn load_prior_local(table_dir: &Path, base_location: &str) -> Result<Option<PriorTable>> {
+/// table is present at `table_dir` yet (a first write). `here` is the table's directory as
+/// an absolute path: a table whose metadata places it elsewhere is warned about.
+fn load_prior_local(table_dir: &Path, here: &str) -> Result<Option<PriorTable>> {
     let Some(version) = local_version(table_dir)? else {
         return Ok(None);
     };
     let meta_text =
         std::fs::read_to_string(table_dir.join(metadata_key(version))).map_err(sink_err)?;
     let metadata: serde_json::Value = serde_json::from_str(&meta_text).map_err(sink_err)?;
-    let mlist_key = current_manifest_list_key(&metadata, base_location)?;
+    warn_if_elsewhere(&metadata, here);
+    let mlist_key = current_manifest_list_key(&metadata)?;
     let mlist_bytes = std::fs::read(table_dir.join(&mlist_key)).map_err(sink_err)?;
     let manifests = avro::read_manifest_list(&mlist_bytes)?;
     Ok(Some(PriorTable {
@@ -893,6 +963,67 @@ fn load_prior_local(table_dir: &Path, base_location: &str) -> Result<Option<Prio
         version,
         manifests,
     }))
+}
+
+/// The snapshot run `run_id` committed to the local table at `table_dir`, if the table
+/// exists and its history holds one (see [`snapshot_of_run`]).
+pub fn find_run_local(table_dir: impl AsRef<Path>, run_id: &str) -> Result<Option<RunSnapshot>> {
+    let table_dir = table_dir.as_ref();
+    let Some(version) = local_version(table_dir)? else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(table_dir.join(metadata_key(version))).map_err(sink_err)?;
+    let meta: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;
+    Ok(snapshot_of_run(&meta, run_id))
+}
+
+/// A local table's current metadata and up to `max` earlier versions (newest first), for
+/// [`table_events`]. `None` when there is no table at `table_dir`. A version whose file is
+/// gone is skipped.
+pub fn read_local_history(
+    table_dir: impl AsRef<Path>,
+    max: usize,
+) -> Result<Option<(serde_json::Value, Vec<serde_json::Value>)>> {
+    let table_dir = table_dir.as_ref();
+    let Some(version) = local_version(table_dir)? else {
+        return Ok(None);
+    };
+    let read = |v: u64| -> Result<Option<serde_json::Value>> {
+        match std::fs::read_to_string(table_dir.join(metadata_key(v))) {
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(sink_err),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(sink_err(e)),
+        }
+    };
+    let current = read(version)?.ok_or_else(|| {
+        sink_err(format!(
+            "{} names v{version}, which is missing",
+            table_dir.display()
+        ))
+    })?;
+    let mut earlier = Vec::new();
+    for v in (1..version).rev().take(max) {
+        if let Some(m) = read(v)? {
+            earlier.push(m);
+        }
+    }
+    Ok(Some((current, earlier)))
+}
+
+/// The summary of a write that found its run already committed by an earlier attempt:
+/// nothing of its own stays, and the run's snapshot is the one reported.
+pub fn earlier_attempt_summary(found: &RunSnapshot) -> SinkSummary {
+    SinkSummary {
+        snapshot_id: Some(found.snapshot_id),
+        rebases: found.rebases,
+        earlier_attempt: true,
+        ..SinkSummary::default()
+    }
+}
+
+/// The snapshot run `run_id` committed to the table `prior` describes, if both are known.
+pub fn run_in(run_id: Option<&str>, prior: Option<&PriorTable>) -> Option<RunSnapshot> {
+    snapshot_of_run(&prior?.metadata, run_id?)
 }
 
 /// A write-once Iceberg v2 table sink, landing on the local filesystem.
@@ -912,6 +1043,9 @@ pub struct IcebergSink {
     /// Set for a merge: follows the written keys so `finish` can delete what they
     /// supersede.
     merge: Option<MergeWriter>,
+    /// The caller's run id, recorded in the snapshot and looked for when a commit is
+    /// refused (see [`IcebergSink::set_run_id`]).
+    run_id: Option<String>,
 }
 
 impl IcebergSink {
@@ -1025,6 +1159,7 @@ impl IcebergSink {
             prior,
             replaces,
             merge,
+            run_id: None,
         })
     }
 
@@ -1032,6 +1167,32 @@ impl IcebergSink {
     /// [`FileFooter`]). Each file gets its own, made from its own row count as it closes.
     pub fn set_footer(&mut self, footer: FileFooter) {
         self.writer.set_footer(footer);
+    }
+
+    /// Name the run this write belongs to. The id is recorded in the snapshot
+    /// (`shapeshift.run-id`), and a commit that another writer beats is checked against it:
+    /// if the snapshot that won carries the same id, an earlier attempt of this run committed
+    /// first, and this write reports that snapshot instead of failing or appending twice.
+    pub fn set_run_id(&mut self, run_id: &str) -> Result<()> {
+        validate_run_id(run_id)?;
+        self.run_id = Some(run_id.to_string());
+        Ok(())
+    }
+
+    /// After a refused commit (its files already removed): the summary of an earlier attempt
+    /// of this run that the table now holds, or the refusal itself.
+    fn earlier_attempt_or(&self, refusal: ShapeError) -> Result<SinkSummary> {
+        if let (Some(id), ShapeError::Conflict(_)) = (&self.run_id, &refusal) {
+            match find_run_local(&self.table_dir, id) {
+                Ok(Some(found)) => return Ok(earlier_attempt_summary(&found)),
+                Ok(None) => {}
+                // The refusal stands (nothing of this write landed, and a retry with the same
+                // run id is safe); only the look for an earlier attempt failed.
+                Err(e) => tracing::warn!(run = %id, error = %e,
+                    "could not look for an earlier attempt of this run after a refusal"),
+            }
+        }
+        Err(refusal)
     }
 }
 
@@ -1057,6 +1218,16 @@ impl Sink for IcebergSink {
         // Loaded and validated at `create` time (fail-fast); consume it to chain the snapshot.
         let prior = self.prior.take();
 
+        // An earlier attempt of this run committed before this one began (its snapshot is
+        // in the history; see `snapshot_of_run` for a rollback past it), so nothing of this
+        // attempt is kept.
+        if let Some(found) = run_in(self.run_id.as_deref(), prior.as_ref()) {
+            for f in &files {
+                let _ = std::fs::remove_file(f);
+            }
+            return Ok(earlier_attempt_summary(&found));
+        }
+
         // A merge finds the rows this write supersedes — reading only the key columns
         // of existing files that could hold one — and writes their position deletes.
         let files_written = files.clone();
@@ -1065,11 +1236,11 @@ impl Sink for IcebergSink {
             Some(m) => {
                 // Existing files are read where the table's metadata says they are,
                 // re-anchored to this directory if the table has moved.
-                let location = prior
+                let anchors = prior
                     .as_ref()
-                    .and_then(|p| p.metadata["location"].as_str())
-                    .unwrap_or(&base_location);
-                let files = LocalTableFiles::new(&self.table_dir, location);
+                    .map(|p| Anchors::of(&p.metadata))
+                    .unwrap_or_default();
+                let files = LocalTableFiles::new(&self.table_dir, anchors);
                 let out = m.finish(
                     &MergeContext {
                         staging_dir: &self.table_dir,
@@ -1088,7 +1259,11 @@ impl Sink for IcebergSink {
                             let _ = std::fs::remove_file(f);
                         }
                         let base = prior.as_ref().map_or(0, |p| p.version);
-                        return Err(moved_on(e, base, local_version(&self.table_dir)?));
+                        return self.earlier_attempt_or(moved_on(
+                            e,
+                            base,
+                            local_version(&self.table_dir)?,
+                        ));
                     }
                 }
             }
@@ -1110,17 +1285,22 @@ impl Sink for IcebergSink {
             timestamp_ms: snapshot_timestamp_ms(),
             prior,
             replaces: self.replaces,
+            tags: SnapshotTags {
+                run_id: self.run_id.clone(),
+                rebases: 0,
+            },
         })?;
 
         // Commit: manifests, then the guarded metadata file, then the hint. If another
-        // writer committed this version first, nothing of this write stays behind.
+        // writer committed this version first, nothing of this write stays behind — and
+        // if that writer was an earlier attempt of this same run, the run is committed.
         match commit_local(&self.table_dir, &art) {
             Ok(written) => files.extend(written),
             Err(e) => {
                 for f in &files {
                     let _ = std::fs::remove_file(f);
                 }
-                return Err(e);
+                return self.earlier_attempt_or(e);
             }
         }
 
@@ -1131,6 +1311,8 @@ impl Sink for IcebergSink {
             merge,
             table_version: Some(art.version),
             snapshot_id: Some(art.snapshot_id),
+            rebases: 0,
+            earlier_attempt: false,
         })
     }
 }
@@ -1162,6 +1344,14 @@ pub struct IcebergInfo {
     /// delete a row that is already deleted.
     pub total_position_deletes: i64,
     pub fields: Vec<(String, String)>,
+    /// The `location` the metadata records, which the table's file paths were written
+    /// against.
+    pub location: String,
+    /// The table is not at `location`: it was moved or copied. shapeshift reads and writes
+    /// it where it is, but other engines' default readers look for its files at
+    /// `location`. Set by [`inspect`] and its object-store twin, which know where the table
+    /// is; [`parse_metadata_json`] alone leaves it `false`.
+    pub moved: bool,
 }
 
 impl IcebergInfo {
@@ -1218,6 +1408,8 @@ pub fn parse_metadata_json(text: &str) -> Result<IcebergInfo> {
         total_records,
         total_position_deletes,
         fields,
+        location: v["location"].as_str().unwrap_or("").to_string(),
+        moved: false,
     })
 }
 
@@ -1447,19 +1639,9 @@ pub fn inspect(table_dir: impl AsRef<Path>) -> Result<IcebergInfo> {
         ))
     })?;
     let text = std::fs::read_to_string(table_dir.join(metadata_key(version))).map_err(sink_err)?;
-    parse_metadata_json(&text)
-}
-
-/// Re-anchor a stored absolute path (written against `base`) onto the current
-/// `table_dir`, so a moved table still resolves. Paths that don't share `base` (already
-/// relative, or externally-anchored) are returned as-is.
-fn reanchor(table_dir: &Path, base: &str, path: &str) -> std::path::PathBuf {
-    if !base.is_empty() {
-        if let Some(rest) = path.strip_prefix(base) {
-            return table_dir.join(rest.trim_start_matches('/'));
-        }
-    }
-    std::path::PathBuf::from(path)
+    let mut info = parse_metadata_json(&text)?;
+    info.moved = is_elsewhere(&info.location, &abspath(table_dir));
+    Ok(info)
 }
 
 /// Load a local table's current snapshot — whatever `version-hint.text` points at —
@@ -1473,7 +1655,7 @@ fn load_current_local(table_dir: &Path) -> Result<PriorTable> {
     })?;
     let text = std::fs::read_to_string(table_dir.join(metadata_key(version))).map_err(sink_err)?;
     let metadata: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;
-    let base = metadata["location"].as_str().unwrap_or("");
+    let files = LocalTableFiles::new(table_dir, Anchors::of(&metadata));
     let current = metadata["current-snapshot-id"].as_i64().unwrap_or(-1);
     let snapshots = metadata["snapshots"]
         .as_array()
@@ -1486,7 +1668,7 @@ fn load_current_local(table_dir: &Path) -> Result<PriorTable> {
     let ml_path = snap["manifest-list"]
         .as_str()
         .ok_or_else(|| ShapeError::Sink("snapshot has no manifest-list".into()))?;
-    let ml_bytes = std::fs::read(reanchor(table_dir, base, ml_path)).map_err(sink_err)?;
+    let ml_bytes = std::fs::read(files.resolve(ml_path)?).map_err(sink_err)?;
     let manifests = read_manifest_list(&ml_bytes)?;
     Ok(PriorTable {
         metadata,
@@ -1505,9 +1687,9 @@ pub fn compact_table(
 ) -> Result<CompactSummary> {
     let table_dir = table_dir.as_ref();
     let current = load_current_local(table_dir)?;
-    let location = current.metadata["location"].as_str().unwrap_or_default();
-    let files = LocalTableFiles::new(table_dir, location);
+    let files = LocalTableFiles::new(table_dir, Anchors::of(&current.metadata));
     let base_location = abspath(table_dir);
+    warn_if_elsewhere(&current.metadata, &base_location);
     let outcome = compact(
         &CompactContext {
             staging_dir: table_dir,
@@ -1540,11 +1722,13 @@ pub fn compact_table(
 pub fn expire_table(table_dir: impl AsRef<Path>, options: &ExpireOptions) -> Result<ExpireSummary> {
     let table_dir = table_dir.as_ref();
     let current = load_current_local(table_dir)?;
-    let location = current.metadata["location"].as_str().unwrap_or_default();
-    let files = LocalTableFiles::new(table_dir, location);
+    let anchors = Anchors::of(&current.metadata);
+    let files = LocalTableFiles::new(table_dir, anchors.clone());
     let base_location = abspath(table_dir);
+    warn_if_elsewhere(&current.metadata, &base_location);
     let plan = plan_expiry(
         &current,
+        &anchors,
         &base_location,
         &files,
         options,
@@ -1568,7 +1752,11 @@ pub fn expire_table(table_dir: impl AsRef<Path>, options: &ExpireOptions) -> Res
     summary.committed = true;
     summary.version = Some(commit.version);
     for t in &plan.delete {
-        match std::fs::remove_file(files.resolve(&t.path)) {
+        let Ok(path) = files.resolve(&t.path) else {
+            summary.files_not_deleted += 1;
+            continue;
+        };
+        match std::fs::remove_file(path) {
             Ok(()) => summary.count_deleted(t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => summary.count_deleted(t),
             Err(_) => summary.files_not_deleted += 1,
@@ -1594,18 +1782,18 @@ pub struct ScanFile {
 pub fn current_scan_files(table_dir: impl AsRef<Path>) -> Result<Vec<ScanFile>> {
     let table_dir = table_dir.as_ref();
     let current = load_current_local(table_dir)?;
-    let location = current.metadata["location"].as_str().unwrap_or_default();
-    let files = LocalTableFiles::new(table_dir, location);
+    let files = LocalTableFiles::new(table_dir, Anchors::of(&current.metadata));
     let mut live = merge::live_files(&files, &current)?;
-    Ok(live
-        .data
+    live.data
         .iter()
-        .map(|e| ScanFile {
-            path: files.resolve(&e.file_path).to_string_lossy().into_owned(),
-            record_count: e.record_count,
-            deleted_positions: live.deletes.remove(&e.file_path).unwrap_or_default(),
+        .map(|e| {
+            Ok(ScanFile {
+                path: files.resolve(&e.file_path)?.to_string_lossy().into_owned(),
+                record_count: e.record_count,
+                deleted_positions: live.deletes.remove(&e.file_path).unwrap_or_default(),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// The data-file paths referenced by a local table's **current snapshot**, re-anchored
@@ -1633,7 +1821,7 @@ pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
              Iceberg reader (iceberg_scan)"
         )));
     }
-    let base = current.metadata["location"].as_str().unwrap_or("");
+    let files_of = LocalTableFiles::new(table_dir, Anchors::of(&current.metadata));
     let current_id = current.metadata["current-snapshot-id"].as_i64();
     let total_records: i64 = current.metadata["snapshots"]
         .as_array()
@@ -1650,13 +1838,14 @@ pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
     let mut files = Vec::new();
     let mut rec_sum: i64 = 0;
     for m in &current.manifests {
-        let mbytes = std::fs::read(reanchor(table_dir, base, &m.path)).map_err(sink_err)?;
+        let mbytes = std::fs::read(files_of.resolve(&m.path)?).map_err(sink_err)?;
         for df in read_manifest_data_files(&mbytes)? {
             // content 0 = data; status 2 = DELETED.
             if df.content == 0 && df.status != 2 {
                 rec_sum += df.record_count;
                 files.push(
-                    reanchor(table_dir, base, &df.file_path)
+                    files_of
+                        .resolve(&df.file_path)?
                         .to_string_lossy()
                         .into_owned(),
                 );
@@ -1674,6 +1863,49 @@ pub fn current_data_files(table_dir: impl AsRef<Path>) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_is_checked_against_the_tables_default_spec_found_by_its_id() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+        let fields = ice_fields_from_schema(&schema).unwrap();
+        let by_region = resolve_partition_fields(&fields, &["region".into()]).unwrap();
+        let region_spec = |id: i64| {
+            serde_json::json!({ "spec-id": id, "fields": [
+                { "name": "region", "transform": "identity", "source-id": 2, "field-id": 1000 }] })
+        };
+        let unpartitioned = |id: i64| serde_json::json!({ "spec-id": id, "fields": [] });
+        // Spec 0 is found by its id, wherever it sits in the list.
+        let meta = serde_json::json!({ "default-spec-id": 0,
+            "partition-specs": [unpartitioned(1), region_spec(0)] });
+        ensure_partition_compatible(&by_region, &meta).unwrap();
+        assert!(ensure_partition_compatible(&[], &meta).is_err());
+        // Partitioning evolved to another default spec: refused, with or without a match
+        // for spec 0, rather than written under a spec that is no longer the table's.
+        let evolved = serde_json::json!({ "default-spec-id": 1,
+            "partition-specs": [unpartitioned(0), region_spec(1)] });
+        for write in [&by_region[..], &[]] {
+            let e = ensure_partition_compatible(write, &evolved)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("default partition spec is 1"), "{e}");
+        }
+        // No spec 0 at all (one removed): refused rather than naming an id no spec has.
+        let gone = serde_json::json!({ "default-spec-id": 0, "partition-specs": [region_spec(3)] });
+        assert!(ensure_partition_compatible(&by_region, &gone).is_err());
+        // A table with no specs listed is unpartitioned, as before.
+        ensure_partition_compatible(&[], &serde_json::json!({})).unwrap();
+        // Another engine's v1 or v3 table is refused: this writer writes v2 snapshots.
+        for (v, says) in [(1, "upgrade the table"), (3, "version 2 tables only")] {
+            let e = ensure_partition_compatible(&[], &serde_json::json!({ "format-version": v }))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(says), "v{v}: {e}");
+        }
+        ensure_partition_compatible(&[], &serde_json::json!({ "format-version": 2 })).unwrap();
+    }
 
     #[test]
     fn join_location_anchors_and_normalizes_slashes() {
@@ -1725,6 +1957,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             prior: None,
             replaces: None,
+            tags: SnapshotTags::default(),
         })
         .unwrap();
 
@@ -1766,6 +1999,7 @@ mod tests {
             timestamp_ms: 0,
             prior: None,
             replaces: None,
+            tags: SnapshotTags::default(),
         });
         assert!(err.is_err());
     }

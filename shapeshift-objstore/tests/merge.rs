@@ -9,8 +9,13 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{json, Value};
 
 use shapeshift_core::{ColumnSpec, ColumnType, Compression, MergeSummary, Shaper, Sink};
-use shapeshift_iceberg::{current_scan_files, inspect, IcebergSink};
-use shapeshift_objstore::ObjectStoreIcebergSink;
+use shapeshift_iceberg::{
+    current_scan_files, inspect, read_manifest_entries, read_manifest_list, CompactOptions,
+    ExpireOptions, IcebergSink, Identity, RelocateOptions,
+};
+use shapeshift_objstore::{
+    compact_iceberg, expire_iceberg, inspect_iceberg, relocate_iceberg, ObjectStoreIcebergSink,
+};
 
 fn tmp_dir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("ss-obj-merge-{}-{}", std::process::id(), name));
@@ -287,6 +292,8 @@ fn walk(dir: &std::path::Path) -> Vec<String> {
             }
         }
     }
+    // Directory order is not guaranteed: compare file sets, not listings.
+    out.sort();
     out
 }
 
@@ -332,4 +339,186 @@ fn of_two_object_store_writers_on_one_version_the_second_is_refused_and_cleaned_
     merge_url(&url, &[row(3, "ap", 3)]);
     assert_eq!(live(&remote).len(), 3);
     std::fs::remove_dir_all(&remote).ok();
+}
+
+#[test]
+fn an_object_store_attempt_that_loses_to_an_earlier_attempt_of_its_run_reports_that_snapshot() {
+    let remote = tmp_dir("run-race");
+    let url = format!("file://{}", remote.display());
+    merge_url(&url, &[row(1, "eu", 1)]);
+    let open = |rows: &[Value]| {
+        let (schema, b) = batch(rows);
+        let parts: Vec<String> = PARTS.iter().map(|s| s.to_string()).collect();
+        let mut s = ObjectStoreIcebergSink::create(&url, schema, Compression::Snappy, true, &parts)
+            .unwrap();
+        s.set_run_id("r-9").unwrap();
+        s.write_batch(&b).unwrap();
+        s
+    };
+    let mut first = open(&[row(2, "us", 2)]);
+    let mut second = open(&[row(2, "us", 2)]);
+    let won = first.finish().unwrap();
+    let after_first = walk(&remote);
+    let lost = second.finish().unwrap();
+    assert!(lost.earlier_attempt);
+    assert_eq!(lost.snapshot_id, won.snapshot_id);
+    assert_eq!(
+        walk(&remote),
+        after_first,
+        "nothing of the second attempt was left"
+    );
+    assert_eq!(live(&remote).len(), 2, "the run's row is in the table once");
+    let found = shapeshift_objstore::find_run(&url, "r-9").unwrap().unwrap();
+    assert_eq!(Some(found.snapshot_id), won.snapshot_id);
+    assert_eq!(shapeshift_objstore::find_run(&url, "r-10").unwrap(), None);
+    // An attempt that begins after the run committed finds it in the table it loaded.
+    let late = open(&[row(2, "us", 2)]).finish().unwrap();
+    assert!(late.earlier_attempt);
+    assert_eq!(walk(&remote), after_first);
+    std::fs::remove_dir_all(&remote).ok();
+}
+
+/// The object-store twin of the local test of the same name: a table moved, merged into and
+/// moved again is read at its own keys wherever its paths were written, by a merge, a
+/// compaction and an expiry, and leaves what the same merges leave in a table that never
+/// moved.
+#[test]
+fn a_table_moved_merged_into_and_moved_again_reads_its_own_files() {
+    let root = tmp_dir("moved");
+    std::fs::create_dir_all(&root).unwrap();
+    let still = root.join("still");
+    let url = |name: &str| format!("file://{}", root.join(name).display());
+    for (round, (rows, at)) in deltas().iter().zip(["a", "b", "c"]).enumerate() {
+        if round > 0 {
+            let from = ["a", "b"][round - 1];
+            std::fs::rename(root.join(from), root.join(at)).unwrap();
+        }
+        assert_eq!(
+            merge_url(&url(at), rows),
+            merge_local(&still, rows),
+            "round {round}"
+        );
+    }
+    let c = root.join("c");
+    assert_eq!(live(&c), live(&still));
+    let info = inspect_iceberg(&url("c")).unwrap();
+    assert!(info.moved && info.location.ends_with("/a"), "{info:?}");
+
+    compact_iceberg(&url("c"), &CompactOptions::default()).unwrap();
+    assert_eq!(live(&c), live(&still));
+    let options = ExpireOptions {
+        older_than_ms: i64::MAX,
+        retain_last: 1,
+        dry_run: false,
+    };
+    let s = expire_iceberg(&url("c"), &options).unwrap();
+    assert_eq!(s.expired_snapshots.len(), 3, "{s:?}");
+    assert_eq!(s.files_outside_table, 0, "{s:?}");
+    assert_eq!(s.files_not_deleted, 0, "{s:?}");
+    assert_eq!(live(&c), live(&still));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Relocation through the object-store path: a table moved, merged into and moved again is
+/// relocated in place; its metadata, manifest lists, manifests and files all name where it
+/// is, it reads what the same merges leave in a table that never moved, a second relocation
+/// does nothing, and it takes more merges. A copy whose original still answers is refused
+/// until named one.
+#[test]
+fn a_moved_table_relocates_in_a_store() {
+    let root = tmp_dir("relocate");
+    std::fs::create_dir_all(&root).unwrap();
+    let still = root.join("still");
+    let url = |name: &str| format!("file://{}", root.join(name).display());
+    for (round, (rows, at)) in deltas().iter().zip(["a", "b", "c"]).enumerate() {
+        if round > 0 {
+            std::fs::rename(root.join(["a", "b"][round - 1]), root.join(at)).unwrap();
+        }
+        merge_url(&url(at), rows);
+        merge_local(&still, rows);
+    }
+    let options = |identity, dry_run| RelocateOptions { identity, dry_run };
+    let s = relocate_iceberg(&url("c"), &options(None, false)).unwrap();
+    assert!(s.committed && !s.new_uuid, "{s:?}");
+    assert!(s.delete_files_rewritten > 0, "{s:?}");
+    assert_eq!(s.superseded_deleted, s.superseded);
+
+    let c = root.join("c");
+    let hint = std::fs::read_to_string(c.join("metadata/version-hint.text")).unwrap();
+    let meta: Value = serde_json::from_slice(
+        &std::fs::read(c.join(format!("metadata/v{}.metadata.json", hint.trim()))).unwrap(),
+    )
+    .unwrap();
+    let here = url("c");
+    assert_eq!(meta["location"], here.as_str());
+    let local = |uri: &str| std::fs::read(uri.strip_prefix("file://").unwrap()).unwrap();
+    for snap in meta["snapshots"].as_array().unwrap() {
+        let list = snap["manifest-list"].as_str().unwrap();
+        assert!(list.starts_with(&here), "{list}");
+        for m in read_manifest_list(&local(list)).unwrap() {
+            assert!(m.path.starts_with(&here), "{}", m.path);
+            for e in read_manifest_entries(&local(&m.path)).unwrap() {
+                assert!(e.file_path.starts_with(&here), "{}", e.file_path);
+            }
+        }
+    }
+    assert_eq!(live(&c), live(&still));
+    assert!(!inspect_iceberg(&here).unwrap().moved);
+
+    let again = relocate_iceberg(&here, &options(None, false)).unwrap();
+    assert!(again.already_anchored && !again.committed, "{again:?}");
+    let more = vec![row(1, "eu", 100), row(9, "ap", 9)];
+    merge_url(&here, &more);
+    merge_local(&still, &more);
+    assert_eq!(live(&c), live(&still));
+
+    // A copy of it, the original alive: refused until named one.
+    let copy = root.join("copy");
+    std::process::Command::new("cp")
+        .args(["-r", c.to_str().unwrap(), copy.to_str().unwrap()])
+        .status()
+        .unwrap();
+    let e = relocate_iceberg(&url("copy"), &options(None, false))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("still answers at"), "{e}");
+    let s = relocate_iceberg(&url("copy"), &options(Some(Identity::Copy), false)).unwrap();
+    assert!(s.committed && s.new_uuid, "{s:?}");
+    assert_eq!(live(&copy), live(&still));
+    assert_eq!(live(&c), live(&still), "the original reads as before");
+    assert_eq!(
+        inspect(&c).unwrap().table_uuid,
+        meta["table-uuid"].as_str().unwrap()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A place the table's metadata names in another kind of store than the table's (here `s3://`
+/// for a `file://` table) is not probed: whether a table answers there is unknown, so the
+/// relocation asks rather than guess, and goes ahead once told.
+#[test]
+fn a_place_in_another_kind_of_store_is_not_probed() {
+    let root = tmp_dir("other-store");
+    std::fs::create_dir_all(&root).unwrap();
+    let url = |name: &str| format!("file://{}", root.join(name).display());
+    merge_url(&url("a"), &deltas()[0]);
+    std::fs::rename(root.join("a"), root.join("b")).unwrap();
+    let meta_path = root.join("b/metadata/v1.metadata.json");
+    let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["location"] = json!("s3://someone-elses-bucket/t");
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let options = |identity| RelocateOptions {
+        identity,
+        dry_run: false,
+    };
+    let e = relocate_iceberg(&url("b"), &options(None))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("s3://someone-elses-bucket/t") && e.contains("another kind of store"),
+        "{e}"
+    );
+    let s = relocate_iceberg(&url("b"), &options(Some(Identity::Moved))).unwrap();
+    assert!(s.committed, "{s:?}");
+    std::fs::remove_dir_all(&root).ok();
 }

@@ -24,6 +24,12 @@ pub struct SinkSummary {
     pub table_version: Option<u64>,
     /// For a table sink: the snapshot this write committed.
     pub snapshot_id: Option<i64>,
+    /// For a table sink that commits through a catalog: how many times the write was built
+    /// again onto a newer snapshot another writer committed first (0 = committed as built).
+    pub rebases: u32,
+    /// For a table sink given a run id: an earlier attempt of the same run had already
+    /// committed `snapshot_id`, so this one committed nothing and removed what it wrote.
+    pub earlier_attempt: bool,
 }
 
 /// What one merge (upsert on a key) did to the table. Every count is exact: the rows a

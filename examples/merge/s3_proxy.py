@@ -13,6 +13,10 @@ Two things change for the client:
     would against a real store: a client that reads one file after another is as slow
     here as it would be there.
 
+It listens on 127.0.0.1 unless `--host` says otherwise: a catalog running in a container
+(examples/catalog) writes its metadata through it, so it needs `--host 0.0.0.0` there. The
+proxy has no authentication of its own; never expose it beyond a test network.
+
 It also counts requests by kind (HEAD, GET, ranged GET, PUT, POST, DELETE) and the most it
 saw in flight at once. Control endpoints (not forwarded):
 
@@ -40,7 +44,9 @@ HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "proxy-connection
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--listen", type=int, required=True, help="port to listen on (127.0.0.1)")
+    ap.add_argument("--listen", type=int, required=True, help="port to listen on")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="address to listen on (0.0.0.0 when a catalog in a container writes through it)")
     ap.add_argument("--upstream", type=int, required=True, help="port of the S3 mock (127.0.0.1)")
     ap.add_argument("--delay-ms", type=float, default=0, help="added to every request")
     a = ap.parse_args()
@@ -130,7 +136,7 @@ def main():
         daemon_threads = True
         request_queue_size = 128
 
-    Server(("127.0.0.1", a.listen), Handler).serve_forever()
+    Server((a.host, a.listen), Handler).serve_forever()
 
 
 if __name__ == "__main__":

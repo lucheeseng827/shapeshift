@@ -159,7 +159,7 @@ impl StatsCollector {
 }
 
 /// Per-column stats for one data file, ready to encode into the manifest.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Stats {
     pub value_counts: Vec<(i32, i64)>,
     pub null_counts: Vec<(i32, i64)>,

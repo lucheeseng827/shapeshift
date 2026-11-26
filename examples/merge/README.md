@@ -185,6 +185,24 @@ what each writer's last round says, and the table versions the successful runs r
 built before the guard (and before `--summary-json`, so it reads the text report) and succeeds
 only if writes were lost.
 
+## Tables another engine made: `verify_foreign.py`
+
+[`verify_foreign.py`](./verify_foreign.py) makes a table with PyIceberg (deflate manifests,
+partition summaries in the manifest list, zstd data files, as Iceberg's Java writers write
+them), then has shapeshift append, merge, compact and expire it while PyIceberg writes to it in
+between. DuckDB and PyIceberg must both read exactly the model after every step, and PyIceberg's
+partition summaries must survive shapeshift's commits. It also checks that a format version 1
+table is refused. It runs on a local path and through a `file://` URL:
+
+```sh
+cargo build -p shapeshift-cli --features object_store,zstd
+.venv/bin/python examples/merge/verify_foreign.py --bin target/debug/shapeshift
+# ok  interleaved writers (local path): 10 rows, v9; DuckDB and PyIceberg read the model after every step; ...
+```
+
+The `zstd` feature is needed to merge into and compact PyIceberg's zstd data files; appends
+work in any build.
+
 ## Limits
 
 - Concurrent writers are refused, not merged: the second of two that built on the same version

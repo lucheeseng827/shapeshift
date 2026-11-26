@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use shapeshift_core::{Result, ShapeError};
 
+use crate::anchor::Anchors;
 use crate::avro::{read_manifest_entries, read_manifest_list, ManifestEntry, ManifestFileEntry};
 use crate::files::{read_each, TableFiles};
 use crate::metadata::{self, RemoveInput};
@@ -150,11 +151,15 @@ fn unique<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     paths.into_iter().filter(|p| seen.insert(*p)).collect()
 }
 
-/// Plan the expiry of `table` (its current metadata, read through `files`). `base_location`
-/// is where the table is now; `now_ms` is recorded as the metadata's `last-updated-ms`.
-/// In a dry run the summary counts what would be deleted.
+/// Plan the expiry of `table` (its current metadata, read through `files`). `anchors` are
+/// the directories its recorded paths were written against (see [`Anchors`]): a file
+/// under one of them, or under `base_location` (where the table is now), is the table's
+/// own and is deleted once nothing retained reads it; any other is counted as outside the
+/// table and left alone. `now_ms` is recorded as the metadata's `last-updated-ms`. In a dry
+/// run the summary counts what would be deleted.
 pub fn plan_expiry<F: TableFiles>(
     table: &PriorTable,
+    anchors: &Anchors,
     base_location: &str,
     files: &F,
     options: &ExpireOptions,
@@ -257,12 +262,7 @@ pub fn plan_expiry<F: TableFiles>(
     }
 
     // What the expired ones reference, minus that.
-    let location = meta["location"].as_str().unwrap_or("");
-    let inside = |path: &str| {
-        [location, base_location]
-            .iter()
-            .any(|root| under_root(path, root))
-    };
+    let inside = |path: &str| anchors.holds(path) || under_root(path, base_location);
     let mut seen: HashSet<String> = HashSet::new();
     let mut delete: Vec<DeleteTarget> = Vec::new();
     let mut consider = |t: DeleteTarget, summary: &mut ExpireSummary| {
@@ -420,7 +420,8 @@ mod tests {
 
         let table = crate::load_current_local(&dir).unwrap();
         let location = table.metadata["location"].as_str().unwrap().to_string();
-        let local = crate::LocalTableFiles::new(&dir, &location);
+        let anchors = Anchors::of(&table.metadata);
+        let local = crate::LocalTableFiles::new(&dir, anchors.clone());
         let options = ExpireOptions {
             older_than_ms: i64::MAX,
             retain_last: 3,
@@ -434,7 +435,7 @@ mod tests {
                 now: AtomicUsize::new(0),
                 max: AtomicUsize::new(0),
             };
-            let plan = plan_expiry(&table, &location, &files, &options, 1).unwrap();
+            let plan = plan_expiry(&table, &anchors, &location, &files, &options, 1).unwrap();
             let reads = files.reads.into_inner().unwrap();
             let again: Vec<_> = reads.iter().filter(|(_, &n)| n > 1).collect();
             assert!(again.is_empty(), "read more than once: {again:?}");
@@ -476,6 +477,47 @@ mod tests {
             assert_eq!(got, one, "{readers} readers");
             assert!(max > 1, "{readers} readers, but the reads never overlapped");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_under_no_anchor_is_never_deleted() {
+        // Planned with anchors that hold none of the table's recorded paths (as a table whose
+        // files live under another engine's `write.data.path` is), every file the expired
+        // snapshots read is outside the table: counted, and kept.
+        let dir = std::env::temp_dir().join(format!("ss-expire-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        for round in 0..3_i64 {
+            let ids = Int64Array::from(vec![round, round + 1]);
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+            let mut sink = crate::IcebergSink::create_merge(
+                &dir,
+                schema.clone(),
+                Compression::Snappy,
+                &[],
+                &["id".to_string()],
+            )
+            .unwrap();
+            sink.write_batch(&batch).unwrap();
+            sink.finish().unwrap();
+        }
+        let table = crate::load_current_local(&dir).unwrap();
+        let own = Anchors::of(&table.metadata);
+        let local = crate::LocalTableFiles::new(&dir, own.clone());
+        let options = ExpireOptions {
+            older_than_ms: i64::MAX,
+            retain_last: 1,
+            dry_run: true,
+        };
+        let elsewhere = Anchors::at("/somewhere/else");
+        let plan = plan_expiry(&table, &elsewhere, "/elsewhere/too", &local, &options, 1).unwrap();
+        assert!(plan.delete.is_empty(), "{:?}", plan.delete);
+        assert!(plan.summary.files_outside_table > 0, "{:?}", plan.summary);
+        // The same plan with the table's own anchors deletes them.
+        let plan = plan_expiry(&table, &own, "/elsewhere/too", &local, &options, 1).unwrap();
+        assert!(!plan.delete.is_empty());
+        assert_eq!(plan.summary.files_outside_table, 0, "{:?}", plan.summary);
         std::fs::remove_dir_all(&dir).ok();
     }
 
