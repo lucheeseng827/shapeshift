@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::changes::{ApplyMode, ChangesSpec, CHANGE_COLUMN, OP_COLUMN};
 use crate::drift::{DriftPolicy, DriftSpec};
 use crate::transform::Transform;
 use crate::types::ColumnType;
@@ -27,6 +28,12 @@ pub struct DatasetSpec {
     /// not keep is counted as filtered, not rejected. See [`crate::Predicate`].
     #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+
+    /// The records are a feed of changes (inserts, updates, deletes) rather than rows:
+    /// what says which, where the row is, and what orders two changes to a key. See
+    /// [`ChangesSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ChangesSpec>,
 
     /// How to read the input.
     #[serde(default)]
@@ -59,8 +66,8 @@ pub struct DatasetSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSpec {
-    /// `jsonl` (one JSON object per line, the default) or `json-array` (a single
-    /// top-level array).
+    /// `jsonl` (one JSON object per line, the default), `json-array` (a single
+    /// top-level array), `csv`, `tsv`, or `xml` (see [`CsvOptions`], [`XmlOptions`]).
     #[serde(default)]
     pub format: SourceFormat,
 
@@ -68,6 +75,27 @@ pub struct SourceSpec {
     /// means "read from the path passed on the command line / stdin".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+
+    /// How a `csv` or `tsv` source is read. Absent: the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv: Option<CsvOptions>,
+
+    /// How an `xml` source is read. Required for `xml`: it names the repeating element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xml: Option<XmlOptions>,
+
+    /// Pull the records from a REST endpoint instead of a file (`shape --from <url>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<crate::pull::HttpSourceSpec>,
+
+    /// Pull the rows from a MySQL query or table instead of a file (`shape --from mysql://…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql: Option<crate::pull::MysqlSourceSpec>,
+
+    /// Pull the rows from a Postgres query or table instead of a file
+    /// (`shape --from postgres://…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<crate::pull::PostgresSourceSpec>,
 }
 
 impl Default for SourceSpec {
@@ -75,8 +103,268 @@ impl Default for SourceSpec {
         SourceSpec {
             format: SourceFormat::Jsonl,
             path: None,
+            csv: None,
+            xml: None,
+            http: None,
+            mysql: None,
+            postgres: None,
         }
     }
+}
+
+impl SourceSpec {
+    /// A source in `format` with default options and no path.
+    pub fn of(format: SourceFormat) -> Self {
+        SourceSpec {
+            format,
+            ..SourceSpec::default()
+        }
+    }
+
+    /// Whether the records come from a pulled source (an endpoint or a database), not a file.
+    pub fn pulls(&self) -> bool {
+        self.http.is_some() || self.mysql.is_some() || self.postgres.is_some()
+    }
+
+    /// The environment variables a pulled source reads its credentials from: those
+    /// `source.http.auth` and `source.http.soap` name, and a database's password variable. A
+    /// spec never holds a secret, so this is everything an orchestrator must provide a run with.
+    /// Sorted, each once.
+    pub fn credential_env(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(h) = &self.http {
+            if let Some(a) = &h.auth {
+                names.extend(
+                    [
+                        a.bearer_env.as_deref(),
+                        a.basic_env.as_deref(),
+                        a.header_env.as_ref().map(|e| e.env.as_str()),
+                        a.query_env.as_ref().map(|e| e.env.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_string),
+                );
+            }
+            if let Some(s) = &h.soap {
+                names.extend(
+                    [s.username_env.as_deref(), s.password_env.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .map(str::to_string),
+                );
+            }
+        }
+        if self.mysql.is_some() {
+            names.push(crate::pull::DbKind::Mysql.password_env().to_string());
+        }
+        if self.postgres.is_some() {
+            names.push(crate::pull::DbKind::Postgres.password_env().to_string());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+impl SourceSpec {
+    /// Options that fit the format, and every option well formed.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::ShapeError;
+        let databases = [
+            (self.mysql.as_ref(), crate::pull::DbKind::Mysql),
+            (self.postgres.as_ref(), crate::pull::DbKind::Postgres),
+        ];
+        if databases.iter().filter(|(d, _)| d.is_some()).count() > 1 {
+            return Err(ShapeError::Spec(
+                "a source is one database: `source.mysql` or `source.postgres`, not both".into(),
+            ));
+        }
+        if let Some((Some(m), kind)) = databases.into_iter().find(|(d, _)| d.is_some()) {
+            if self.path.is_some() || self.http.is_some() {
+                return Err(ShapeError::Spec(
+                    "a source is one of a file (`source.path`), an endpoint (`source.http`) or a \
+                     database (`source.mysql`, `source.postgres`)"
+                        .into(),
+                ));
+            }
+            if self.format != SourceFormat::Jsonl || self.csv.is_some() || self.xml.is_some() {
+                return Err(ShapeError::Spec(
+                    "a database's rows have no file format: `source.format`, `source.csv` and \
+                     `source.xml` do not apply to a database source"
+                        .into(),
+                ));
+            }
+            return m.validate_as(kind);
+        }
+        if let Some(h) = &self.http {
+            if self.path.is_some() {
+                return Err(ShapeError::Spec(
+                    "a source is a file (`source.path`) or an endpoint (`source.http`), not both"
+                        .into(),
+                ));
+            }
+            if self.format != SourceFormat::Jsonl {
+                return Err(ShapeError::Spec(
+                    "an endpoint's body format is `source.http.format`, not `source.format`".into(),
+                ));
+            }
+            h.validate()?;
+            // The body's format decides which of the format options apply.
+            let body = match h.body_format() {
+                crate::pull::HttpFormat::Csv => SourceFormat::Csv,
+                crate::pull::HttpFormat::Tsv => SourceFormat::Tsv,
+                crate::pull::HttpFormat::Xml => SourceFormat::Xml,
+                _ => SourceFormat::JsonArray,
+            };
+            return SourceSpec {
+                format: body,
+                http: None,
+                ..self.clone()
+            }
+            .validate();
+        }
+        let f = self.format.name();
+        match self.format {
+            SourceFormat::Csv | SourceFormat::Tsv => {}
+            _ if self.csv.is_some() => {
+                return Err(ShapeError::Spec(format!(
+                    "`source.csv` applies to csv and tsv sources, not {f}"
+                )))
+            }
+            _ => {}
+        }
+        match (self.format, &self.xml) {
+            (SourceFormat::Xml, None) => {
+                return Err(ShapeError::Spec(
+                    "an xml source needs `source.xml.record`: the repeating element, like `/Orders/Order`"
+                        .into(),
+                ))
+            }
+            (SourceFormat::Xml, Some(x)) => {
+                let path = x.record.trim().trim_start_matches('/');
+                if path.is_empty() || path.split('/').any(|s| s.trim().is_empty()) {
+                    return Err(ShapeError::Spec(format!(
+                        "`source.xml.record` {:?} is not a path of element names",
+                        x.record
+                    )));
+                }
+            }
+            (_, Some(_)) => {
+                return Err(ShapeError::Spec(format!(
+                    "`source.xml` applies to xml sources, not {f}"
+                )))
+            }
+            _ => {}
+        }
+        if let Some(c) = &self.csv {
+            for (what, ch) in [("delimiter", c.delimiter), ("quote", Some(c.quote))] {
+                if let Some(ch) = ch {
+                    if !ch.is_ascii() || ch == '\n' || ch == '\r' {
+                        return Err(ShapeError::Spec(format!(
+                            "`source.csv.{what}` must be one ASCII character other than a line break"
+                        )));
+                    }
+                }
+            }
+            // The default delimiter counts too: `quote: ","` on a csv source would make
+            // every comma both.
+            let delimiter = c.delimiter.unwrap_or(if self.format == SourceFormat::Tsv {
+                '\t'
+            } else {
+                ','
+            });
+            if delimiter == c.quote {
+                return Err(ShapeError::Spec(
+                    "`source.csv.delimiter` and `quote` must differ".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in &c.columns {
+                if name.trim().is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`source.csv.columns` has an empty name".into(),
+                    ));
+                }
+                if !seen.insert(name) {
+                    return Err(ShapeError::Spec(format!(
+                        "`source.csv.columns` names `{name}` twice"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How a CSV or TSV file becomes records: one record per row, an object keyed by the
+/// column names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CsvOptions {
+    /// The first row names the columns (the default). With `columns` also given, that row
+    /// is skipped and `columns` names them instead.
+    #[serde(default = "yes")]
+    pub header: bool,
+    /// The column names, in order. Required with `header: false` unless the default names
+    /// (`column_1`, `column_2`, …) will do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// The field separator, one byte: `,` for csv and a tab for tsv unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<char>,
+    /// The quote character, one byte (default `"`).
+    #[serde(default = "double_quote")]
+    pub quote: char,
+    /// Values read as null (default: the empty field).
+    #[serde(default = "empty_is_null")]
+    pub null_values: Vec<String>,
+    /// `auto` (the default): an unquoted-looking integer, decimal, `true` or `false`
+    /// arrives as a JSON number or boolean, so inference sees types. `strings`: every
+    /// field arrives as a string, for the spec's types to coerce.
+    #[serde(default)]
+    pub types: CsvTypes,
+}
+
+impl Default for CsvOptions {
+    fn default() -> Self {
+        CsvOptions {
+            header: true,
+            columns: Vec::new(),
+            delimiter: None,
+            quote: '"',
+            null_values: empty_is_null(),
+            types: CsvTypes::Auto,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+fn double_quote() -> char {
+    '"'
+}
+fn empty_is_null() -> Vec<String> {
+    vec![String::new()]
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsvTypes {
+    #[default]
+    Auto,
+    Strings,
+}
+
+/// How an XML document becomes records: each element at `record` is one record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XmlOptions {
+    /// The repeating element, as a path of element names: `/Orders/Order` from the root,
+    /// or `Order` / `Orders/Order` at any depth. Namespace prefixes are ignored
+    /// (`soap:Body` is `Body`).
+    pub record: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -85,6 +373,25 @@ pub enum SourceFormat {
     #[default]
     Jsonl,
     JsonArray,
+    /// Comma-separated values (RFC 4180 quoting).
+    Csv,
+    /// Tab-separated values.
+    Tsv,
+    /// XML, one record per element at `source.xml.record`.
+    Xml,
+}
+
+impl SourceFormat {
+    /// The name the spec and the command line use.
+    pub fn name(self) -> &'static str {
+        match self {
+            SourceFormat::Jsonl => "jsonl",
+            SourceFormat::JsonArray => "json-array",
+            SourceFormat::Csv => "csv",
+            SourceFormat::Tsv => "tsv",
+            SourceFormat::Xml => "xml",
+        }
+    }
 }
 
 /// Output description.
@@ -124,6 +431,11 @@ pub struct OutputSpec {
     /// catalog names the table's location and is its commit point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<CatalogSpec>,
+
+    /// With `changes:`: `upsert` (the default) keeps the current state on `merge_on`;
+    /// `changelog` appends every change with an `_op` column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<ApplyMode>,
 }
 
 /// A spec error, with a word added when it is a catalog credential written into the spec:
@@ -291,7 +603,32 @@ impl DatasetSpec {
         } else {
             serde_yaml::from_str(text).map_err(|e| e.to_string())
         };
-        decoded.map_err(|e| crate::error::ShapeError::Spec(secret_hint(e)))
+        let mut spec: DatasetSpec =
+            decoded.map_err(|e| crate::error::ShapeError::Spec(secret_hint(e)))?;
+        spec.apply_preset();
+        Ok(spec)
+    }
+
+    /// Fill in what `changes.preset` knows and the spec left out, and add the preset's
+    /// version columns unless the spec declares columns of those names. Runs when a spec is
+    /// read; running it again changes nothing.
+    pub fn apply_preset(&mut self) {
+        let Some(changes) = self.changes.as_mut() else {
+            return;
+        };
+        changes.apply_preset();
+        let Some(p) = changes.preset else { return };
+        for (name, ty, from) in p.columns() {
+            if !self.columns.iter().any(|c| c.name == *name) {
+                self.columns.push(ColumnSpec {
+                    name: name.to_string(),
+                    from: Some(from.to_string()),
+                    ty: *ty,
+                    transform: None,
+                    required: false,
+                });
+            }
+        }
     }
 
     /// Serialize to YAML (the canonical on-disk form).
@@ -308,6 +645,7 @@ impl DatasetSpec {
         if let Some(w) = &self.filter {
             crate::predicate::Predicate::parse(w)?;
         }
+        self.source.validate()?;
         if self.schema == SchemaMode::Strict && self.columns.is_empty() {
             return Err(ShapeError::Spec(
                 "strict schema mode requires at least one declared column".into(),
@@ -422,6 +760,135 @@ impl DatasetSpec {
                 if self.schema == SchemaMode::Strict && !self.columns.iter().any(|c| &c.name == k) {
                     return Err(ShapeError::Spec(format!(
                         "merge key `{k}` is not a declared column (declare it to merge on it)"
+                    )));
+                }
+            }
+        }
+        self.validate_pull()?;
+        self.validate_changes()
+    }
+
+    /// An incremental source, against the output (RELEASE-0.6 M4, rule 3).
+    fn validate_pull(&self) -> crate::error::Result<()> {
+        use crate::error::ShapeError;
+        // The cursor field, and whether it is strict.
+        // The cursor field, whether it is strict, and where a spec says so.
+        let (from, strict, strict_field) = match (&self.source.http, &self.source.mysql) {
+            (Some(h), _) => match &h.incremental {
+                Some(i) => (i.from.clone(), i.strict, "source.http.incremental.strict"),
+                None => return Ok(()),
+            },
+            (None, Some(m)) => match &m.cursor {
+                Some(c) => (c.clone(), m.strict, "source.mysql.strict"),
+                None => return Ok(()),
+            },
+            (None, None) => match self
+                .source
+                .postgres
+                .as_ref()
+                .and_then(|p| p.cursor.as_ref().map(|c| (c, p)))
+            {
+                Some((c, p)) => (c.clone(), p.strict, "source.postgres.strict"),
+                None => return Ok(()),
+            },
+        };
+        if self.output.format != OutputFormat::Iceberg {
+            return Err(ShapeError::Spec(
+                "an incremental source records its position in the table it writes: it needs \
+                 `output.format: iceberg` (a Parquet file has no snapshot to keep it in)"
+                    .into(),
+            ));
+        }
+        if !strict && self.output.merge_on.is_empty() {
+            return Err(ShapeError::Spec(format!(
+                "an incremental source re-reads the records at its position's value \
+                 (`{}`), so they would land twice: set `output.merge_on` (replayed rows upsert \
+                 onto themselves), or declare `{strict_field}: true` if the field is unique \
+                 and only grows, like an auto-increment id",
+                from
+            )));
+        }
+        if self.output.apply == Some(crate::changes::ApplyMode::Changelog) && !strict {
+            return Err(ShapeError::Spec(format!(
+                "a changelog appends every change it reads, so a replayed record would be \
+                 appended twice: an incremental source into a changelog needs \
+                 `{strict_field}: true`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `changes:` and `output.apply`, against the rest of the spec.
+    fn validate_changes(&self) -> crate::error::Result<()> {
+        use crate::error::ShapeError;
+        if self.columns.iter().any(|c| c.name == CHANGE_COLUMN) {
+            return Err(ShapeError::Spec(format!(
+                "`{CHANGE_COLUMN}` is a name shapeshift keeps for itself: rename the column"
+            )));
+        }
+        let Some(changes) = &self.changes else {
+            if self.output.apply.is_some() {
+                return Err(ShapeError::Spec(
+                    "`output.apply` says how to apply a feed of changes: it needs a `changes:` block"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        };
+        changes.validate()?;
+        match self.output.apply.unwrap_or_default() {
+            ApplyMode::Upsert => {
+                if self.output.merge_on.is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`changes:` applies each change to a key: set `output.merge_on` (or \
+                         `output.apply: changelog` to keep every change instead)"
+                            .into(),
+                    ));
+                }
+                if changes.key_from.is_some() {
+                    for c in &changes.order_by {
+                        let declared = self.columns.iter().find(|d| &d.name == c);
+                        if declared.is_some_and(|d| !d.source_path().starts_with('$')) {
+                            return Err(ShapeError::Spec(crate::shaper::key_from_version(c)));
+                        }
+                    }
+                }
+                if self.schema == SchemaMode::Strict {
+                    for c in &changes.order_by {
+                        if !self.columns.iter().any(|d| &d.name == c) {
+                            return Err(ShapeError::Spec(format!(
+                                "`changes.order_by` column `{c}` is not a declared column"
+                            )));
+                        }
+                    }
+                }
+            }
+            ApplyMode::Changelog => {
+                if self.output.format != OutputFormat::Iceberg {
+                    return Err(ShapeError::Spec(
+                        "`output.apply: changelog` adds each run's changes to an Iceberg table \
+                         (`format: iceberg`)"
+                            .into(),
+                    ));
+                }
+                if !self.output.merge_on.is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`output.apply: changelog` appends every change, so it matches no key: \
+                         drop `output.merge_on`"
+                            .into(),
+                    ));
+                }
+                if !changes.order_by.is_empty() {
+                    return Err(ShapeError::Spec(
+                        "`changes.order_by` decides which change to a key wins, and a changelog \
+                         keeps them all: drop it (the columns stay in the table)"
+                            .into(),
+                    ));
+                }
+                if self.columns.iter().any(|c| c.name == OP_COLUMN) {
+                    return Err(ShapeError::Spec(format!(
+                        "`apply: changelog` adds the column `{OP_COLUMN}`, and the spec declares \
+                         one: rename it"
                     )));
                 }
             }

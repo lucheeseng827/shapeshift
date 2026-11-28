@@ -30,13 +30,22 @@ fixes; older `0.1` patches may be updated at the maintainer's discretion.
 
 ## Security posture
 
-The OSS engine (Apache-2.0) is a **pure data plane**. It reads JSON/JSONL from a
-local path, shapes it through a declarative spec, and writes Parquet or a
-self-contained Iceberg v2 table to a local path. Concretely:
+The OSS engine (Apache-2.0) is a **pure data plane**. It reads JSON, JSON Lines,
+CSV, TSV or XML from a local path or standard input, shapes it through a
+declarative spec, and writes Parquet or a self-contained Iceberg v2 table.
+Concretely:
 
-- **No network in the OSS core.** The engine and CLI open no sockets, make no
-  outbound calls, and ship no telemetry. There is no connector or hosted-service
-  code in this repository.
+- **No network in the default binary.** The released binary and image are the
+  lean build: they open no sockets, make no outbound calls, and ship no telemetry,
+  and the lean build links no network client or database driver (`cargo tree`
+  shows none).
+  Network code is opt-in at build time, each piece behind a Cargo feature that is
+  off by default: `object_store` (S3, GCS or Azure output, and an Iceberg REST
+  catalog), `serve` (the local console), and the pulled sources `http`, `mysql`
+  and `postgres`. A build with a source connects only to the endpoint its spec or
+  command line names, reads credentials from the environment or a file (never
+  from the spec), and refuses to send them without TLS to another machine unless
+  `--insecure-source` is given. There is no hosted-service code in this repository.
 - **No eval, no exec, no code loading.** The transform spec is data. Column
   transforms are a fixed, named library (`lowercase`, `trim`, `dollars_to_cents`,
   `json_encode`, …); there is no expression evaluator, no scripting, and no

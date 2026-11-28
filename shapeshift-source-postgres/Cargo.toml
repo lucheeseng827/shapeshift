@@ -1,0 +1,24 @@
+# shapeshift-source-postgres — rows from a Postgres query or table (`source.postgres`,
+# `shape --from postgres://…`), read incrementally from the position the table records. Behind
+# the CLI's `postgres` feature, so the lean binary links no database client.
+[package]
+name = "shapeshift-source-postgres"
+description = "shapeshift's Postgres source: a query or a table read incrementally by a watermark, its position kept in the Iceberg table it writes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# The synchronous client; dates, JSON and UUIDs decoded by its own codecs.
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+# TLS on rustls with ring (as the other sources), the public roots bundled.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+rustls-pemfile = "2"

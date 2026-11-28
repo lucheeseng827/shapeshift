@@ -6,9 +6,9 @@
 //! output and reject sidecars land under the configured data directory, `inspect`
 //! reads them (or any local table) back, and every shape is a run in the run log
 //! (`runs.jsonl`), whose snapshot carries the run's id. `runs`, `tables` and `table`
-//! read those back; a table's history comes from its own metadata. There is no run
-//! queue, no persistence of specs, and no metering — that is orchestration, and out
-//! of scope here.
+//! read those back; a table's history comes from its own metadata. Named specs live in
+//! [`crate::datasets`]. There is no run queue and no metering — that is orchestration, and
+//! out of scope here.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +22,13 @@ use shapeshift_core::{
     Predicate, PushOutcome, SchemaMode, Shaper, SourceFormat, SourceSpec,
 };
 use shapeshift_iceberg::{parse_metadata_json, read_local_history, table_events, IcebergSink};
-use shapeshift_json::{open_reader, JsonError};
+use shapeshift_json::{open_source, JsonError};
 use shapeshift_parquet::ParquetSink;
 
+use crate::alerts::Alerts;
+use crate::catalog::{CatalogCache, CatalogSettings};
+use crate::connectors::Connectors;
+use crate::datasets::Datasets;
 use crate::http::{Request, Response};
 use crate::runs::{Run, RunLog};
 
@@ -33,8 +37,22 @@ use crate::runs::{Run, RunLog};
 pub struct Ctx {
     data_dir: PathBuf,
     counter: AtomicU64,
+    /// Datasets may pull from sources (`serve --allow-sources`).
+    allow_sources: std::sync::atomic::AtomicBool,
     /// The runs this console started (`runs.jsonl` in the data dir).
     runs: RunLog,
+    /// The datasets it keeps (`datasets/` in the data dir).
+    datasets: Datasets,
+    /// Alert rules, targets and incidents (`alerts.json` in the data dir).
+    alerts: Alerts,
+    /// Push connectors (`connectors.json`, and their spools under `spool/`).
+    connectors: Connectors,
+    /// The REST catalog the Catalog page browses, if the console was started with one.
+    catalog: std::sync::OnceLock<CatalogSettings>,
+    /// Its last listing (a listing walks the whole catalog).
+    catalog_cache: CatalogCache,
+    /// The console's metrics, when `--metrics-addr` asked for them.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Live>>,
 }
 
 /// Cap on reject rows returned inline to the console (all rows are still counted and
@@ -49,15 +67,76 @@ impl Ctx {
         std::fs::create_dir_all(data_dir.join("outputs"))
             .with_context(|| format!("creating {}/outputs", data_dir.display()))?;
         let runs = RunLog::open(&data_dir)?;
+        let datasets = Datasets::open(&data_dir)?;
+        let alerts = Alerts::open(&data_dir)?;
+        let connectors = Connectors::open(&data_dir)?;
         Ok(Ctx {
             data_dir,
             counter: AtomicU64::new(0),
+            allow_sources: std::sync::atomic::AtomicBool::new(false),
             runs,
+            datasets,
+            alerts,
+            connectors,
+            catalog: std::sync::OnceLock::new(),
+            catalog_cache: CatalogCache::default(),
+            metrics: std::sync::OnceLock::new(),
         })
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Keep the console's metrics from now on (`--metrics-addr`).
+    pub(crate) fn enable_metrics(&self) -> std::sync::Arc<crate::metrics::Live> {
+        let live = self
+            .metrics
+            .get_or_init(|| std::sync::Arc::new(crate::metrics::Live::new()))
+            .clone();
+        let _ = self.runs.metrics.set(live.clone());
+        live
+    }
+
+    pub(crate) fn metrics(&self) -> Option<&crate::metrics::Live> {
+        self.metrics.get().map(|m| m.as_ref())
+    }
+
+    pub(crate) fn runs(&self) -> &RunLog {
+        &self.runs
+    }
+
+    pub(crate) fn datasets(&self) -> &Datasets {
+        &self.datasets
+    }
+
+    pub(crate) fn alerts(&self) -> &Alerts {
+        &self.alerts
+    }
+
+    pub(crate) fn connectors(&self) -> &Connectors {
+        &self.connectors
+    }
+
+    pub(crate) fn catalog(&self) -> Option<&CatalogSettings> {
+        self.catalog.get()
+    }
+
+    pub(crate) fn catalog_cache(&self) -> &CatalogCache {
+        &self.catalog_cache
+    }
+
+    pub(crate) fn set_catalog(&self, s: CatalogSettings) {
+        let _ = self.catalog.set(s);
+    }
+
+    pub(crate) fn set_allow_sources(&self, allow: bool) {
+        self.allow_sources.store(allow, Ordering::SeqCst);
+    }
+
+    /// Whether datasets may pull from the sources their specs name (`serve --allow-sources`).
+    pub(crate) fn allow_sources(&self) -> bool {
+        self.allow_sources.load(Ordering::SeqCst)
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -124,9 +203,13 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
     if r.input.trim().is_empty() {
         bail!("no input — paste some records to infer a spec");
     }
+    if r.format == SourceFormat::Xml {
+        // The form has no field for the record path yet: say so, not the CLI's flag.
+        bail!("xml input needs a record path, which only a spec can give here: shape it with a spec whose `source.xml.record` names the element that is one record");
+    }
     let dataset = clean_dataset(r.dataset.as_deref());
     let input_path = write_temp_input(ctx, &r.input, r.format)?;
-    let samples = sample_records(&input_path, r.format, r.sample, None)?;
+    let samples = sample_records(&input_path, &SourceSpec::of(r.format), r.sample, None)?;
     if samples.is_empty() {
         bail!("no well-formed records were read from the input");
     }
@@ -134,10 +217,8 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
     let spec = DatasetSpec {
         dataset: dataset.clone(),
         filter: None,
-        source: SourceSpec {
-            format: r.format,
-            path: None,
-        },
+        changes: None,
+        source: SourceSpec::of(r.format),
         output: OutputSpec {
             format: OutputFormat::Parquet,
             path: format!("{dataset}.parquet"),
@@ -145,6 +226,7 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
             partition_by: Vec::new(),
             merge_on: Vec::new(),
             catalog: None,
+            apply: None,
         },
         schema: SchemaMode::Infer,
         columns,
@@ -170,32 +252,37 @@ fn do_infer(ctx: &Ctx, r: InferReq) -> Result<InferResp> {
 // ---- shape ------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ShapeReq {
+pub(crate) struct ShapeReq {
     /// Inline records; ignored when `input_path` is given.
     #[serde(default)]
-    input: Option<String>,
+    pub(crate) input: Option<String>,
     /// A server-side input file to shape instead of inline text (for large inputs).
     #[serde(default)]
-    input_path: Option<String>,
+    pub(crate) input_path: Option<String>,
     /// An edited spec (YAML/JSON). When omitted, the schema is inferred on the fly.
     #[serde(default)]
-    spec_yaml: Option<String>,
+    pub(crate) spec_yaml: Option<String>,
     #[serde(default)]
-    format: SourceFormat,
+    pub(crate) format: SourceFormat,
     #[serde(default = "default_output_format")]
-    to: OutputFormat,
+    pub(crate) to: OutputFormat,
     #[serde(default)]
-    compression: Compression,
+    pub(crate) compression: Compression,
     #[serde(default)]
-    dataset: Option<String>,
+    pub(crate) dataset: Option<String>,
     #[serde(default)]
-    partition_by: Vec<String>,
+    pub(crate) partition_by: Vec<String>,
     #[serde(default)]
-    append: bool,
+    pub(crate) append: bool,
     /// What to do about schema drift. Overrides the spec's `drift.policy`; absent
     /// means "whatever the spec says" (which defaults to `warn`).
     #[serde(default)]
-    on_drift: Option<DriftPolicy>,
+    pub(crate) on_drift: Option<DriftPolicy>,
+    /// The run id the snapshot records, when the caller keeps one for a retry (a connector's
+    /// batch): a run the table already holds is found and not appended twice. Never read from
+    /// a request; absent, the run log's own id.
+    #[serde(skip)]
+    pub(crate) run_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -327,6 +414,9 @@ struct ShapeResp {
     /// `drift.policy: ignore`, or when the run matched its schema exactly.
     #[serde(skip_serializing_if = "Option::is_none")]
     drift: Option<DriftResp>,
+    /// A pulled source: its kind, the position it started from and committed, and its counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<Value>,
 }
 
 pub fn shape(ctx: &Ctx, req: &Request) -> Response {
@@ -334,17 +424,24 @@ pub fn shape(ctx: &Ctx, req: &Request) -> Response {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    run_shape(ctx, r, json!({ "via": "shape" }))
+}
+
+/// Run one shape, as a run in the log: the Shape form's, or a dataset's `Run now`. `extra` is
+/// added to the run's record (`via`: which of the two started it).
+pub(crate) fn run_shape(ctx: &Ctx, r: ShapeReq, extra: Value) -> Response {
     // Every shape is a run in the log, from the moment it starts.
-    let mut run = ctx.runs.start(
-        json!({
-            "command": "shape",
-            "dataset": clean_dataset(r.dataset.as_deref()),
-            "format": format!("{:?}", r.to).to_lowercase(),
-            "append": r.append,
-        }),
-        "shaping",
-    );
-    match do_shape(ctx, r, &mut run) {
+    let mut fields = json!({
+        "command": "shape",
+        "dataset": clean_dataset(r.dataset.as_deref()),
+        "format": format!("{:?}", r.to).to_lowercase(),
+        "append": r.append,
+    });
+    if let (Some(f), Some(x)) = (fields.as_object_mut(), extra.as_object()) {
+        f.extend(x.clone());
+    }
+    let mut run = ctx.runs.start(fields, "shaping");
+    let resp = match do_shape(ctx, r, &mut run) {
         Ok(resp) => {
             run.succeed(json!({
                 "rows_in": resp.rows_in,
@@ -357,6 +454,7 @@ pub fn shape(ctx: &Ctx, req: &Request) -> Response {
                 "table_version": resp.table_version,
                 "rejects_path": resp.rejects_path,
                 "earlier_attempt": resp.earlier_attempt,
+                "source": resp.source,
             }));
             Response::json(200, &resp)
         }
@@ -365,7 +463,10 @@ pub fn shape(ctx: &Ctx, req: &Request) -> Response {
             run.fail(&e);
             Response::error(400, message)
         }
-    }
+    };
+    // A run's outcome can open or resolve an incident: evaluate the rules now.
+    ctx.alerts.poke();
+    resp
 }
 
 fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
@@ -379,13 +480,15 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         .filter(|s| !s.is_empty())
     {
         Some(text) => DatasetSpec::parse(text).map_err(anyhow::Error::from)?,
+        None if r.format == SourceFormat::Xml => bail!(
+            "xml input needs a record path, which only a spec can give here: add a spec whose \
+             `source.xml.record` names the element that is one record"
+        ),
         None => DatasetSpec {
             dataset: dataset.clone(),
             filter: None,
-            source: SourceSpec {
-                format: r.format,
-                path: None,
-            },
+            changes: None,
+            source: SourceSpec::of(r.format),
             output: OutputSpec {
                 format: r.to,
                 path: String::new(),
@@ -393,6 +496,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
                 partition_by: Vec::new(),
                 merge_on: Vec::new(),
                 catalog: None,
+                apply: None,
             },
             schema: SchemaMode::Infer,
             columns: Vec::new(),
@@ -404,7 +508,26 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
     // 2. Apply the console's controls onto the spec (they always win — the form is
     //    the source of truth for where/how the output lands).
     spec.dataset = dataset.clone();
-    spec.source.format = r.format;
+    // A pulled source (an endpoint, a database) has no file format for the form to set.
+    let pulling = crate::pulled::is_pulled(&spec.source);
+    if pulling && !ctx.allow_sources() {
+        bail!(
+            "this console pulls from no sources: a spec's source names a host and the \
+             environment variables whose values it sends there, and the console has no login. \
+             Start it with `shapeshift serve --allow-sources` where only you can reach it"
+        );
+    }
+    if !pulling {
+        spec.source.format = r.format;
+    }
+    // A spec's CSV or XML options must still fit the format the form chose.
+    spec.source.validate().map_err(anyhow::Error::from)?;
+    if spec.changes.is_some() {
+        bail!(
+            "a change feed (`changes:`) is applied from the command line (`shapeshift shape`) in \
+             this release; the console shapes records as they are"
+        );
+    }
     spec.output.format = r.to;
     spec.output.compression = r.compression;
     if !r.partition_by.is_empty() {
@@ -444,8 +567,18 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         bail!("`append` applies only to Iceberg output");
     }
 
-    // 4. Resolve the input: a server-side path, or inline text written to a temp file.
+    let merging = !spec.output.merge_on.is_empty();
+    if pulling && crate::pulled::incremental(&spec.source) && !r.append && !merging {
+        bail!(
+            "an incremental source keeps its position in the table, which replacing the table \
+             would drop: turn on Append, or merge on a key (`output.merge_on`)"
+        );
+    }
+
+    // 4. Resolve the input: a server-side path, inline text written to a temp file, or (a
+    //    pulled source) nothing: the records come from the source.
     let (input_path, temp_input) = match r.input_path.as_deref().filter(|s| !s.is_empty()) {
+        _ if pulling => (PathBuf::new(), false),
         Some(p) => (ctx.resolve(p), false),
         None => {
             let text = r
@@ -457,26 +590,66 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         }
     };
 
+    // A pulled source is opened once, from the position its table records; inference reads
+    // the head of its records, which the shaping pass then replays.
+    let (pulled, mut pulled_records) = if pulling {
+        let (p, records) = crate::pulled::open(&spec, &output_path)?
+            .ok_or_else(|| anyhow!("the spec names no source to pull"))?;
+        (Some(p), Some(records))
+    } else {
+        (None, None)
+    };
+    let mut pulled_head: Vec<Value> = Vec::new();
+
     // 5. Build the shaper (inferring in Infer mode).
-    let inferred = if spec.schema == SchemaMode::Infer {
-        // Inference sees only the records the run keeps, so the schema is theirs alone.
-        let filter = spec.filter.as_deref().map(Predicate::parse).transpose()?;
-        let samples = sample_records(
-            &input_path,
-            spec.source.format,
-            spec.options.infer_sample,
-            filter.as_ref(),
-        )?;
-        if let (Some(f), true) = (&filter, samples.is_empty() && spec.columns.is_empty()) {
-            bail!(
+    let inferred =
+        if let (Some(records), SchemaMode::Infer) = (pulled_records.as_mut(), spec.schema) {
+            let filter = spec.filter.as_deref().map(Predicate::parse).transpose()?;
+            let n = spec.options.infer_sample.max(1);
+            // Records the filter drops are held too (the shaping pass counts them), so the
+            // head is bounded by what is read, not only by what is kept.
+            let max_read = n.saturating_add(10_000);
+            let mut kept = Vec::new();
+            while kept.len() < n && pulled_head.len() < max_read {
+                match records.next() {
+                    Some(Ok(v)) => {
+                        if filter.as_ref().map_or(true, |f| f.test(&v).keep) {
+                            kept.push(v.clone());
+                        }
+                        pulled_head.push(v);
+                    }
+                    Some(Err(e)) => return Err(anyhow!("reading the source: {e}")),
+                    None => break,
+                }
+            }
+            if let (Some(f), true) = (&filter, kept.is_empty()) {
+                bail!(
+                    "`where {f}` kept none of the {} records sampled from the source, so there is \
+                     no schema to infer: check the expression, or declare every column \
+                     (`schema: strict`)",
+                    pulled_head.len()
+                );
+            }
+            infer_columns(kept.iter(), spec.options.flatten)
+        } else if spec.schema == SchemaMode::Infer {
+            // Inference sees only the records the run keeps, so the schema is theirs alone.
+            let filter = spec.filter.as_deref().map(Predicate::parse).transpose()?;
+            let samples = sample_records(
+                &input_path,
+                &spec.source,
+                spec.options.infer_sample,
+                filter.as_ref(),
+            )?;
+            if let (Some(f), true) = (&filter, samples.is_empty() && spec.columns.is_empty()) {
+                bail!(
                 "`where {f}` kept none of the records sampled, so there is no schema to infer: \
                  check the expression, or declare the columns"
             );
-        }
-        infer_columns(samples.iter(), spec.options.flatten)
-    } else {
-        Vec::new()
-    };
+            }
+            infer_columns(samples.iter(), spec.options.flatten)
+        } else {
+            Vec::new()
+        };
     let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(anyhow::Error::from)?;
     let schema = shaper.schema();
 
@@ -484,7 +657,6 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
     //    rerun never mixes stale data files. Safe: the path is always inside out_dir.
     //    A merge (`output.merge_on` in the spec) upserts into the table that is there,
     //    as the CLI's does, so it never clears it.
-    let merging = !spec.output.merge_on.is_empty();
     if is_iceberg && !r.append && !merging && output_path.exists() {
         std::fs::remove_dir_all(&output_path)
             .with_context(|| format!("clearing {}", output_path.display()))?;
@@ -511,7 +683,8 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         }
         .map_err(anyhow::Error::from)?;
         // The snapshot records which of this console's runs wrote it.
-        s.set_run_id(&run.id()).map_err(anyhow::Error::from)?;
+        let snapshot_run = r.run_id.clone().unwrap_or_else(|| run.id());
+        s.set_run_id(&snapshot_run).map_err(anyhow::Error::from)?;
         Box::new(s)
     } else {
         Box::new(
@@ -534,14 +707,22 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
     let mut parse_errors = 0u64;
     let mut batches = 0u64;
 
-    let reader = open_reader(&input_path, spec.source.format).map_err(|e| anyhow!("{e}"))?;
+    let reader: shapeshift_json::RecordSource = match pulled_records.take() {
+        Some(rest) => Box::new(
+            std::mem::take(&mut pulled_head)
+                .into_iter()
+                .map(Ok)
+                .chain(rest),
+        ),
+        None => open_source(&input_path, &spec.source).map_err(|e| anyhow!("{e}"))?,
+    };
     for item in reader {
         match item {
             Ok(v) => {
                 rows_in += 1;
                 match shaper.push(&v).map_err(anyhow::Error::from)? {
                     PushOutcome::Appended => rows_out += 1,
-                    PushOutcome::Filtered => {}
+                    PushOutcome::Filtered | PushOutcome::Skipped => {}
                     PushOutcome::Rejected(reason) => {
                         rejected += 1;
                         let rec = json!({ "error": reason, "raw": v });
@@ -585,6 +766,24 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         use std::io::Write as _;
         w.flush()?;
     }
+    // The source's position goes into the same commit as the rows it read.
+    let source_report = match &pulled {
+        Some(p) => {
+            let (end, progress) = p
+                .source
+                .outcome()
+                .ok_or_else(|| anyhow!("the source was not read to the end of its run"))?;
+            if let Some(pos) = &end {
+                sink.set_source_position(
+                    p.source.kind(),
+                    &shapeshift_core::recorded_position(pos, p.source.as_ref()),
+                )
+                .map_err(anyhow::Error::from)?;
+            }
+            Some(crate::pulled::report(p, &end, &progress))
+        }
+        None => None,
+    };
     run.phase(if is_iceberg { "committing" } else { "closing" });
     let summary = sink.finish().map_err(anyhow::Error::from)?;
     let filter_report = shaper.filter_report().cloned();
@@ -628,6 +827,7 @@ fn do_shape(ctx: &Ctx, r: ShapeReq, run: &mut Run<'_>) -> Result<ShapeResp> {
         snapshot_id: summary.snapshot_id.map(|id| id.to_string()),
         table_version: summary.table_version,
         earlier_attempt: summary.earlier_attempt,
+        source: source_report,
     })
 }
 
@@ -726,47 +926,54 @@ pub fn table(ctx: &Ctx, req: &Request) -> Response {
     let dir = ctx.resolve(r.path.trim());
     match read_local_history(&dir, 200) {
         Ok(Some((current, earlier))) => {
-            let mut card = table_card(&r.path, &current);
-            let info = parse_metadata_json(&current.to_string()).ok();
-            card["schema"] = json!(info
-                .map(|i| i
-                    .fields
-                    .iter()
-                    .map(|(n, t)| json!({ "name": n, "type": t }))
-                    .collect::<Vec<_>>())
-                .unwrap_or_default());
-            // A partition field is shown as its transform of the source column it reads
-            // (`day(event_at)`), not of its own name (`event_at_day`).
-            let columns = column_names(&current);
-            card["partition"] = json!(current["partition-specs"]
-                .as_array()
-                .and_then(|specs| specs
-                    .iter()
-                    .find(|s| s["spec-id"] == current["default-spec-id"]))
-                .and_then(|s| s["fields"].as_array())
-                .map(|f| f
-                    .iter()
-                    .map(|f| format!(
-                        "{}({})",
-                        f["transform"].as_str().unwrap_or("?"),
-                        f["source-id"]
-                            .as_i64()
-                            .and_then(|id| columns.get(&id).cloned())
-                            .or_else(|| f["name"].as_str().map(str::to_string))
-                            .unwrap_or_else(|| "?".into())
-                    ))
-                    .collect::<Vec<_>>())
-                .unwrap_or_default());
-            card["versions_read"] = json!(earlier.len() + 1);
-            card["events"] = json!(table_events(&current, &earlier)
-                .iter()
-                .map(|e| e.to_json())
-                .collect::<Vec<_>>());
-            Response::json(200, &card)
+            Response::json(200, &describe_table(&r.path, &current, &earlier))
         }
         Ok(None) => Response::error(404, format!("no Iceberg table at {}", dir.display())),
         Err(e) => Response::error(400, format!("{e}")),
     }
+}
+
+/// What the console shows of a table: its card, schema, partitioning and history as events,
+/// from its current metadata and the earlier versions it could read (none for a table loaded
+/// from a catalog, whose history is the snapshots its current metadata lists).
+pub(crate) fn describe_table(label: &str, current: &Value, earlier: &[Value]) -> Value {
+    let mut card = table_card(label, current);
+    let info = parse_metadata_json(&current.to_string()).ok();
+    card["schema"] = json!(info
+        .map(|i| i
+            .fields
+            .iter()
+            .map(|(n, t)| json!({ "name": n, "type": t }))
+            .collect::<Vec<_>>())
+        .unwrap_or_default());
+    // A partition field is shown as its transform of the source column it reads
+    // (`day(event_at)`), not of its own name (`event_at_day`).
+    let columns = column_names(current);
+    card["partition"] = json!(current["partition-specs"]
+        .as_array()
+        .and_then(|specs| specs
+            .iter()
+            .find(|s| s["spec-id"] == current["default-spec-id"]))
+        .and_then(|s| s["fields"].as_array())
+        .map(|f| f
+            .iter()
+            .map(|f| format!(
+                "{}({})",
+                f["transform"].as_str().unwrap_or("?"),
+                f["source-id"]
+                    .as_i64()
+                    .and_then(|id| columns.get(&id).cloned())
+                    .or_else(|| f["name"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| "?".into())
+            ))
+            .collect::<Vec<_>>())
+        .unwrap_or_default());
+    card["versions_read"] = json!(earlier.len() + 1);
+    card["events"] = json!(table_events(current, earlier)
+        .iter()
+        .map(|e| e.to_json())
+        .collect::<Vec<_>>());
+    card
 }
 
 /// The current schema's columns by field id (nested struct fields as `parent.child`).
@@ -844,7 +1051,7 @@ pub fn health(ctx: &Ctx) -> Response {
 
 // ---- shared helpers ---------------------------------------------------------
 
-fn parse_body<T: for<'de> Deserialize<'de>>(req: &Request) -> Result<T, Response> {
+pub(crate) fn parse_body<T: for<'de> Deserialize<'de>>(req: &Request) -> Result<T, Response> {
     serde_json::from_slice(&req.body)
         .map_err(|e| Response::error(400, format!("invalid JSON body: {e}")))
 }
@@ -861,7 +1068,7 @@ fn default_output_format() -> OutputFormat {
 
 /// Sanitize a dataset name into a safe single path segment (letters/digits/_/-),
 /// falling back to `dataset`. Prevents a name from escaping the output directory.
-fn clean_dataset(name: Option<&str>) -> String {
+pub(crate) fn clean_dataset(name: Option<&str>) -> String {
     let raw = name
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -885,11 +1092,14 @@ fn clean_dataset(name: Option<&str>) -> String {
 }
 
 /// Write inline records to a unique temp file whose extension matches the format
-/// (so `open_reader` picks the right reader), returning its path.
+/// (so the file says what it holds), returning its path.
 fn write_temp_input(ctx: &Ctx, text: &str, format: SourceFormat) -> Result<PathBuf> {
     let ext = match format {
         SourceFormat::Jsonl => "jsonl",
         SourceFormat::JsonArray => "json",
+        SourceFormat::Csv => "csv",
+        SourceFormat::Tsv => "tsv",
+        SourceFormat::Xml => "xml",
     };
     let path = ctx.tmp_dir().join(format!("in-{}.{ext}", ctx.next_id()));
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
@@ -901,12 +1111,12 @@ fn write_temp_input(ctx: &Ctx, text: &str, format: SourceFormat) -> Result<PathB
 /// error aborts.
 fn sample_records(
     path: &Path,
-    format: SourceFormat,
+    source: &SourceSpec,
     n: usize,
     filter: Option<&Predicate>,
 ) -> Result<Vec<Value>> {
     let reader =
-        open_reader(path, format).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+        open_source(path, source).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
     let mut out = Vec::new();
     for item in reader {
         match item {

@@ -20,6 +20,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Catalog & engines: browse a REST catalog (read-only). The CLI turns it on with its
+# `object_store` feature, which already links the catalog client.
+catalog = ["dep:shapeshift-objstore"]
+# Datasets that pull: an endpoint (`source.http`) or a database (`source.mysql`). The CLI's
+# `http` and `mysql` features turn these on.
+http = ["dep:shapeshift-source-http"]
+mysql = ["dep:shapeshift-source-mysql"]
+postgres = ["dep:shapeshift-source-postgres"]
+
 [dependencies]
 shapeshift-core = { workspace = true }
 shapeshift-json = { workspace = true }
@@ -33,3 +43,13 @@ tracing = { workspace = true }
 # A run id's random suffix: ids recorded in snapshots must never repeat (a fresh run log, or
 # another console writing the same table, would otherwise take a new run for an earlier one).
 uuid = { workspace = true }
+# Alerts are POSTed to webhooks (Slack, Teams, a paging service), which are HTTPS. rustls with
+# Mozilla's roots bundled (webpki-roots), so delivery works with no CA store on the box.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Connector tokens: SHA-256 to keep them hashed, and the system's randomness to make them.
+# Already linked for ureq's TLS.
+ring = "0.17"
+shapeshift-objstore = { workspace = true, optional = true }
+shapeshift-source-http = { workspace = true, optional = true }
+shapeshift-source-mysql = { workspace = true, optional = true }
+shapeshift-source-postgres = { workspace = true, optional = true }

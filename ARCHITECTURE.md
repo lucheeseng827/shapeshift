@@ -1,14 +1,15 @@
 # shapeshift — Architecture
 
-The internal design of record for **shapeshift**, a streaming JSON/JSONL → Parquet/Iceberg
-shaper. This document describes how the engine is split into crates, how a record flows from
+The internal design of record for **shapeshift**, a streaming shaper from JSON, CSV, TSV and
+XML (files, or pulled from an endpoint or a database) to Parquet and Iceberg. This document describes how the engine is split into crates, how a record flows from
 bytes to a columnar file, and the correctness-critical choices (the transactional per-row
 append, the field-id chain, and the hand-rolled Avro encoder) that are easy to get wrong and
 expensive to get wrong.
 
 Scope: this is the **OSS engine** (Apache-2.0) — fully self-hostable, no row cap, no telemetry.
-Scheduling, run history, and connectors sit outside it, behind the boundary described in the last
-section; nothing in this document depends on them.
+Scheduling, run history, and per-vendor connectors sit outside it, behind the boundary described
+in the last section; nothing in this document depends on them. The generic pulled sources of 0.6
+(§10b) are in it, each behind an off-by-default feature.
 
 ---
 
@@ -32,20 +33,27 @@ section; nothing in this document depends on them.
 
 ---
 
-## 2. The six-crate split
+## 2. The crate split
 
 shapeshift is a standalone Cargo workspace with its own `Cargo.lock` (the heavy Arrow / parquet
 / simd-json stack resolves independently of the shared monorepo workspace, the same pattern as
-sibling modules forge/recall/evald). The member list is a closed set of six crates:
+sibling modules forge/recall/evald). Six crates make the engine; five more (0.5–0.6) are the
+console, the agent server and the pulled sources, each a leaf the CLI links only behind a feature
+(`mcp`'s is the exception: it is in the default binary, and depends on `serde_json` alone):
 
 | Crate | Responsibility | Notable deps | I/O backend? |
 |---|---|---|---|
 | `shapeshift-core` | The engine. Spec model, JSON schema inference, the named Transform library, the Shaper (JSON value → Arrow `RecordBatch`), the `Sink` trait, MAR cost arithmetic. | arrow-array/arrow-schema 54, serde/serde_json/serde_yaml, chrono (no `clock`) | **none — by design** |
-| `shapeshift-json` | Streaming JSON source over the simd-json SIMD lexer: `JsonlReader` (one object/line, bounded RAM) and `JsonArrayReader` (streamed element-at-a-time, bounded RAM). | simd-json 0.14 | read |
+| `shapeshift-json` | The file readers. JSON over the simd-json SIMD lexer: `JsonlReader` (one object/line, bounded RAM) and `JsonArrayReader` (streamed element-at-a-time, bounded RAM); and, from 0.6, `CsvReader` (CSV and TSV) and `XmlReader`, each yielding one record a row or element (§10a). | simd-json 0.14, csv, quick-xml | read |
 | `shapeshift-parquet` | `ParquetSink` (RecordBatch → Parquet, one row group per batch, Snappy default) + `inspect()` read-back. | parquet 54 `["arrow","snap"]` | write |
 | `shapeshift-iceberg` | `IcebergSink`: a self-contained Apache **Iceberg v2** table (no catalog server), **append-to-existing / multi-snapshot** (`--append`) + `inspect()`. Owns the hand-rolled Avro encoder **and reader** (the reader carries a prior snapshot's manifests forward on append), and a **backend-agnostic table builder** (`IcebergDataWriter` + `build_metadata_artifacts`, paths anchored at a base location) the object-store sink reuses. | parquet 54, uuid v4 | write |
 | `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table (data + manifests + metadata, put 8 at a time) in S3/GCS/Azure — data via a bounded-RAM multipart upload, metadata via `put`, paths anchored at the destination. The driver that reuses other drivers (`parquet`, `iceberg`); opt-in behind the CLI's `object_store` feature. | object_store 0.14, tokio (current-thread) | write (remote) |
 | `shapeshift-cli` | The single `shapeshift` binary. Orchestrates source → shaper → sink and owns the CLI surface. | clap 4 (derive), anyhow, tracing | driver |
+| `shapeshift-source-http` | A REST or SOAP endpoint as a `Source` (§10b): paging, the incremental cursor, credentials from the environment, redirects followed by hand. Feature `http`. | ureq 3 (rustls) | read (remote) |
+| `shapeshift-source-mysql` | A MySQL query or table as a `Source`, in one consistent snapshot. Feature `mysql`. | mysql 28 (rustls, ring) | read (remote) |
+| `shapeshift-source-postgres` | The same for Postgres, through a server-side portal. Feature `postgres`. | postgres 0.19, tokio-postgres-rustls (ring) | read (remote) |
+| `shapeshift-serve` | `shapeshift serve`, the local console: a hand-rolled HTTP server on `std::net` (no async runtime), datasets, runs, alerts, push connectors, a read-only catalog browser. Feature `serve`. | ureq 3 (alert webhooks) | driver |
+| `shapeshift-mcp` | `shapeshift mcp`'s core: JSON-RPC on stdio, the read-only tool tier, a path sandbox, capped results. | serde_json | none |
 
 **Why this shape.** `core` is the I/O-free brain: it can be inference-tested, coercion-tested,
 and cost-tested with no filesystem and no format crate on the dependency graph. `json`,
@@ -61,6 +69,13 @@ on the way in and Arrow `RecordBatch` on the way out — two well-understood, ba
 was a new crate implementing `Sink` (by wrapping the existing writers) with **nothing in `core`
 changed**, and it is opt-in behind the CLI's `object_store` feature so the default binary links
 no cloud SDKs.
+
+The pulled sources of 0.6 follow the same pattern from the other end. `core` owns the `Source`
+trait and every rule about positions (§10b); each source crate depends on `core` alone and
+implements the trait, and the CLI links it only behind its feature, so the lean binary links no
+network client and no database driver. `serve` is the second crate that composes others: behind
+the same features it opens a dataset's source and browses a catalog, so a feature turned on in
+the CLI turns on its console half too.
 
 ---
 
@@ -796,6 +811,46 @@ with --catalog: POST …/namespaces/{ns}/register {name, metadata-location} (nev
 - **`s3a://` is S3.** A table Spark recorded as `s3a://` and reached as `s3://` is not "moved",
   and a relocation keeps its spelling, so its other readers keep their client.
 
+## 8h. Change feeds — `changes:` (0.6)
+
+A change feed is a merge whose rows say what happened. The spec's `changes:` block names the
+field that says it (`op`, with its values per kind: insert, update, delete, skip), where the row
+is in each record (`row`), where a delete's key is (`key_from`), and which output columns version
+a change (`order_by`). A preset (`debezium-postgres`, `debezium-mysql`, `flink-cdc`) fills these in
+and adds the version columns. The shaper classifies each record before shaping it, and the merge
+writer of §8a takes the kind with the row:
+
+- **An upsert** is §8a's merge: the row replaces the key's live row, with a position delete.
+- **A delete** writes only the position delete: the key's live row goes, and nothing is
+  appended.
+- **With `order_by`**, a change wins only if it is newer than the key's live row (compared on
+  the order columns, as the table records them), so a feed delivered out of order, or replayed,
+  ends in the same state, for a deleted key while its tombstone is kept (below). A change that
+  is not newer is counted *stale* and changes nothing. A
+  table records its order (`shapeshift.changes.order-by`) and refuses a merge ordered another way.
+- **`apply: changelog`** skips all of this and appends every change with an `_op` column.
+
+**Tombstones.** With `order_by`, a deleted key leaves no row to compare a late change against,
+so the delete itself is remembered: its key and version, for `changes.tombstone_retention`
+(default 7 days). They are kept in one Puffin file under `metadata/`, named twice: in every
+snapshot's summary (`shapeshift.tombstones`, with its count, size and the snapshot that wrote
+it) and in the table's `statistics` list (Iceberg's place for a snapshot's statistics files).
+The current
+tombstones are those the nearest snapshot in the current snapshot's ancestry names, since a write
+by another engine names none. A merge with `order_by` reads them, drops the ones a newer change
+superseded (the key was re-created) and the ones past retention, adds its own deletes, and
+writes a new file whole: its size is the deletes of the retention window, not the table. Every
+other shapeshift write (an append, `compact`) names the same file again, unchanged. If the file
+a snapshot names cannot be read, a merge with `order_by` is refused with the path and the
+reason: nothing is merged on a guess. `expire` deletes a tombstone file only when no kept
+snapshot names it, and a REST catalog commit sends `set-statistics` / `remove-statistics`. The format of this state is the table property
+`shapeshift.changes.format`; a build that does not know the value refuses to write the table.
+
+**Debezium's snapshot rows.** A row the connector read from the table as it stood (`op: r`) is
+given the lowest version of its preset (`cdc_lsn` 0; an empty `cdc_file` at position 0), so
+every change outranks it: a transaction open across the initial snapshot commits after it with
+lower LSNs, and its updates and deletes must still win.
+
 ## 9. The Parquet sink
 
 `ParquetSink` streams RecordBatches to one file via `parquet::arrow::ArrowWriter`, one row group
@@ -824,6 +879,70 @@ the rest of the system rather than simd-json's borrowed/tape types. This is a de
 
 The cost is one owned `Value` allocation per record; the benefit is a clean, backend-neutral
 record model and a `core` crate that is trivially testable without any parser at all.
+
+## 10a. CSV, TSV and XML readers (0.6)
+
+Both readers keep that seam: each turns its format into the same stream of `serde_json::Value`
+records, so inference, paths, transforms, drift and `where` apply unchanged, and `convert` prints
+exactly what a spec will see. Both are pure Rust (`csv`, `quick-xml`), so they are in the lean
+binary.
+
+- **`CsvReader`** (CSV and TSV): a row becomes an object keyed by the column names (from the
+  header, or `source.csv.columns`, or `column_N`). Quoting is RFC 4180's; a byte-order mark is
+  skipped. With `types: auto` a field that is plainly a boolean, an integer or a decimal arrives
+  as one, so inference sees types; `strings` leaves every field text for the spec to coerce. A
+  row with the wrong number of fields is a reject, kept with its line and its text re-quoted, as
+  a bad JSON line is.
+- **`XmlReader`**: each element at `source.xml.record` becomes a record: attributes as `@name`,
+  children by name (a repeated one an array), text alone as the value or beside them as
+  `#text`, every value a string. Namespace prefixes are dropped. A document with a
+  `<!DOCTYPE>` is refused, so no entity is ever fetched or expanded, and one that is not well
+  formed fails the run there: nothing after the break can be read, so it is not one bad record.
+
+Both stream one record at a time, and one record may be no larger than a JSON one (256 MiB): a
+quote that never closes, or a record path that matches the whole document, fails the run there
+instead of filling memory.
+
+## 10b. Pulled sources (0.6)
+
+A pulled source is read by the engine itself, a little at a time, and the **table is its
+checkpoint**. `core` defines the `Source` trait and every rule about positions; a source crate
+(`shapeshift-source-http`, `-mysql`, `-postgres`) implements it:
+
+- `kind()` names it (`http`, `mysql`, `postgres`); its position is recorded in the snapshot
+  summary as `shapeshift.source.<kind>`.
+- `identity()` says what the position is a position *in* (the endpoint without its query and the
+  cursor field; a database's URL, table or query digest, and cursor). It is recorded beside the
+  position, and `resume_from` refuses a run whose source says otherwise: a table never resumes
+  another source's position.
+- `open(start, bounds)` starts from the table's recorded position (`None` on the first run) and
+  returns a streaming iterator of records: a source holds one page, or one batch of rows, at a
+  time. `outcome()`, once the records are drained, gives the position to commit and what the
+  run read (new, re-read, already read).
+
+The CLI reads the position from the table, opens the source, shapes its records as any input,
+and hands the new position to the sink (`Sink::set_source_position`), which writes it **in the
+same commit as the rows**. A run that fails commits neither, so the next one starts from the last
+commit. A sink that cannot record a position refuses an incremental source. The rules a position
+follows (an `at v` or `inside v, after k` position; records at `v` re-read on purpose, so a source
+needs `merge_on` or a strictly growing cursor; bounds counting new records only; `lookback`;
+`max_tie`) are SPEC §2.6's, implemented once in `core` and shared by every source.
+
+What each source owns is its protocol and its safety:
+
+- **HTTP** holds each page whole (at most 64 MiB), follows the paging style the spec names,
+  and checks the declared order as records arrive (a record out of order fails the run, since a
+  position past it could skip one). Credentials come from environment variables the spec names,
+  go only to the URL's own origin, and over plain http only to this machine unless
+  `--insecure-source`; redirects are followed by the source (at most 5), never by the client, so
+  a credential is never sent on. A SOAP service is the same source with an envelope built around
+  a template and a WS-Security token; a `Fault` fails the run.
+- **MySQL and Postgres** read in one `REPEATABLE READ`, `READ ONLY` transaction in UTC, so a run
+  sees one state of the database, streaming (a queue of a few hundred rows; a Postgres portal,
+  500 a fetch). The password comes from the environment; TLS is required off this machine,
+  checked against the bundled public roots and any `ca_file`.
+- **`--source-hosts`** holds a run to a list of hosts whatever the spec says, checked on the
+  first URL, every redirect and page, and the database hosts as the driver parses them.
 
 ---
 
@@ -960,9 +1079,11 @@ Stated honestly; the layout is chosen so each is additive rather than a rewrite.
   serialises) a concurrent writer (§8d), and leaves position-delete files in place, so read cost grows with every merge until the table
   is compacted (`compact`, §8b). Compaction keeps every earlier snapshot's files until
   `expire` (§8c) lets the old snapshots go; old `metadata.json` files are kept.
-- **No CDC capture, no scheduling, no connectors** — deliberately kept out of the engine
-  (next section). Applying a delta it is handed (`--merge-on`) is the engine's job; deciding which
-  rows changed since the last run is not.
+- **No CDC log capture, no scheduling, no per-vendor connectors** — deliberately kept out of the
+  engine (next section). Applying a change feed it is handed (§8h), and reading what is new from
+  an endpoint or a table by its cursor (§10b), are the engine's job; reading a database's log
+  (WAL, binlog) to find what changed is Debezium's or Flink CDC's. A query sees what a query
+  sees: a hard `DELETE` needs the change feed.
 
 ---
 
@@ -979,6 +1100,10 @@ The engine's contract to an orchestrator is exactly the CLI surface — its flag
 statuses (75: refused by the commit guard, run it again) and the `--summary-json` document it
 prints; nothing more couples them, so capability added at the orchestration layer never needs to
 change — or cap — the engine.
+
+A pulled source (§10b) does not change this. Its position is not engine state: it is written in
+the table, in the commit that lands the rows, so an orchestrator that runs the same spec on a
+cadence needs to remember nothing between runs, and two runs of it can never both advance it.
 
 ---
 

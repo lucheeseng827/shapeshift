@@ -1,0 +1,14 @@
+# shapeshift-mcp — the Model Context Protocol server's core: JSON-RPC over stdio, the tier gate,
+# the path sandbox and the result caps. The tools themselves are the CLI's (`shapeshift mcp`), so
+# they call the same functions the commands do. No dependency beyond serde_json, and no listener.
+[package]
+name = "shapeshift-mcp"
+description = "shapeshift's MCP server core: JSON-RPC on stdio, read-only unless told otherwise, with a path sandbox and capped results."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }

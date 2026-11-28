@@ -59,8 +59,25 @@ pub struct MergeSummary {
     pub data_files_pruned: u64,
     /// Position-delete files written.
     pub delete_files: u64,
-    /// Rows deleted: `prior_rows_replaced + duplicates_in_input`.
+    /// Rows deleted: `prior_rows_replaced + rows_deleted + duplicates_in_input`, and the
+    /// rows of stale changes this write had written.
     pub position_deletes: u64,
+    /// A change feed's keys whose latest change was a delete that applied.
+    pub keys_deleted: u64,
+    /// Live rows already in the table that a delete removed.
+    pub rows_deleted: u64,
+    /// Keys whose latest change was not newer than the key's live row (`changes.order_by`),
+    /// so the table kept its row: as new or newer, including a change replayed.
+    pub changes_stale: u64,
+    /// The columns changes were ordered by (`changes.order_by`); empty: arrival order.
+    pub order_by: Vec<String>,
+    /// Tombstones (with `order_by`): deletes this write remembered; tombstones it retired
+    /// because a newer change re-created the key; those it trimmed past the retention; and
+    /// how many the table remembers after it.
+    pub tombstones_written: u64,
+    pub tombstones_retired: u64,
+    pub tombstones_trimmed: u64,
+    pub tombstones_live: u64,
 }
 
 /// A columnar output target.
@@ -72,4 +89,14 @@ pub trait Sink {
     /// Flush footers / write table metadata and return what was produced. Must be
     /// called exactly once; writing after finish is a logic error.
     fn finish(&mut self) -> Result<SinkSummary>;
+
+    /// Record a pulled source's position in this write's commit, as the snapshot summary
+    /// key `shapeshift.source.<kind>`: the data and the position land together, or neither
+    /// does. Called before [`Sink::finish`]. Only a table records one; a file cannot.
+    fn set_source_position(&mut self, kind: &str, _position: &serde_json::Value) -> Result<()> {
+        Err(crate::ShapeError::Spec(format!(
+            "an incremental `{kind}` source records its position in the table it writes: \
+             it needs `output.format: iceberg`"
+        )))
+    }
 }

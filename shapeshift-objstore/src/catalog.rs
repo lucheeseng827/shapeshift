@@ -29,6 +29,13 @@ use crate::{client_err, sink_err};
 
 /// How long one catalog call may take before its outcome is treated as lost.
 pub(crate) const CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pages a listing follows before giving up on a catalog that never stops paging.
+const MAX_PAGES: usize = 1000;
+/// Namespaces a browse lists at most.
+pub(crate) const MAX_NAMESPACES: usize = 1000;
+/// What a catalog without nested namespaces may answer a listing with `?parent=`: a bad or
+/// unknown request, a method or parameter it does not support.
+const UNSUPPORTED: &[u16] = &[400, 404, 405, 406, 422, 501];
 
 /// How many times an append the catalog refused is built again onto a newer head before
 /// it gives up with a conflict (exit 75). Of writers racing on one table each round commits
@@ -510,6 +517,153 @@ impl RestCatalog {
 
     fn table_url(&self, t: &TableIdent) -> String {
         format!("{}/tables/{}", self.namespace_url(t), encode(&t.name))
+    }
+
+    /// `GET url` as JSON, with the run's credentials (with client credentials, getting a
+    /// token first is a POST to the token endpoint; the catalog itself is only read). An answer
+    /// that is not a success is `Ok(Err(status))` with the error the caller reports.
+    async fn get_json(
+        &self,
+        url: &str,
+        what: &str,
+    ) -> Result<std::result::Result<Value, (u16, ShapeError)>> {
+        let request = self.authorized(self.client.get(url)).await?;
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| sink_err(format!("{what} at the catalog {}: {e}", self.uri)))?;
+        let (status, body) = read(resp).await?;
+        if !status.is_success() {
+            return Ok(Err((
+                status.as_u16(),
+                sink_err(format!(
+                    "the catalog at {} refused {what}: {}{}",
+                    self.uri,
+                    describe(status, &body),
+                    self.auth_hint(status)
+                )),
+            )));
+        }
+        serde_json::from_slice(&body).map(Ok).map_err(|e| {
+            sink_err(format!(
+                "the catalog at {} answered {what} with something not JSON: {e}",
+                self.uri
+            ))
+        })
+    }
+
+    /// Every item under `key` of a listing at `base`, following `next-page-token` (sent back
+    /// as `pageToken`) up to [`MAX_PAGES`] pages. `None` when the first page is refused with one
+    /// of `tolerate`; any other refusal, and a catalog that hands back the token it was given, is
+    /// an error.
+    async fn pages(
+        &self,
+        base: &str,
+        key: &str,
+        what: &str,
+        tolerate: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let url = match &token {
+                None => base.to_string(),
+                Some(t) => {
+                    let sep = if base.contains('?') { '&' } else { '?' };
+                    format!("{base}{sep}pageToken={}", encode(t))
+                }
+            };
+            let page = match self.get_json(&url, what).await? {
+                Ok(page) => page,
+                Err((status, _)) if token.is_none() && tolerate.contains(&status) => {
+                    return Ok(None)
+                }
+                Err((_, e)) => return Err(e),
+            };
+            if let Some(items) = page[key].as_array() {
+                out.extend(items.iter().cloned());
+            }
+            match page["next-page-token"].as_str().filter(|t| !t.is_empty()) {
+                Some(t) if token.as_deref() == Some(t) => {
+                    return Err(sink_err(format!(
+                        "the catalog at {} answered {what} with the page token it was given: it \
+                         would never end",
+                        self.uri
+                    )))
+                }
+                Some(t) => token = Some(t.to_string()),
+                None => return Ok(Some(out)),
+            }
+        }
+        Err(sink_err(format!(
+            "the catalog at {} answered {what} with more than {MAX_PAGES} pages",
+            self.uri
+        )))
+    }
+
+    /// Every namespace, as its levels: the top level, then each one's children
+    /// (`?parent=`), up to [`MAX_NAMESPACES`]; the flag says whether that cap cut the list short. A
+    /// catalog without nested namespaces may refuse `parent` as a bad or unknown request
+    /// ([`UNSUPPORTED`]), or ignore it and answer the top level again: either way, no children.
+    /// Any other refusal (credentials, a server error) is an error, never a quietly shorter list.
+    pub(crate) async fn list_namespaces(&self) -> Result<(Vec<Vec<String>>, bool)> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut queue: std::collections::VecDeque<Option<Vec<String>>> = [None].into();
+        while let Some(parent) = queue.pop_front() {
+            let url = match &parent {
+                None => format!("{}namespaces", self.root),
+                Some(p) => format!(
+                    "{}namespaces?parent={}",
+                    self.root,
+                    encode(&p.join("\u{1f}"))
+                ),
+            };
+            let tolerate: &[u16] = if parent.is_some() { UNSUPPORTED } else { &[] };
+            let Some(found) = self
+                .pages(&url, "namespaces", "listing namespaces", tolerate)
+                .await?
+            else {
+                continue;
+            };
+            for ns in found {
+                let levels: Vec<String> = ns
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|l| l.as_str().map(str::to_string))
+                    .collect();
+                let child = match &parent {
+                    None => true,
+                    Some(p) => levels.len() > p.len() && levels.starts_with(p),
+                };
+                if levels.is_empty() || !child || out.contains(&levels) {
+                    continue;
+                }
+                out.push(levels.clone());
+                if out.len() >= MAX_NAMESPACES {
+                    return Ok((out, true));
+                }
+                queue.push_back(Some(levels));
+            }
+        }
+        Ok((out, false))
+    }
+
+    /// The tables in namespace `ns` (their names), following the catalog's pages.
+    pub(crate) async fn list_tables(&self, ns: &[String]) -> Result<Vec<String>> {
+        let url = format!(
+            "{}namespaces/{}/tables",
+            self.root,
+            encode(&ns.join("\u{1f}"))
+        );
+        let found = self
+            .pages(&url, "identifiers", "listing tables", &[])
+            .await?
+            .unwrap_or_default();
+        Ok(found
+            .iter()
+            .filter_map(|i| i["name"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// Load `t`, or `None` when the catalog has no such table (or no such namespace).

@@ -1,0 +1,15 @@
+# A Debezium feed from MySQL (the JSON converter with schemas off), applied to an Iceberg
+# table that keeps the current state. The preset reads `op`, `after` and `before`, and adds
+# `cdc_file`, `cdc_pos`, `cdc_row` and `cdc_ts_ms`, ordering changes by the binlog position.
+dataset: orders
+schema: strict
+changes:
+  preset: debezium-mysql
+output:
+  format: iceberg
+  path: PATH
+  merge_on: [id]
+columns:
+  - { name: id, type: int64, required: true }
+  - { name: status, type: string }
+  - { name: amount, type: int64 }

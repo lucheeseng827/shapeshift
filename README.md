@@ -2,7 +2,7 @@
 
 # shapeshift
 
-**shapeshift** streams JSON/JSONL into **Parquet** or an **Apache Iceberg v2** table under a small
+**shapeshift** streams JSON/JSONL, CSV, TSV and XML into **Parquet** or an **Apache Iceberg v2** table under a small
 declarative *dataset transform spec*. Write one spec per source *shape* — the columns, types, and
 value transforms your rows need — then shape unbounded rows on your own hardware for the cost of the
 CPU that does it. It is a single static **Apache-2.0** Rust binary (or an embeddable set of crates):
@@ -15,7 +15,9 @@ no JVM, no catalog server, no Python, no row cap, no telemetry. It is the honest
 [![Image size](https://img.shields.io/docker/image-size/mancube/shapeshift?sort=semver&label=image)](https://hub.docker.com/r/mancube/shapeshift)
 [![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/shapeshift)
 
-**Status: released.** The current release is **0.5.0**. Each tagged release publishes:
+**Status: released.** The current release is **0.5.0**; **0.6.0-rc.1**, its release candidate, is
+on the release page as a pre-release (image tag `0.6.0-rc.1`; `latest` stays on 0.5.0). Each
+tagged release publishes:
 - a static `shapeshift` binary for Linux x86_64 (musl), with its SHA-256, on the
   [release page](https://github.com/lucheeseng827/shapeshift/releases);
 - the multi-arch image (`linux/amd64`, `linux/arm64`) `mancube/shapeshift`, tagged with
@@ -229,6 +231,76 @@ correct types, dates/timestamps, flattened columns, and nulls; `iceberg_scan('ev
 the *same* rows and the *same* aggregates end-to-end — verified identical to the Parquet path
 (4 rows, `sum(amount)=115.49`).
 
+### Not JSON? CSV, TSV and XML
+
+The same commands read CSV, TSV and XML with `--format`, streaming with bounded RAM. A CSV row or an
+XML element becomes a JSON-shaped record, and `convert` shows you exactly which:
+
+```sh
+$ shapeshift convert -i orders.csv --format csv
+{"id":1,"name":"Ada","amount":12.5,"zip":"02139"}
+$ shapeshift shape -i orders.xml --format xml --xml-record /Orders/Order -o orders.parquet
+```
+
+Plain numbers and booleans in a CSV arrive typed (a ZIP code with a leading zero stays a string);
+XML attributes become `@name` fields, and a document type declaration is refused, so no external
+entity is ever read. The options live in the spec's `source.csv` and `source.xml`
+([SPEC §2.2](docs/SPEC.md)).
+
+### Pull from an API — `--from` and `source.http` (0.6)
+
+A REST endpoint is a source too, read a page at a time, in a build with `--features http`. The
+token comes from an environment variable the spec names, never from the spec:
+
+```yaml
+source:
+  http:
+    url: https://api.example.com/v1/orders
+    auth: { bearer_env: ORDERS_API_TOKEN }
+    records: data.items                 # where the array is in each response
+    paging: { next: links.next }        # or link, page/size, offset/limit, a cursor token
+    incremental: { param: updated_since, from: updated_at, order: asc }
+output: { format: iceberg, path: warehouse/orders, merge_on: [id] }
+```
+
+```sh
+$ shapeshift shape -s orders.yaml --max-records 50000   # again and again, e.g. from cron
+  source http: 50000 new, 3 re-read, 0 already read; position {"at":"2026-11-02T09:14:00Z"} → {"at":"2026-11-03T17:40:12Z"} (stopped at a bound: the next run goes on from there)
+```
+
+With `incremental`, the table is the checkpoint: the position is written into the snapshot the
+rows commit in, so there is no state file, a failed run lands nothing, and the next one resumes
+where the last commit stopped. A bounded run counts only new records, and a loop of bounded runs
+always reaches the end. Records at the position's value are re-read on purpose (one may have
+arrived since), so a source needs `merge_on` or a `strict` cursor. `lookback` covers records
+that turn up late with an older value; [SPEC §2.6](docs/SPEC.md) states exactly which ones it
+catches. Credentials go only to the URL's own origin, and over plain http only to this machine.
+`shape --from <url> --records data -o out.parquet` reads one page with no spec at all. A SOAP
+service is `source.http.soap`: an envelope built around a template, a WS-Security username token
+from the environment, the response read as XML, and a `Fault` reported by its fault string
+([SPEC §2.6](docs/SPEC.md)).
+
+### Pull from MySQL — `--from mysql://` (0.6)
+
+A query or a table is a source too, in a build with `--features mysql`. The password comes from
+`SHAPESHIFT_MYSQL_PASSWORD`:
+
+```sh
+$ shapeshift shape --from mysql://app@db.example.com/shop --source-table orders \
+    --watermark updated_at --merge-on id --to iceberg -o warehouse/orders --max-records 100000
+```
+
+Each run reads what changed since the position the table recorded, in one consistent snapshot,
+streaming. A table is read by its watermark and primary key (one integer or temporal column; a composite or
+text key orders the rows but is no tiebreak). With that tiebreak a run can stop inside a group
+of rows sharing one `updated_at` and the next picks up there; without one a bounded run reads
+each group to its end, and fails on one larger than `max_tie`. `--query "select … where updated_at >=
+:cursor order by updated_at" --start 2020-01-01` reads a query instead, and `--from
+postgres://…` (a build with `--features postgres`) reads Postgres the same way (its first run needs a
+`--start`). Soft deletes are a change (`changes:`); a
+hard `DELETE` leaves nothing a query can see, so it needs a change feed
+([SPEC §2.7](docs/SPEC.md) says what `lookback` must cover).
+
 ## The dataset transform spec
 
 The spec is the **product boundary**: write it once per source shape, then shape unbounded rows for
@@ -366,8 +438,9 @@ drift:
 `rescue` appends its column *after* every declared one, so switching it on is an additive Iceberg
 schema change (`--append` accepts it as a new optional column). A run that fails under `error` never
 finalizes its sink, so there is no half-written table to consume — the Parquet file has no footer
-(no reader will open it) and the Iceberg table keeps its previous `metadata.json`, whatever was
-flushed before the drift. The written-but-unreferenced bytes stay on disk as leftovers to delete.
+(no reader will open it) and the Iceberg table keeps its previous `metadata.json`. The data files
+an Iceberg run flushed before it failed are removed, as is a table directory the run itself made;
+the same holds for any run that fails before its commit (a strict coercion, a source error).
 
 Detection costs about **6% of wall time** on a clean 1M-row run and leaves peak RSS unchanged
 ([BENCHMARKS.md §7](./BENCHMARKS.md#7-performance-measured)) — `--on-drift ignore` buys it back.
@@ -431,6 +504,37 @@ Limits, stated plainly: every merge leaves a delete file that every reader must 
 table is compacted (`inspect` shows how many rows they hide); and concurrent writers are safe but
 not merged — of two that built on the same version, the second is refused (exit status 75) and
 must run again (see [Concurrent writers](#concurrent-writers--the-commit-guard)).
+
+### Change feeds — deletes, and changes out of order
+
+A merge upserts. A **feed of changes** also deletes, and does not always arrive in order. A
+`changes:` block says how to read one: which field says what happened, where the row is, and
+which columns version a change.
+
+```yaml
+changes:
+  preset: debezium-postgres # Debezium's envelope, ordered by the log sequence number
+output: { format: iceberg, path: orders, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+  - { name: status, type: string }
+```
+
+The preset reads `op` (`c`/`u`/`d`), the row in `after` and a delete's key in `before`, and adds
+`cdc_lsn` to order by, so the newer change to a key wins whatever order the feed arrives in.
+Any feed works without a preset: name the `op` field and its values, the `row`, and the
+`order_by` columns (a column whose `from` starts with `$` reads the envelope). There are presets
+for Debezium from MySQL and for Flink CDC too.
+
+A delete removes the key's row. With `order_by`, a change that is not newer than the key's live
+row is **stale**: counted, and the table keeps its row, so a feed replayed after a failure changes
+nothing. A delete is remembered (a tombstone, kept a week by default), so a late change for a
+deleted key does not bring it back. `apply: changelog` keeps every change instead, with an `_op` column. Checked against
+DuckDB with random out-of-order feeds, flat and as Debezium envelopes
+([`examples/changes/verify_duckdb.py`](./examples/changes/verify_duckdb.py)), and against real
+Debezium feeds from Postgres and MySQL shuffled into several writes
+([`examples/changes/debezium/`](./examples/changes/debezium/)); the rules are in
+[SPEC §5b](./docs/SPEC.md).
 
 ### Compact — pay the merges back
 
@@ -767,6 +871,63 @@ order is not part of the contract.)
 - **`summary_version` is the contract.** A field may be added within version 1; renaming or
   removing one, or changing what it means, bumps it.
 
+### Let an agent use it — `shapeshift mcp`
+
+`shapeshift mcp` serves shapeshift's tools to an AI agent (Claude Desktop, an IDE, your own) over
+the Model Context Protocol, on stdio. It is read-only: the agent can infer a spec from a
+sample, check a spec, look at a file's records, inspect a table and its history, and preview
+rows, all under `--root`. With `--console http://127.0.0.1:8087` it reads a running console's
+datasets, runs, alerts and connectors instead. No tool takes a URL or a credential, results
+read from data are marked as data, and every call is logged to stderr.
+
+```json
+{ "mcpServers": { "shapeshift": { "command": "shapeshift", "args": ["mcp", "--root", "/data/samples"] } } }
+```
+
+The tools, the two modes and the safety rules: [docs/MCP.md](docs/MCP.md).
+
+### Monitor it — `--metrics-file`
+
+The same four commands take `--metrics-file <path>`: on exit, the run's numbers are written to
+that file in the Prometheus text format, replacing it whole (written beside it, then renamed),
+for node_exporter's textfile collector or any file scraper. A run lives seconds, so there is
+no listener to scrape. Off unless given: without the flag nothing is kept or written, and
+nothing is ever sent anywhere.
+
+```console
+$ shapeshift shape -s orders.yaml --metrics-file /var/lib/node_exporter/textfile/orders.prom
+$ grep -v '^#' /var/lib/node_exporter/textfile/orders.prom | head -4
+shapeshift_build_info{version="0.6.0"} 1
+shapeshift_run_last_bytes_written{dataset="orders",command="shape"} 868
+shapeshift_run_last_duration_seconds{dataset="orders",command="shape"} 0.014
+shapeshift_run_last_end_timestamp_seconds{dataset="orders",command="shape"} 1795759475.58
+```
+
+| Metric (a gauge; labels `dataset` for `shape`, and `command`) | What it is |
+|---|---|
+| `shapeshift_run_last_exit_status` | 0, 75 (another writer committed first: run it again) or 1 |
+| `shapeshift_run_last_end_timestamp_seconds` | When the last run ended |
+| `shapeshift_run_last_success_timestamp_seconds` | When a run last succeeded: carried over by a failed run, so a freshness alert reads `time() - this` |
+| `shapeshift_run_last_duration_seconds` | How long the last run took |
+| `shapeshift_run_last_rows_{in,out,rejected,filtered,deleted,stale}`, `shapeshift_run_last_bytes_written` | `shape`'s counts, as `--summary-json` gives them (a successful run only) |
+| `shapeshift_source_last_records_{new,replayed}`, `shapeshift_source_last_position_timestamp_seconds` | A pulled source's last pull, and its position when the cursor is a time (the lag is now minus it) |
+| `shapeshift_build_info{version}` | 1 |
+
+A failed run writes its status, end time and duration. A run killed before it can write
+leaves the previous file, whose end time then goes stale: the same freshness alert catches
+both. Labels are the dataset's name and the command, never a path, a URL or anything read
+from the data. `shape` always writes both labels: a run that fails before its spec is read
+reports under the dataset its `--dataset` or spec file names, or the one the file it
+replaces names, so its series are the ones an alert already watches.
+
+- **A dataset that has never succeeded has no success time**, so `time() - x` gives no data
+  rather than a large value. Alert on `absent(shapeshift_run_last_success_timestamp_seconds{…})`
+  too, or write `(time() - x) or vector(inf)`.
+- **A replay of a committed run** (`--run-id` found already committed) succeeds but neither
+  counts rows nor advances the success time: it read nothing new.
+- **A file that cannot be written** is a warning on stderr; the run's exit status is its own.
+  Alert on the file's staleness, not only its values.
+
 [`examples/merge/verify_duckdb.py`](./examples/merge/verify_duckdb.py) runs every write this way
 and holds the summary to what DuckDB reads: the snapshot it names must be the table's newest, a
 merge's key counts must match the model, and an expiry must name exactly the snapshots that went.
@@ -835,10 +996,23 @@ Two read-only views show what happened (0.5):
 
 Screenshots of both views are at the top, under [See it in action](#see-it-in-action).
 
+**Datasets** keep a spec with a name: the file it reads, how it lands, and an optional
+freshness window. **Run now** runs one in the console, through the same code as the Shape
+form. The **Overview** (the first page) says which datasets need a look: a latest run that
+failed or lost a race to another writer (exit 75), or no successful run within the freshness
+window. **Alerts** tell a webhook (Slack, Teams, a paging service) once when a dataset starts
+needing a look and once when it stops. **Connectors** take records pushed to an ingest URL
+(`shapeshift serve --ingest-addr 0.0.0.0:8088`; `POST /v1/ingest/<connector>` with the
+connector's token), batch them, and land each batch through a dataset. With `--catalog` (a build
+with `object_store`), a **Catalog** page browses a REST catalog's tables, read-only.
+*(Unreleased.)*
+
 It is a *shaper* console, not a control plane: single-user, and it binds to
 `127.0.0.1` with **no authentication of its own** — keep it on loopback, or front it
-with your own auth/proxy. Scheduling, a run queue, connectors, and metering are
-deliberately not here — that is an orchestrator's job, not the engine's. See [`shapeshift-serve`](./shapeshift-serve/README.md).
+with your own auth/proxy. Only the ingest listener is meant to be reached from elsewhere: it
+serves the ingest path and nothing else, and every post needs a connector's token. Scheduling,
+a run queue, pulling from a source (Kafka, CDC, SaaS APIs) and metering are deliberately not
+here: a dataset runs when you press Run now, or when a connector's batch is ready. See [`shapeshift-serve`](./shapeshift-serve/README.md).
 
 ## Embed it
 
@@ -881,6 +1055,9 @@ fn main() -> shapeshift_core::Result<()> {
 | `shapeshift-iceberg` | `IcebergSink`: writes a self-contained Iceberg **v2** table (no catalog server) — data Parquet, Avro manifest + manifest list, JSON metadata, version hint. Append-to-existing snapshots (`--append`), **upsert** (`--merge-on`, position deletes), **compaction** (`compact`, a `replace` snapshot), **snapshot expiry** (`expire`), per-column statistics, and identity + hidden partitioning (`--partition-by`) + `inspect()`. Reads manifests against the schema each one carries. Exposes a backend-agnostic table builder the object-store sink reuses. |
 | `shapeshift-objstore` | `ObjectStoreParquetSink` **and** `ObjectStoreIcebergSink`: land a Parquet file / a whole Iceberg v2 table in S3 / GCS / Azure — a `PUT` per object (bounded-RAM multipart past 8 MiB), 8 in flight, paths anchored at the destination. Opt-in behind the CLI's `object_store` feature, so the default musl-static binary links no cloud SDKs. |
 | `shapeshift-serve` | `shapeshift serve` — a local web console over the shaper (infer · shape · inspect), plus a run log of its own runs and a table's history read from its metadata. The HTTP server is **hand-rolled on `std::net`** (no async runtime, no web framework) and the UI is embedded static files, so it stays a single static binary. Opt-in behind the CLI's `serve` feature; the default binary is unchanged. |
+| `shapeshift-source-http` | The HTTP source (`source.http`, `--from`): a paged REST endpoint on the rustls client the console already links, read incrementally by the position rules in `shapeshift-core`, its position kept in the table's snapshot. Opt-in behind the CLI's `http` feature. |
+| `shapeshift-source-mysql` | The MySQL source (`source.mysql`, `--from mysql://`): a query or a table read in one read-only snapshot, streaming, by the same position rules, on a pure-Rust client over rustls. Opt-in behind the CLI's `mysql` feature. |
+| `shapeshift-source-postgres` | The Postgres source (`source.postgres`, `--from postgres://`): MySQL's twin, read through a server-side portal in one read-only snapshot. Opt-in behind the CLI's `postgres` feature. |
 | `shapeshift-cli` | The single `shapeshift` binary. |
 
 ## Architecture
@@ -1024,9 +1201,10 @@ attributes Iceberg readers need are preserved. See [ARCHITECTURE.md](./ARCHITECT
 
 - **Not an orchestrator or scheduler.** There is no DAG, no cron, no dependency graph — that is an
   orchestrator's job (such as **dagron**). shapeshift runs one shape and exits.
-- **Not a connector catalog.** It does not reach into SaaS APIs or databases; it shapes JSON/JSONL you
-  already have. Connectors and CDC *capture* are out of scope — though it can upsert a delta you hand
-  it (`--merge-on`).
+- **Not a connector catalog.** It has no per-vendor connectors: its sources are generic (a REST or SOAP
+  endpoint, a MySQL or Postgres query or table, each named in the spec) beside the JSON/JSONL, CSV,
+  TSV and XML files you already have. Log-based CDC *capture* is out of scope, but it applies a Debezium or
+  Flink CDC feed you hand it (`changes:`, deletes included) and upserts a delta (`--merge-on`).
 - **Not a query engine.** It *writes* Parquet and Iceberg for DuckDB, Spark, Trino, and friends to
   read; it does not run SQL over them.
 
@@ -1139,7 +1317,8 @@ it does that one job completely.
   writes (`If-None-Match` on S3). Rows are matched by key; deleting a row because a change feed
   says so (`op: d`) is not supported yet. `expire` keeps every old `metadata.json` (one small
   file per commit).
-- No CDC capture, no scheduling, no connectors — those belong to an orchestrator. The engine is
+- No CDC capture, no scheduling, and no connector that pulls from a source — those belong to an
+  orchestrator (the console only takes records pushed to it). The engine is
   Apache-2.0 and fully self-hostable, with no row cap and no telemetry.
 
 ## Which tool for which job

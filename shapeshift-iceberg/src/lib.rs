@@ -60,6 +60,7 @@ mod metadata;
 mod partition;
 mod relocate;
 mod stats;
+mod tombstones;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -100,10 +101,16 @@ pub use crate::files::{LocalTableFiles, TableFiles};
 pub use crate::history::{
     table_events, EventCounts, RemovedSnapshot, SchemaChange, TableEvent, Writer,
 };
-pub use crate::merge::{resolve_key_columns, KeyColumn, MergeContext, MergeOutcome, MergeWriter};
+pub use crate::merge::DEFAULT_TOMBSTONE_RETENTION_MS;
+pub use crate::merge::{
+    resolve_key_columns, table_change_order, KeyColumn, MergeContext, MergeOutcome, MergeWriter,
+    CHANGES_ORDER_KEY,
+};
 pub use crate::metadata::{
-    join_location, snapshot_of_run, validate_run_id, IceField, RunSnapshot, SnapshotTags,
-    REBASES_KEY, RUN_ID_KEY, RUN_ID_MAX, VERSION_KEY,
+    join_location, snapshot_of_run, table_source_position, table_tombstones, validate_run_id,
+    validate_source_kind, IceField, RunSnapshot, SnapshotTags, TombstoneRef, CHANGES_FORMAT,
+    CHANGES_FORMAT_KEY, REBASES_KEY, RUN_ID_KEY, RUN_ID_MAX, SOURCE_KEY_PREFIX, TOMBSTONES_KEY,
+    VERSION_KEY,
 };
 pub use crate::partition::{
     parse_partition_expr, resolve_partition_fields, PartVal, PartitionDataFile, PartitionField,
@@ -114,6 +121,7 @@ pub use crate::relocate::{
     OldPlace, RelocateCommit, RelocateContext, RelocateOptions, RelocatePlan, RelocateSummary,
 };
 pub use crate::stats::Stats;
+pub use crate::tombstones::{TombstoneSet, BLOB_TYPE as TOMBSTONE_BLOB_TYPE};
 
 use crate::stats::StatsCollector;
 
@@ -512,6 +520,9 @@ pub struct MetadataBuild<'a> {
     pub replaces: Option<u64>,
     /// What the snapshot records about the write: its run id and rebases.
     pub tags: SnapshotTags,
+    /// The new snapshot's id, when the caller chose it already (a merge stamps its
+    /// tombstone file with it); `None` makes a new one.
+    pub snapshot_id: Option<i64>,
 }
 
 /// Build the manifest, manifest-list, `metadata.json`, and `version-hint.text` for one
@@ -523,7 +534,9 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
     if b.ice_fields.is_empty() {
         return Err(ShapeError::Sink("iceberg table has no columns".into()));
     }
-    if b.data_files.is_empty() {
+    // Onto an existing table a write may add no data file: a change feed of deletes only
+    // adds delete files. (Its data manifest is empty, and the next write drops it.)
+    if b.data_files.is_empty() && b.prior.is_none() {
         // The unpartitioned path always writes one (possibly empty) data file, so an empty
         // list here means a partitioned table saw zero rows: there is no partition to write.
         let msg = if b.partition_fields.is_empty() {
@@ -549,11 +562,8 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
         }
         ensure_partition_compatible(b.partition_fields, &prior.metadata)?;
     }
-    let snapshot_id = snapshot_id_from_uuid(&Uuid::new_v4());
-    let seq = match &b.prior {
-        Some(p) => last_sequence_number(&p.metadata)? + 1,
-        None => 1,
-    };
+    let snapshot_id = b.snapshot_id.unwrap_or_else(new_snapshot_id);
+    let seq = next_sequence_number(b.prior.as_ref())?;
 
     // 1. Manifest listing every data file written this snapshot (one per partition),
     //    each with its partition tuple + per-column stats.
@@ -732,6 +742,19 @@ pub fn build_metadata_artifacts(b: &MetadataBuild) -> Result<MetadataArtifacts> 
 
 /// The `last-sequence-number` of an existing table (the base for the next snapshot's
 /// sequence number).
+/// A new snapshot id.
+pub fn new_snapshot_id() -> i64 {
+    snapshot_id_from_uuid(&Uuid::new_v4())
+}
+
+/// The sequence number the next snapshot onto `prior` takes (1 for a new table).
+pub fn next_sequence_number(prior: Option<&PriorTable>) -> Result<i64> {
+    Ok(match prior {
+        Some(p) => last_sequence_number(&p.metadata)? + 1,
+        None => 1,
+    })
+}
+
 fn last_sequence_number(meta: &serde_json::Value) -> Result<i64> {
     meta["last-sequence-number"]
         .as_i64()
@@ -747,6 +770,7 @@ fn last_sequence_number(meta: &serde_json::Value) -> Result<i64> {
 /// table's format version is checked here too: this writer writes version 2 snapshots and
 /// manifests, so it writes onto version 2 tables only.
 fn writable_spec_fields(meta: &serde_json::Value) -> Result<&[serde_json::Value]> {
+    metadata::ensure_changes_format(meta)?;
     match meta["format-version"].as_i64() {
         None | Some(2) => {}
         Some(1) => {
@@ -965,6 +989,21 @@ fn load_prior_local(table_dir: &Path, here: &str) -> Result<Option<PriorTable>> 
     }))
 }
 
+/// The position the local table at `table_dir` records for a `kind` source (see
+/// [`table_source_position`]); `None` with no table, or none recorded.
+pub fn source_position_local(
+    table_dir: impl AsRef<Path>,
+    kind: &str,
+) -> Result<Option<serde_json::Value>> {
+    let table_dir = table_dir.as_ref();
+    let Some(version) = local_version(table_dir)? else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(table_dir.join(metadata_key(version))).map_err(sink_err)?;
+    let meta: serde_json::Value = serde_json::from_str(&text).map_err(sink_err)?;
+    table_source_position(&meta, kind)
+}
+
 /// The snapshot run `run_id` committed to the local table at `table_dir`, if the table
 /// exists and its history holds one (see [`snapshot_of_run`]).
 pub fn find_run_local(table_dir: impl AsRef<Path>, run_id: &str) -> Result<Option<RunSnapshot>> {
@@ -1046,6 +1085,55 @@ pub struct IcebergSink {
     /// The caller's run id, recorded in the snapshot and looked for when a commit is
     /// refused (see [`IcebergSink::set_run_id`]).
     run_id: Option<String>,
+    /// A pulled source's position to commit with this write (see
+    /// [`Sink::set_source_position`]).
+    source: Option<(String, String)>,
+    /// `table_dir` did not exist before this sink: a run that fails removes it.
+    made_dir: bool,
+    /// `finish` was called: from there the commit owns the files, and removes them itself when
+    /// it is refused.
+    finished: bool,
+}
+
+/// A sink dropped unfinished belongs to a run that failed (a strict coercion, `drift.policy:
+/// error`, a source error): its data files are removed (the writer's own `Drop`), and so is the
+/// table directory, when this run made it and nothing else is in it. A table that was already
+/// there keeps every file it had.
+impl Drop for IcebergSink {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.writer.discard();
+        remove_empty_table_dirs(&self.table_dir, self.made_dir);
+    }
+}
+
+/// The directories a sink makes before it exists: removed (when empty) if `IcebergSink::open`
+/// fails, so a refused run leaves no empty table behind; disarmed once the sink is built.
+struct DirsMade {
+    table_dir: PathBuf,
+    made_dir: bool,
+    armed: bool,
+}
+
+impl Drop for DirsMade {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_empty_table_dirs(&self.table_dir, self.made_dir);
+        }
+    }
+}
+
+/// Each only if empty: remove_dir refuses a directory that holds anything, so a table's own
+/// `data/` and `metadata/` stay; empty ones made for nothing go, and the table directory too
+/// when this run made it.
+fn remove_empty_table_dirs(table_dir: &Path, made_dir: bool) {
+    let _ = std::fs::remove_dir(table_dir.join("data"));
+    let _ = std::fs::remove_dir(table_dir.join("metadata"));
+    if made_dir {
+        let _ = std::fs::remove_dir(table_dir);
+    }
 }
 
 impl IcebergSink {
@@ -1109,6 +1197,15 @@ impl IcebergSink {
         merge_on: &[String],
     ) -> Result<Self> {
         let table_dir = table_dir.to_path_buf();
+        // A run that fails removes the directory it made (see `Drop`), never one it found.
+        let made_dir = !table_dir.exists();
+        // Until the sink exists, a failure here (an incompatible append, a partition or key
+        // column that does not resolve) leaves the directories to this guard instead.
+        let mut guard = DirsMade {
+            table_dir: table_dir.clone(),
+            made_dir,
+            armed: true,
+        };
         std::fs::create_dir_all(table_dir.join("data")).map_err(sink_err)?;
         std::fs::create_dir_all(table_dir.join("metadata")).map_err(sink_err)?;
 
@@ -1149,6 +1246,8 @@ impl IcebergSink {
             partition_fields.clone(),
         )?;
 
+        // From here the sink's own `Drop` does what the guard did.
+        guard.armed = false;
         Ok(IcebergSink {
             table_dir,
             ice_fields,
@@ -1160,6 +1259,9 @@ impl IcebergSink {
             replaces,
             merge,
             run_id: None,
+            source: None,
+            made_dir,
+            finished: false,
         })
     }
 
@@ -1167,6 +1269,18 @@ impl IcebergSink {
     /// [`FileFooter`]). Each file gets its own, made from its own row count as it closes.
     pub fn set_footer(&mut self, footer: FileFooter) {
         self.writer.set_footer(footer);
+    }
+
+    /// Apply a change feed's changes in the order of these columns (`changes.order_by`):
+    /// the newer change to a key wins, and one not newer than the key's live row is stale.
+    /// A merge sink only; the columns are checked against the table's schema now.
+    pub fn order_changes_by(&mut self, order_by: &[String], retention_ms: i64) -> Result<()> {
+        match &mut self.merge {
+            Some(m) => m.order_by(&self.ice_fields, order_by, retention_ms),
+            None => Err(ShapeError::Sink(
+                "`changes.order_by` orders a merge: this sink is not merging".into(),
+            )),
+        }
     }
 
     /// Name the run this write belongs to. The id is recorded in the snapshot
@@ -1197,6 +1311,12 @@ impl IcebergSink {
 }
 
 impl Sink for IcebergSink {
+    fn set_source_position(&mut self, kind: &str, position: &serde_json::Value) -> Result<()> {
+        validate_source_kind(kind)?;
+        self.source = Some((kind.to_string(), position.to_string()));
+        Ok(())
+    }
+
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         match &mut self.merge {
             None => self.writer.write_batch(batch),
@@ -1205,7 +1325,14 @@ impl Sink for IcebergSink {
     }
 
     fn finish(&mut self) -> Result<SinkSummary> {
+        // A writer that fails to finish has removed its own files; the sink's `Drop` then
+        // removes the directories it made. Only a finished writer hands its files on.
         let data_files = self.writer.finish()?;
+        self.finished = true;
+        // Another sink on this same new table, dropped before it wrote anything, may have
+        // removed the empty `metadata/` both created: this commit makes it again rather than
+        // fail on it. (Partition directories are made with their files.)
+        std::fs::create_dir_all(self.table_dir.join("metadata")).map_err(sink_err)?;
         let rows: u64 = data_files.iter().map(|d| d.rows).sum();
         let bytes: u64 = data_files.iter().map(|d| d.size as u64).sum();
         // The data files (already on disk under the table dir) lead the summary.
@@ -1231,6 +1358,9 @@ impl Sink for IcebergSink {
         // A merge finds the rows this write supersedes — reading only the key columns
         // of existing files that could hold one — and writes their position deletes.
         let files_written = files.clone();
+        let snapshot_id = new_snapshot_id();
+        let mut changes_order = None;
+        let mut tombstones = None;
         let (delete_files, merge) = match self.merge.take() {
             None => (Vec::new(), None),
             Some(m) => {
@@ -1249,11 +1379,17 @@ impl Sink for IcebergSink {
                         new_files: &data_files,
                         partition_fields: &self.partition_fields,
                         compression: self.compression,
+                        snapshot_id,
+                        sequence_number: next_sequence_number(prior.as_ref())?,
                     },
                     &files,
                 );
                 match out {
-                    Ok(out) => (out.delete_files, Some(out.summary)),
+                    Ok(out) => {
+                        changes_order = out.changes_order;
+                        tombstones = out.tombstones;
+                        (out.delete_files, Some(out.summary))
+                    }
                     Err(e) => {
                         for f in &files_written {
                             let _ = std::fs::remove_file(f);
@@ -1273,9 +1409,12 @@ impl Sink for IcebergSink {
                 .iter()
                 .map(|d| self.table_dir.join(&d.data_key)),
         );
+        if let Some(t) = &tombstones {
+            files.push(self.table_dir.join(&t.key));
+        }
 
         let table_uuid = self.table_uuid.to_string();
-        let art = build_metadata_artifacts(&MetadataBuild {
+        let built = build_metadata_artifacts(&MetadataBuild {
             base_location: &base_location,
             table_uuid: &table_uuid,
             ice_fields: &self.ice_fields,
@@ -1288,8 +1427,22 @@ impl Sink for IcebergSink {
             tags: SnapshotTags {
                 run_id: self.run_id.clone(),
                 rebases: 0,
+                changes_order,
+                tombstones,
+                source: self.source.clone(),
             },
-        })?;
+            snapshot_id: Some(snapshot_id),
+        });
+        // Nothing of a write that cannot be described stays behind.
+        let art = match built {
+            Ok(art) => art,
+            Err(e) => {
+                for f in &files {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(e);
+            }
+        };
 
         // Commit: manifests, then the guarded metadata file, then the hint. If another
         // writer committed this version first, nothing of this write stays behind — and
@@ -1958,6 +2111,7 @@ mod tests {
             prior: None,
             replaces: None,
             tags: SnapshotTags::default(),
+            snapshot_id: None,
         })
         .unwrap();
 
@@ -2000,6 +2154,7 @@ mod tests {
             prior: None,
             replaces: None,
             tags: SnapshotTags::default(),
+            snapshot_id: None,
         });
         assert!(err.is_err());
     }

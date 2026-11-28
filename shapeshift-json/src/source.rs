@@ -616,8 +616,44 @@ pub fn open_reader(
     path: impl AsRef<Path>,
     format: shapeshift_core::SourceFormat,
 ) -> Result<RecordSource, JsonError> {
+    open_source(path, &shapeshift_core::SourceSpec::of(format))
+}
+
+/// Open `path` (or standard input, `-`) as the spec's source says: its format and that
+/// format's options. CSV and TSV take their defaults when the spec gives none; XML needs
+/// its record path, so an XML source without one is refused here.
+pub fn open_source(
+    path: impl AsRef<Path>,
+    spec: &shapeshift_core::SourceSpec,
+) -> Result<RecordSource, JsonError> {
+    use shapeshift_core::SourceFormat;
     let path = path.as_ref();
-    match (format, is_stdin(path)) {
+    let raw = || -> Result<Box<dyn Read + Send>, JsonError> {
+        Ok(if is_stdin(path) {
+            Box::new(std::io::stdin())
+        } else {
+            Box::new(File::open(path)?)
+        })
+    };
+    match spec.format {
+        SourceFormat::Csv | SourceFormat::Tsv => {
+            let opts = spec.csv.clone().unwrap_or_default();
+            let tsv = spec.format == SourceFormat::Tsv;
+            return Ok(Box::new(crate::csv::CsvReader::new(raw()?, tsv, &opts)?) as RecordSource);
+        }
+        SourceFormat::Xml => {
+            let opts = spec.xml.as_ref().ok_or_else(|| {
+                JsonError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "an xml source needs the element that is one record: a spec's `source.xml.record` (or --xml-record on the command line)",
+                ))
+            })?;
+            let inner = BufReader::with_capacity(64 * 1024, raw()?);
+            return Ok(Box::new(crate::xml::XmlReader::new(inner, opts)) as RecordSource);
+        }
+        SourceFormat::Jsonl | SourceFormat::JsonArray => {}
+    }
+    match (spec.format, is_stdin(path)) {
         (shapeshift_core::SourceFormat::Jsonl, true) => {
             Ok(Box::new(JsonlReader::new(BufReader::new(std::io::stdin()))) as RecordSource)
         }
@@ -629,6 +665,9 @@ pub fn open_reader(
         }
         (shapeshift_core::SourceFormat::JsonArray, false) => {
             Ok(Box::new(JsonArrayReader::open(path)?) as RecordSource)
+        }
+        (SourceFormat::Csv | SourceFormat::Tsv | SourceFormat::Xml, _) => {
+            unreachable!("handled above")
         }
     }
 }

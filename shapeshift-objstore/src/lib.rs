@@ -81,7 +81,7 @@ use shapeshift_iceberg::{
     SnapshotTags, TableFiles, TableIdent,
 };
 
-use crate::catalog::{backoff, CatalogOptions, Created, RestCatalog, Settled};
+use crate::catalog::{backoff, CatalogOptions, Created, RestCatalog, Settled, CATALOG_TIMEOUT};
 use shapeshift_parquet::ParquetSink;
 
 /// Multipart chunk size. Above S3's 5 MiB minimum for non-final parts, so any file
@@ -226,6 +226,86 @@ impl ObjectStoreParquetSink {
         let size = std::fs::metadata(&temp).map_err(sink_err)?.len();
         block_on(async move { upload_file(&store, &key, &temp, size).await })
     }
+}
+
+/// One namespace of a REST catalog, as [`browse_catalog`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogNamespace {
+    pub levels: Vec<String>,
+    /// Its tables' names; empty when `error` says why they could not be listed.
+    pub tables: Vec<String>,
+    /// The catalog refused to list this namespace's tables (a namespace the credentials may
+    /// not read, say); the others are still listed.
+    pub error: Option<String>,
+}
+
+/// What [`browse_catalog`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogListing {
+    pub namespaces: Vec<CatalogNamespace>,
+    /// The catalog holds more namespaces than a browse lists (the first 1000 are here).
+    pub truncated: bool,
+}
+
+/// How long a whole browse may take, however many namespaces it walks.
+const BROWSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a REST catalog holds: its namespaces and their tables. Nothing is written to the
+/// catalog (with client credentials, getting a token is a POST to the token endpoint).
+pub fn browse_catalog(conn: &CatalogConnection) -> Result<CatalogListing> {
+    let conn = conn.clone();
+    block_on(async move {
+        let walk = async {
+            let catalog = RestCatalog::connect(&conn, CATALOG_TIMEOUT).await?;
+            let (all, truncated) = catalog.list_namespaces().await?;
+            let mut namespaces = Vec::new();
+            for levels in all {
+                let (tables, error) = match catalog.list_tables(&levels).await {
+                    Ok(t) => (t, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
+                namespaces.push(CatalogNamespace {
+                    levels,
+                    tables,
+                    error,
+                });
+            }
+            Ok(CatalogListing {
+                namespaces,
+                truncated,
+            })
+        };
+        tokio::time::timeout(BROWSE_DEADLINE, walk)
+            .await
+            .unwrap_or_else(|_| {
+                Err(sink_err(format!(
+                    "the catalog at {} took longer than {} s to list",
+                    conn.uri,
+                    BROWSE_DEADLINE.as_secs()
+                )))
+            })
+    })
+}
+
+/// One catalog table's current metadata (`loadTable`), and the metadata file the catalog
+/// names for it; `None` when the catalog has no such table. Nothing is written to the catalog.
+pub fn catalog_table_metadata(
+    conn: &CatalogConnection,
+    namespace: &[String],
+    name: &str,
+) -> Result<Option<(Option<String>, serde_json::Value)>> {
+    let conn = conn.clone();
+    let ident = TableIdent {
+        namespace: namespace.to_vec(),
+        name: name.to_string(),
+    };
+    block_on(async move {
+        let catalog = RestCatalog::connect(&conn, CATALOG_TIMEOUT).await?;
+        Ok(catalog
+            .load(&ident)
+            .await?
+            .map(|l| (l.metadata_location, l.metadata)))
+    })
 }
 
 /// Build a small current-thread runtime and drive one finalize future to completion.
@@ -590,6 +670,41 @@ fn find_run_at(
     })
 }
 
+/// The position the Iceberg table at `url` (a table location in an object store) records
+/// for a `kind` source; `None` with no table, or none recorded.
+pub fn source_position(url: &str, kind: &str) -> Result<Option<serde_json::Value>> {
+    let (store, base_key) = build_store(url)?;
+    let meta = block_on(async move {
+        let Some(version) = store_version(&store, &base_key).await? else {
+            return Ok(None);
+        };
+        get_opt_metadata(&store, &base_key, version).await
+    })?;
+    match meta {
+        Some(m) => shapeshift_iceberg::table_source_position(&m, kind),
+        None => Ok(None),
+    }
+}
+
+/// The position `table` (`namespace.name`) in the REST catalog `catalog` records for a
+/// `kind` source; `None` when the catalog has no such table, or it records none.
+pub fn source_position_in_catalog(
+    catalog: &CatalogConnection,
+    table: &str,
+    kind: &str,
+) -> Result<Option<serde_json::Value>> {
+    let ident = TableIdent::parse(table)?;
+    let timeout = CatalogOptions::default().timeout;
+    let loaded = block_on(async move {
+        let catalog = RestCatalog::connect(catalog, timeout).await?;
+        catalog.load(&ident).await
+    })?;
+    match loaded {
+        Some(t) => shapeshift_iceberg::table_source_position(&t.metadata, kind),
+        None => Ok(None),
+    }
+}
+
 /// The snapshot run `run_id` committed to the Iceberg table at `url` (a table location in
 /// an object store), if the table exists and its history holds one. An orchestrator's
 /// retry asks this before doing the work again: a run whose snapshot is there is done.
@@ -860,6 +975,9 @@ pub struct ObjectStoreIcebergSink {
     /// The caller's run id, recorded in the snapshot and looked for when a commit is
     /// refused (see [`ObjectStoreIcebergSink::set_run_id`]).
     run_id: Option<String>,
+    /// A pulled source's position to commit with this write (see
+    /// [`Sink::set_source_position`]).
+    source: Option<(String, String)>,
 }
 
 /// The catalog a sink commits through, the table, and the table's metadata as the write
@@ -1167,6 +1285,7 @@ impl ObjectStoreIcebergSink {
             merge: a.merge,
             catalog: a.catalog,
             run_id: None,
+            source: None,
         })
     }
 
@@ -1179,6 +1298,18 @@ impl ObjectStoreIcebergSink {
         validate_run_id(run_id)?;
         self.run_id = Some(run_id.to_string());
         Ok(())
+    }
+
+    /// Apply a change feed's changes in the order of these columns (`changes.order_by`):
+    /// the newer change to a key wins, and one not newer than the key's live row is stale.
+    /// A merge sink only; the columns are checked against the table's schema now.
+    pub fn order_changes_by(&mut self, order_by: &[String], retention_ms: i64) -> Result<()> {
+        match &mut self.merge {
+            Some(m) => m.order_by(&self.ice_fields, order_by, retention_ms),
+            None => Err(ShapeError::Sink(
+                "`changes.order_by` orders a merge: this sink is not merging".into(),
+            )),
+        }
     }
 
     /// After a refused commit, or a merge that found the table moved on (its files already
@@ -1652,6 +1783,12 @@ fn load_catalog_table(
 }
 
 impl Sink for ObjectStoreIcebergSink {
+    fn set_source_position(&mut self, kind: &str, position: &serde_json::Value) -> Result<()> {
+        shapeshift_iceberg::validate_source_kind(kind)?;
+        self.source = Some((kind.to_string(), position.to_string()));
+        Ok(())
+    }
+
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let writer = self
             .writer
@@ -1687,6 +1824,9 @@ impl Sink for ObjectStoreIcebergSink {
 
         // A merge reads the existing table from the store (key columns only, ranged) and
         // stages its delete files beside the data files for the same upload.
+        let snapshot_id = shapeshift_iceberg::new_snapshot_id();
+        let mut changes_order = None;
+        let mut tombstones = None;
         let (delete_files, merge) = match self.merge.take() {
             None => (Vec::new(), None),
             Some(m) => {
@@ -1707,6 +1847,10 @@ impl Sink for ObjectStoreIcebergSink {
                             new_files: &data_files,
                             partition_fields: &self.partition_fields,
                             compression: self.compression,
+                            snapshot_id,
+                            sequence_number: shapeshift_iceberg::next_sequence_number(
+                                prior.as_ref(),
+                            )?,
                         },
                         &files,
                     )
@@ -1718,14 +1862,21 @@ impl Sink for ObjectStoreIcebergSink {
                         }
                     });
                 match out {
-                    Ok(out) => (out.delete_files, Some(out.summary)),
+                    Ok(out) => {
+                        changes_order = out.changes_order;
+                        tombstones = out.tombstones;
+                        (out.delete_files, Some(out.summary))
+                    }
                     Err(e) => return self.earlier_attempt_or(e),
                 }
             }
         };
+        // The tombstone file goes up with the delete files, before the metadata names it.
         let deletes: Vec<(String, PathBuf)> = delete_files
             .iter()
-            .map(|d| (d.data_key.clone(), self.temp_dir.join(&d.data_key)))
+            .map(|d| d.data_key.clone())
+            .chain(tombstones.iter().map(|t| t.key.clone()))
+            .map(|k| (k.clone(), self.temp_dir.join(&k)))
             .collect();
 
         let table_uuid = self.table_uuid.to_string();
@@ -1744,7 +1895,11 @@ impl Sink for ObjectStoreIcebergSink {
             tags: SnapshotTags {
                 run_id: self.run_id.clone(),
                 rebases: 0,
+                changes_order,
+                tombstones,
+                source: self.source.clone(),
             },
+            snapshot_id: Some(snapshot_id),
         })?;
         tracing::debug!(dest = %self.base_url, rows, files = uploads.len(), deletes = deletes.len(), "uploading iceberg table to object store");
         let (bytes, metadata_file, table_version, snapshot_id, rebases, earlier) = match &self
@@ -1765,6 +1920,16 @@ impl Sink for ObjectStoreIcebergSink {
             Some(target) => {
                 let files = rebuild_files.unwrap_or_default();
                 let rebuild = |prior: PriorTable, rebases: u32| {
+                    // A source position was read from the head this write started on: a
+                    // head another writer moved may hold a later one, which this write
+                    // would take back. Run again from the new head instead.
+                    if let Some((kind, _)) = &self.source {
+                        return Err(ShapeError::Conflict(format!(
+                            "another writer committed to the table while this incremental \
+                             `{kind}` run read its source: its position is not rebased onto \
+                             theirs. Nothing of this run was published; run it again"
+                        )));
+                    }
                     build_metadata_artifacts(&MetadataBuild {
                         base_location: &self.base_url,
                         table_uuid: &table_uuid,
@@ -1778,7 +1943,11 @@ impl Sink for ObjectStoreIcebergSink {
                         tags: SnapshotTags {
                             run_id: self.run_id.clone(),
                             rebases,
+                            changes_order: None,
+                            tombstones: None,
+                            source: None,
                         },
+                        snapshot_id: None,
                     })
                 };
                 let done = commit_to_catalog(

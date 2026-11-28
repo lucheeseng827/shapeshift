@@ -8,7 +8,11 @@
 //!   depth- and string-aware scanner finds element boundaries, so one element at
 //!   a time enters memory — a multi-GB array never materializes either.
 //!
-//! Both drive the [simd-json](https://docs.rs/simd-json) SIMD lexer via its serde
+//! - [`CsvReader`] and [`XmlReader`] — CSV/TSV rows and XML elements as records, streamed
+//!   the same way; [`open_source`] opens any format as a spec's `source` describes it, and
+//!   [`OwnedTape`] puts their records on a tape for the shape loop.
+//!
+//! The JSON readers drive the [simd-json](https://docs.rs/simd-json) SIMD lexer via its serde
 //! bridge, landing straight in the ubiquitous `serde_json::Value` so everything
 //! downstream stays on one value model.
 //!
@@ -24,12 +28,20 @@
 //! assert_eq!(rows[0]["id"], 1);
 //! ```
 
+mod cap;
+mod csv;
 mod error;
 mod source;
 mod tape;
+mod xml;
 
 pub use error::JsonError;
 pub use source::{
-    is_rereadable, is_stdin, open_reader, JsonArrayReader, JsonlReader, RecordSource,
+    is_rereadable, is_stdin, open_reader, open_source, JsonArrayReader, JsonlReader,
+    RecordSource,
 };
-pub use tape::{TapeJsonArrayReader, TapeJsonlReader, TapeRecord, TapeSource};
+pub use tape::{
+    OwnedTape, TapeJsonArrayReader, TapeJsonlReader, TapeRecord, TapeSource,
+};
+pub use crate::csv::CsvReader;
+pub use crate::xml::XmlReader;

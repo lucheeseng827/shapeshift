@@ -131,9 +131,57 @@ pub struct ParquetInfo {
     pub columns: Vec<(String, String)>,
 }
 
+/// The first `n` rows of a Parquet file as JSON objects, column by column. Numbers, booleans
+/// and strings keep their JSON kind; anything else (a date, a timestamp, a nested value) is
+/// written as Parquet prints it. For a look, not a query: it stops after `n` rows.
+pub fn head(path: impl AsRef<Path>, n: usize) -> Result<Vec<serde_json::Value>> {
+    head_file(File::open(path.as_ref()).map_err(sink_err)?, n)
+}
+
+/// [`head`], of a file already open: for a caller that checked what it opened, so that nothing
+/// can be swapped in between the check and the read.
+pub fn head_file(file: File, n: usize) -> Result<Vec<serde_json::Value>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::Field;
+    use serde_json::{Number, Value};
+    let reader = SerializedFileReader::new(file).map_err(sink_err)?;
+    let mut out = Vec::new();
+    for row in reader.get_row_iter(None).map_err(sink_err)?.take(n) {
+        let row = row.map_err(sink_err)?;
+        let mut obj = serde_json::Map::new();
+        for (name, field) in row.get_column_iter() {
+            let v = match field {
+                Field::Null => Value::Null,
+                Field::Bool(b) => Value::Bool(*b),
+                Field::Byte(x) => Value::from(*x),
+                Field::Short(x) => Value::from(*x),
+                Field::Int(x) => Value::from(*x),
+                Field::Long(x) => Value::from(*x),
+                Field::UByte(x) => Value::from(*x),
+                Field::UShort(x) => Value::from(*x),
+                Field::UInt(x) => Value::from(*x),
+                Field::ULong(x) => Value::from(*x),
+                Field::Float(x) => {
+                    Number::from_f64(f64::from(*x)).map_or(Value::Null, Value::Number)
+                }
+                Field::Double(x) => Number::from_f64(*x).map_or(Value::Null, Value::Number),
+                Field::Str(s) => Value::String(s.clone()),
+                other => Value::String(other.to_string()),
+            };
+            obj.insert(name.clone(), v);
+        }
+        out.push(Value::Object(obj));
+    }
+    Ok(out)
+}
+
 /// Read a Parquet file's schema + row/row-group counts without scanning the data.
 pub fn inspect(path: impl AsRef<Path>) -> Result<ParquetInfo> {
-    let file = File::open(path.as_ref()).map_err(sink_err)?;
+    inspect_file(File::open(path.as_ref()).map_err(sink_err)?)
+}
+
+/// [`inspect`], of a file already open (see [`head_file`]).
+pub fn inspect_file(file: File) -> Result<ParquetInfo> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(sink_err)?;
     let schema = builder.schema().clone();
     let meta = builder.metadata();

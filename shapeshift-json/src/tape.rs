@@ -341,6 +341,54 @@ impl<R: BufRead> TapeSource for TapeJsonArrayReader<R> {
     }
 }
 
+/// Any record source on a tape: each record, already a `Value`, is written out and taped.
+///
+/// The formats that are not JSON on disk (CSV, TSV, XML) produce owned values, so this is
+/// how they reach the shape loop, which reads tapes. It costs a serialisation per record
+/// that the JSON readers do not pay; their records stream exactly as the JSON ones do,
+/// and their errors (with lines) pass through untouched.
+pub struct OwnedTape {
+    records: crate::RecordSource,
+    scratch: Vec<u8>,
+    buffers: simd_json::Buffers,
+}
+
+impl OwnedTape {
+    pub fn new(records: crate::RecordSource) -> Self {
+        OwnedTape {
+            records,
+            scratch: Vec::with_capacity(4096),
+            buffers: simd_json::Buffers::new(4096),
+        }
+    }
+}
+
+impl TapeSource for OwnedTape {
+    fn next_tape(&mut self) -> Option<Result<simd_json::Tape<'_>, JsonError>> {
+        let v = match self.records.next()? {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        self.scratch.clear();
+        if let Err(e) = serde_json::to_writer(&mut self.scratch, &v) {
+            return Some(Err(JsonError::Io(e.into())));
+        }
+        self.scratch.reserve(SIMD_SLACK);
+        Some(
+            simd_json::to_tape_with_buffers(&mut self.scratch, &mut self.buffers).map_err(|e| {
+                JsonError::Parse {
+                    line: 0,
+                    message: e.to_string(),
+                    raw: String::new(),
+                }
+            }),
+        )
+    }
+    fn next_owned(&mut self) -> Option<Result<Value, JsonError>> {
+        self.records.next()
+    }
+}
+
 /// The [`TapeJsonlReader`] treatment for a single top-level JSON array.
 ///
 /// The array reader already framed elements into a reusable buffer — the same shape

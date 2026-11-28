@@ -10,6 +10,246 @@ Nicholas Lu Chee Seng and the shapeshift contributors. Licensed under Apache-2.0
 
 ## [Unreleased]
 
+## [0.6.0-rc.1] - 2026-11-28
+
+The release candidate of 0.6.0, for trying before the release: what follows is what 0.6.0 is
+to ship. It is a GitHub pre-release with the image tag `0.6.0-rc.1`; `latest` stays on 0.5.0.
+
+### Upgrading
+
+Specs and command lines that worked in 0.5 work unchanged. What to know before upgrading:
+
+- **Every writer of a `changes:` table must be 0.6 or later.** 0.5 knows nothing of tombstones
+  and cannot be made to refuse a table that has them:
+  - a 0.5 **merge** into such a table ignores them, so a late change can bring a deleted row back;
+  - a 0.5 append or compaction is harmless while the snapshot that names the tombstones stays in
+    the history (0.6 finds them on the nearest ancestor that names them);
+  - a 0.5 **`expire`** can remove that snapshot. 0.6 finds tombstones only through the snapshot
+    summaries, so a later merge then finds none, and a late change can bring a deleted row back.
+    The tombstone file itself is left behind, read by nothing; the next 0.6 expiry removes it.
+    Run `expire` on a `changes:` table with 0.6 only.
+
+  From 0.6 the guard exists: a `changes:` table carries the property
+  `shapeshift.changes.format = 1`, and a binary that does not know the value refuses to write the
+  table, naming the version it needs.
+- **A pulled source's position lives in the snapshot summary** (`shapeshift.source.http`,
+  `shapeshift.source.mysql`, `shapeshift.source.postgres`) and is carried forward by every later
+  snapshot shapeshift writes. A tool that rewrites snapshots without their summary resets it: the
+  next run starts again from the source's first record.
+- **A run that fails before its commit now removes what it wrote** to an Iceberg table's
+  directory: its data files, and the directory itself when the run made it. 0.5 left them, as
+  files no snapshot named. A table that was already there keeps every file it had.
+- **The lean binary and image** gain the CSV, TSV and XML readers, `convert`, change feeds,
+  `--metrics-file` and `shapeshift mcp` (6.03 MiB, from 5.18 MiB; [BENCHMARKS](./BENCHMARKS.md)).
+  The pulled sources, the console, object storage and zstd stay behind features (`http`,
+  `mysql`, `postgres`, `serve`, `object_store`, `zstd`), so the lean binary still links no
+  network client and no database driver.
+
+For code that embeds the crates:
+
+- `DatasetSpec` gained `changes: Option<ChangesSpec>`; `SourceSpec` gained `csv`, `xml`,
+  `http`, `mysql` and `postgres` (each an `Option`); `OutputSpec` gained `apply:
+  Option<ApplyMode>`. A struct literal needs them, or `..Default::default()`.
+- `SourceFormat` gained `Csv`, `Tsv` and `Xml`, and `expire`'s `FileKind` gained `Statistics`:
+  an exhaustive `match` needs the new arms.
+- `MergeSummary` gained `keys_deleted`, `rows_deleted`, `changes_stale`, `order_by` and
+  `tombstones_written`, `_retired`, `_trimmed`, `_live`; `ExpireSummary` gained
+  `statistics_files_deleted`; `MetadataBuild` gained `snapshot_id: Option<i64>`.
+- `Sink` gained `set_source_position`, with a default that refuses: a sink that does not
+  record a position cannot take an incremental source. `IcebergSink` and the object-store sink
+  record it.
+
+### Added
+
+- **`shapeshift mcp`**: shapeshift's tools for an AI agent, over the Model Context Protocol on
+  stdio, in the default binary. Read-only. Local mode (`--root`) offers infer, validate a spec,
+  convert a sample, inspect, a table's history and a preview, on files under the root; console
+  mode (`--console`) offers a running console's runs, datasets, Overview, alerts, connectors,
+  catalog and tables. No tool takes a URL or a credential; paths stay under the root (links
+  included); results read from data are marked and capped; calls are limited and logged. The
+  spec reference is a resource, and three prompts are offered. `--root` is always named;
+  `--console` takes an IP address or `localhost`, never a hostname (a lookup has no deadline).
+  `docs/MCP.md` lists it all.
+- **Monitoring, ready made** (`docs/METRICS.md`, `docs/monitoring/`): a Grafana dashboard for
+  runs, the console, connectors and sources, and Prometheus alert rules (plain and as a
+  `PrometheusRule`) for a failing run, a stale dataset, the Overview, a connector backed up and
+  a source behind; the rules pass `promtool check rules`.
+- **`serve --metrics-addr <addr>`**: the console's metrics at `GET /metrics` on a listener of
+  its own, in the Prometheus text format. Runs by dataset, way and outcome, with their
+  durations and rows; datasets' last success and freshness window; what the Overview lists;
+  alert incidents and deliveries; connectors' posts, records, spools and batch runs; pulls
+  and their positions; requests by listener. Off unless given; nothing is sent anywhere.
+- **`--metrics-file <path>`** on `shape`, `compact`, `expire` and `relocate`: on exit, the run's
+  numbers in the Prometheus text format, written whole, for node_exporter's textfile
+  collector or any file scraper. Exit status, end time, the last success time (carried over by
+  a failed run), duration, `shape`'s row and byte counts, and a pulled source's new and
+  re-read records and its position's time. Off unless given; nothing is sent anywhere.
+- **Postgres source (`source.postgres`, `shape --from postgres://…`).** MySQL's twin, with the
+  same fields and position rules: a query naming `:cursor` or a table by `--watermark` and its
+  primary key. Each run reads one snapshot in a read-only transaction through a server-side
+  portal, so a run that stops at its bound fetches no more; types map as SPEC §2.8 says
+  (numeric exactly, as text; timestamps as UTC; jsonb as JSON; a uuid key is a tiebreak).
+  The password comes from `SHAPESHIFT_POSTGRES_PASSWORD`; TLS off this machine. Behind the
+  CLI's `postgres` feature (the new crate `shapeshift-source-postgres`, over rustls); the
+  console pulls it too.
+
+- **Sources in the console.** A dataset's input may be a source its spec names (`source.http`,
+  `source.mysql` or `source.postgres`) instead of a file; **Run now** pulls from the position its table records
+  and commits the new position with the rows. The dataset page shows what it reads, the
+  position, and what the last pull read; a run's line says how many records were new. In
+  builds with the CLI's `http`, `mysql` or `postgres` feature (with `serve`), and only when the
+  console is started with `--allow-sources`: a spec names a host and the environment variables
+  whose values it sends there, and the console has no login.
+
+- **SOAP sources (`source.http.soap`).** A SOAP 1.1 or 1.2 service is an HTTP source: each
+  request POSTs an envelope shapeshift builds around `soap.body_template`, whose `{{name}}`
+  placeholders take the request's parameters (the incremental lower bound, the page or offset)
+  XML-escaped; `action` sets `SOAPAction`; `username_env` and `password_env` add a WS-Security
+  username token, sent to the service's own origin only. The response is read as XML from
+  `source.xml.record`, incrementally by the same position rules, and a `Fault` (on a 500 or a
+  200) fails the run at once, naming its fault code and string, without retries.
+
+- **MySQL source (`source.mysql`, `shape --from mysql://…`).** A query (`--query`, naming
+  `:cursor`) or a table (`--source-table`, by `--watermark` and its primary key), read
+  incrementally by the same position rules as the HTTP source, its position kept in the
+  snapshot as `shapeshift.source.mysql`. A table's primary key, when it is one integer or temporal
+  column, is the tiebreak, so a bounded run stops inside a group of any size and the next
+  resumes there (a composite or text key orders the rows but is no tiebreak, nor is a key that
+  is the cursor itself or under `strict`). Each run reads one consistent
+  snapshot in a read-only transaction; rows stream (a million at flat memory), and a run that
+  stops early ends the server's read. Types map as SPEC §2.7 says (DECIMAL as an exact string,
+  DATETIME/TIMESTAMP as UTC timestamps, TINYINT(1) as boolean, JSON as JSON; binary columns are
+  refused, naming the cast). Soft deletes work through `changes:`; hard deletes need a change
+  feed. The password comes from `SHAPESHIFT_MYSQL_PASSWORD` (or `_FILE`), never the URL; TLS
+  off this machine unless `--insecure-source`, with `ca_file` for a private CA. Behind the CLI's
+  `mysql` feature (the new crate `shapeshift-source-mysql`, pure Rust over rustls).
+
+- **HTTP source (`source.http`, `shape --from <url>`).** A REST endpoint, read a page at a time:
+  credentials from environment variables (`bearer_env`, `basic_env`, `header_env`,
+  `query_env`), a record path, five paging styles (a next link in the body, the `Link` header,
+  page numbers, offsets, a cursor token), JSON, JSON Lines, CSV, TSV or XML bodies, and retries
+  on 429 and 5xx that honour `Retry-After`. With `incremental` it reads only what is new since
+  the position the table records in its snapshot (`shapeshift.source.http`), committed with
+  the rows: no state file, and a failed run lands nothing twice. `--max-records`,
+  `--max-pages` and `--max-wait` bound a run, counting new records only, and a loop of bounded
+  runs always reaches the end (`docs/SPEC.md` §2.6 states the seven rules, including what a
+  late record needs). Credentials go only to the URL's own origin, never over plain http to
+  another machine without `--insecure-source`, and appear in no message. Behind the CLI's
+  `http` feature (the new crate `shapeshift-source-http`, on the rustls client the console
+  already links); the default binary is unchanged.
+
+- **Change feeds (`changes:`).** A spec can read a feed of inserts, updates and deletes: which
+  field says what happened (`op`, with its values per kind), where the row is (`row`), where a
+  delete's key is (`key_from`), and which output columns version a change (`order_by`). With
+  `output.apply: upsert` (the default, on `merge_on`) the table keeps the current state: a
+  delete removes the key's row with a position delete, and with `order_by` the newest change to
+  a key wins whatever order it arrives in, while one not newer than the key's live row is
+  counted stale and changes nothing (so a replayed feed is harmless). A table records its order
+  and refuses merges ordered another way. `apply: changelog` appends every change with an `_op`
+  column instead. A column whose path starts with `$` reads the envelope (`$.source.ts_ms`). The
+  report and `--summary-json` gain `changes`, `rows.deleted`, `rows.stale` and `rows.skipped`.
+  Checked against DuckDB with random out-of-order feeds, flat and as Debezium envelopes
+  (`examples/changes/verify_duckdb.py`). Command line only for now: the console refuses
+  `changes:`.
+
+- **Change-feed presets.** `changes.preset: debezium-postgres`, `debezium-mysql` or `flink-cdc`
+  fills in the op values, the row, where a delete's key is and the order, and adds the version
+  columns (`cdc_lsn`; or `cdc_file`, `cdc_pos`, `cdc_row`; and `cdc_ts_ms`). Checked against
+  real Debezium feeds from Postgres 16 and MySQL 8, shuffled into four writes: the table matched
+  the database, and a replay changed nothing (`examples/changes/debezium/`).
+  A row the connector read from the table as it stood (`op: r`, its initial and incremental
+  snapshots) is older than every change: it takes the lowest version (`cdc_lsn` 0; an empty
+  `cdc_file` with position 0), so writes need not stop while a snapshot is taken. On Postgres a
+  transaction open across the snapshot commits after it with lower LSNs, and its updates and
+  deletes used to lose to the snapshot rows, unreported. Kept as a test on feeds captured
+  from real databases with such a transaction open (`examples/changes/debezium/handoff/`).
+
+- **Tombstones.** With `order_by`, a delete is remembered once its row is gone, so a late or
+  replayed change for a deleted key is stale rather than bringing the row back. Kept for
+  `changes.tombstone_retention` (default 7 days) in one Puffin file under `metadata/`, named by
+  every snapshot and in the table's `statistics` list: appends, compaction, `expire`,
+  `relocate` and REST catalog commits (`set-statistics`, `remove-statistics`) all carry it.
+  The table records the format of its change-feed state (`shapeshift.changes.format`), and a
+  build that finds a newer one refuses to write. shapeshift 0.5 does not know tombstones:
+  every writer of a change-feed table must be 0.6 or later. `expire` reports tombstone files
+  it deleted (`deleted.statistics_files`).
+
+- **CSV, TSV and XML sources.** `source.format` takes `csv`, `tsv` and `xml`, with their options
+  in `source.csv` (header, columns, delimiter, quote, null values, and whether plain numbers and
+  booleans are typed) and `source.xml` (`record`, the element that is one record). They stream
+  with bounded RAM like the JSON formats (2M CSV rows shaped in 17 MB), and a row or record that
+  does not parse is counted and sidecarred with its line. An XML document that is not well formed
+  fails the run, since nothing after the break can be read. XML refuses a document type
+  declaration, so no external entity is read; namespace prefixes are dropped (in the record path
+  too), attributes become `@name` and text beside them `#text`. Every command that reads an input takes `--format csv|tsv|xml`, and
+  `--delimiter`, `--no-header`, `--columns`, `--all-strings` and `--xml-record` when there is no
+  spec; `infer` writes them into the spec. `shapeshift-json` gains `open_source`, `CsvReader`,
+  `XmlReader` and `OwnedTape`.
+
+- **`shapeshift convert`.** Any input format to JSON Lines, to a file (written whole once the input
+  is read, so a failed run leaves nothing) or standard output. A record that does not parse stops it,
+  naming its line, unless `--skip-bad`; `--limit` stops early.
+
+- **`shapeshift serve`: Catalog.** `serve --catalog <uri>` (with `--warehouse`,
+  `--insecure-catalog`, and the catalog's credentials from the environment as for
+  `shape --catalog`) lists a REST catalog's namespaces, nested ones included, and their tables,
+  following its pages, and shows a table's history from the metadata the catalog loads, with
+  snippets to read it from DuckDB, Spark and PyIceberg. Read-only: it creates, commits and
+  registers nothing (with client credentials, getting a token is a POST to the token endpoint).
+  A listing is kept for 30 s (Refresh lists again), stops after 2 minutes, and says when it shows
+  only the first 1000 namespaces. In a build with `object_store`. `shapeshift-objstore` gains
+  `browse_catalog` and `catalog_table_metadata`.
+
+- **`shapeshift serve`: Datasets and an Overview.** A dataset is a spec with a name, kept in
+  the data dir (`datasets/<name>.json`): the file it reads, how it lands (Parquet, or an
+  Iceberg table it appends to by default), and an optional freshness window. **Run now** runs
+  it in the console, through the same code as the Shape form, one run of a dataset at a time
+  (a second request gets 409). Its page lists its runs, the latest run's rejected rows and
+  snippets to read what it landed. The **Overview**, now the first page, counts datasets, runs
+  and tables and lists what needs a look: a dataset whose latest run failed (`run_failed`),
+  lost a race to another writer (`run_conflict`, exit 75), or had no successful run within its
+  freshness window (`table_stale`). There is still no scheduler and no queue.
+- **`shapeshift serve`: Alerts.** A rule picks a condition (`run_failed`, `run_conflict`,
+  `table_stale`, or `rejects_over` with a threshold of rejected rows), every dataset or one,
+  and the targets to tell. Each dataset that meets it is an incident, which notifies once when it
+  opens and once when it resolves. One resolved by hand stays quiet until its condition clears.
+  A target is a webhook URL: JSON with a `text` field (Slack, Teams or a paging service take it
+  as is) and the details under `shapeshift`, with a Test button and its last delivery shown.
+  Rules run after every run and once a minute. HTTPS goes through rustls with Mozilla's roots
+  bundled, so delivery needs no CA store on the box. Rules, targets and incidents are
+  `alerts.json` in the data dir, owner-only on Unix; a webhook URL is never shown after it is
+  saved, and is not encrypted. The `serve` build now links ring (C), for that TLS.
+- **`shapeshift serve`: push connectors.** `--ingest-addr` starts a second listener that serves
+  `POST /v1/ingest/<connector>` and nothing else. A connector has its own token (`ssi_…`,
+  shown once, kept as a SHA-256) and feeds one Iceberg dataset. A post is NDJSON, a JSON array
+  of objects or one object, up to 4 MiB, taken whole or refused (400 names the line). A retry
+  that names itself (`Idempotency-Key`, `ce-id`, `x-dagron-event-id`) with the same id and
+  the same body is taken once; each connector remembers its last 4096 such posts, in memory, so
+  a restart forgets them. Records are
+  synced to the connector's spool before the `202`, sealed into a batch at `flush_bytes` or
+  `flush_seconds`, and landed by the dataset as a run (`via: connector`). A batch that fails
+  is kept and tried again; each batch has its own run id in the snapshot, so one run again after
+  it landed adds nothing. Past four times `flush_bytes` waiting, posts get `503` with
+  `Retry-After`. The ingest listener speaks plain HTTP: off loopback, put a TLS-terminating
+  proxy in front of it.
+
+### Fixed
+
+- **A MySQL source over TLS panicked** in a build that also has `object_store` (such as
+  `--features object_store,http,mysql,postgres`): two TLS providers were linked
+  and the MySQL client found no default (`Could not automatically determine the process-level
+  CryptoProvider`). The source installs ring, the provider it is built for, unless the process
+  chose one. Postgres and HTTP sources were not affected.
+- **A Postgres connection error names its cause**: `postgres: invalid configuration: password
+  missing`, with the variable to set, instead of `invalid configuration`; a certificate no
+  trusted CA signed names `source.postgres.ca_file`.
+- **A run that fails before its commit leaves nothing in an Iceberg table's directory**: the
+  data files it had flushed are removed, and so is a table directory the run made (a strict
+  coercion, `drift.policy: error` and a source error all failed this way). A table that was
+  already there keeps every file it had.
+- `cost` prints `$0.00`, not `$-0.00`, for a loss under a cent.
+- SPEC §2.1 lists the `drift` block.
+
 ## [0.5.0] - 2026-11-26
 
 ### Upgrading
@@ -1022,7 +1262,8 @@ build musl-static and ships as a single binary.
 - **Not in the engine:** no incremental / CDC, no scheduling, and no connectors — those
   belong to an orchestrator.
 
-[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/shapeshift/compare/v0.6.0-rc.1...HEAD
+[0.6.0-rc.1]: https://github.com/lucheeseng827/shapeshift/compare/v0.5.0...v0.6.0-rc.1
 [0.5.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/shapeshift/compare/v0.2.0...v0.3.0

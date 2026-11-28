@@ -33,11 +33,15 @@
 //! assert!(batch.schema().column_with_name("user.name").is_some());
 //! ```
 
+mod changes;
 mod drift;
 mod error;
 mod infer;
 mod mar;
+pub mod metrics;
+mod position;
 mod predicate;
+mod pull;
 mod record;
 mod shaper;
 mod sink;
@@ -49,16 +53,30 @@ mod value;
 #[cfg(test)]
 mod tests;
 
+pub use changes::{
+    parse_duration_ms, ApplyMode, ChangeKind, ChangesPreset, ChangesSpec, SeedVersion,
+    CHANGE_COLUMN, CHANGE_DELETE, CHANGE_UPSERT, OP_COLUMN,
+};
 pub use drift::{DriftPolicy, DriftReport, DriftSpec, NewField, TypeMismatch, MAX_TRACKED_PATHS};
 pub use error::{Result, ShapeError};
 pub use infer::{infer_columns, looks_like_date, looks_like_timestamp};
 pub use mar::{estimate as estimate_mar, MarInputs, MarReport};
+pub use position::{Bounds, Cursor, Position, Progress, Rules, Tracker, Verdict};
 pub use predicate::{Predicate, Tested, MAX_WHERE_BYTES};
-pub use shaper::{effective_columns, run_pipeline, FilterReport, PushOutcome, RunReport, Shaper};
+pub use pull::{
+    check_source_host, cursor_marks, digest, duration_ms, mysql_identifier_ok, recorded_position,
+    resume_from, DbKind, DbSourceSpec, HeaderEnv, HttpAuth, HttpFormat, HttpMethod, HttpPaging,
+    HttpSourceSpec, Incremental, MysqlSourceSpec, PostgresSourceSpec, SoapSpec, SoapVersion,
+    SortOrder, Source, DEFAULT_MAX_TIE,
+};
+pub use shaper::{
+    effective_columns, run_pipeline, ChangeReport, FilterReport, PushOutcome, RunReport, Shaper,
+};
 pub use sink::{MergeSummary, Sink, SinkSummary};
 pub use spec::{
-    partition_source_column, CatalogSpec, ColumnSpec, Compression, DatasetSpec, Options,
-    OutputFormat, OutputSpec, SchemaMode, SourceFormat, SourceSpec,
+    partition_source_column, CatalogSpec, ColumnSpec, Compression, CsvOptions, CsvTypes,
+    DatasetSpec, Options, OutputFormat, OutputSpec, SchemaMode, SourceFormat, SourceSpec,
+    XmlOptions,
 };
 pub use transform::Transform;
 pub use types::ColumnType;

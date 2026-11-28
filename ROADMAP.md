@@ -10,15 +10,17 @@ in [`./ARCHITECTURE.md`](./ARCHITECTURE.md) (the v0.1 limits are §13; the engin
 Two rules govern everything below:
 
 - **The OSS engine (Apache-2.0) stays a shaper, not an orchestrator.** It has no row cap and no
-  telemetry, and it never will. Scheduling, run history, connectors (Phase 6's Kafka source is
-  the one exception), metering, CDC capture and continuous monitoring are the orchestration
-  layer's job, kept out of the engine on purpose
+  telemetry, and it never will. Scheduling, run history, per-vendor connectors (the generic
+  sources of 0.6 and Phase 6's Kafka source are the exceptions, each behind its own feature),
+  metering, CDC log capture and continuous monitoring are the orchestration layer's job, kept out
+  of the engine on purpose
   ([ARCHITECTURE §14](./ARCHITECTURE.md)). The phases below only ever make the engine a
   better *shaper*; what stays out is listed in its own section at the end.
-- **Additive, not a rewrite.** The six-crate split (I/O-free `core`, driver crates behind the
-  `Sink` trait) was chosen so each roadmap item is a new driver, a new spec field, or a new
-  manifest column — never a change to the engine's contract. New physical outputs are new crates
-  implementing `Sink`; `core` does not move.
+- **Additive, not a rewrite.** The crate split (I/O-free `core`, driver crates behind the
+  `Sink` and `Source` traits) was chosen so each roadmap item is a new driver, a new spec field,
+  or a new manifest column — never a change to the engine's contract. New physical outputs are
+  new crates implementing `Sink`, new pulled sources new crates implementing `Source`; `core`
+  does not move.
 
 Performance note: shapeshift's numbers are **measured, on stated hardware**, with the
 reproducible harness in [`benchmarks/`](./benchmarks/) — see
@@ -31,12 +33,11 @@ presented as a promise for another; run the harness yourself to compare.
 |---|---|---|
 | **0 — Foundation** | Standalone Cargo workspace, musl-static single binary, Snappy-only dep floor, hand-rolled Avro | ✅ **shipped (v0.1)** |
 | **1 — v0.1 engine** | Dataset transform Spec → Arrow → Parquet **and** self-contained Iceberg v2, both read end-to-end by DuckDB | ✅ **shipped (v0.1)** |
-| **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; shapeshift runs no catalog of its own, and commits through an external REST catalog from 0.5 ([Phase 5](#phase-5--row-level-writes-in-progress-03)) |
+| **2 — Iceberg write-path maturity** | Append-to-existing / multi-snapshot, partitioning, per-column stats, a catalog | ✅ **shipped** — append-to-existing / multi-snapshot, **additive schema evolution**, per-column statistics, **identity + hidden (transform) partitioning**, and the server-less Hadoop-style catalog; shapeshift runs no catalog of its own, and commits through an external REST catalog from 0.5 ([Phase 5](#phase-5--row-level-writes-shipped-0306)) |
 | **3 — Reach & format coverage** | Object-store output, optional zstd fat build, streaming json-array, a real benchmark suite | ✅ **shipped** — object-store output (Parquet _and_ Iceberg), the zstd fat build (`--features zstd`), streaming json-array, and the measured benchmark suite ([`benchmarks/`](./benchmarks/)) |
 | **4 — Trustworthy against a moving source** | Schema drift detection and mitigation: what the schema silently dropped, and five policies for what to do about it | ✅ **shipped** — `drift.policy` (`ignore`/`warn`/`rescue`/`quarantine`/`error`), a per-path report with the columns to add, measured at ~6% on a clean run |
-| **5 — Row-level writes** | Upsert on a key, then the hygiene and reach that make it production-grade: compaction, object-store merge, change-feed deletes | 🟡 **in progress** — `--merge-on` upsert into local **and object-store** tables (0.3), **`compact`**, **`expire`** and the **commit guard** (0.4.0), DuckDB-verified (over S3 too); change-feed deletes are next |
-
-| **6 — Streams and data quality** | Land Kafka topics and CDC change feeds (Debezium, Flink CDC) exactly once, check every batch against declared quality rules, and check the tables Spark and Flink write with the same rules | 📋 **planned, 0.6–0.7** (0.8 is held as leeway for whatever slips) — see [Phase 6](#phase-6--streams-and-data-quality-planned-0607) |
+| **5 — Row-level writes** | Upsert on a key, then the hygiene and reach that make it production-grade: compaction, object-store merge, change-feed deletes | ✅ **shipped** — `--merge-on` upsert into local **and object-store** tables (0.3), **`compact`**, **`expire`** and the **commit guard** (0.4.0), commits through a REST catalog with run ids (0.5), DuckDB-verified (over S3 too); change-feed deletes (0.6) |
+| **6 — Sources, change feeds and streams** | Pull from endpoints and databases with the position in the table, apply CDC change feeds (Debezium, Flink CDC), then land Kafka topics and check batches against declared quality rules | 🟡 **0.6 shipped** sources (CSV, TSV, XML; REST, SOAP, MySQL, Postgres) and change feeds; **0.7 planned**: Kafka, quality rules, `plan`, `check` (0.8 is held as leeway) — see [Phase 6](#phase-6--sources-change-feeds-and-streams-06-shipped-07-planned) |
 
 Phases 2, 3, and 4 are independent of each other and can interleave — each only depends on the v0.1
 core. Phase 5 builds on Phase 2's multi-snapshot write path. Phase 6 builds on Phase 5's
@@ -278,7 +279,7 @@ the engine growing any state.
       scheduled: an orchestrator's job ([ARCHITECTURE §14](./ARCHITECTURE.md)), listed in the
       out-of-scope section below.
 
-## Phase 5 — Row-level writes *(in progress, 0.3)*
+## Phase 5 — Row-level writes *(shipped, 0.3–0.6)*
 
 Append-only is the honest limit that matters most for a shaper aimed at per-row billing: the data a
 MAR bill punishes is *update-heavy*, and appending it leaves one row per version instead of one per
@@ -352,14 +353,19 @@ between runs (each merge reads what it needs from the table itself).
       commits `remove-snapshots`, asserting every branch and tag where it found them, and deletes
       files only once the catalog took it. None is rebuilt after a refusal (exit 75): each was
       planned against the head it loaded. Checked against a stand-in catalog that refuses,
-      fails and loses answers on demand; the run against the reference REST server is to come.
-- [ ] **Catalog authentication** — bearer token, OAuth2 client credentials, warehouse.
+      fails and loses answers on demand, and against Apache Iceberg's reference REST catalog
+      with DuckDB reading the tables back through it
+      ([`examples/catalog/verify_catalog.py`](./examples/catalog/verify_catalog.py)).
+- [x] **Catalog authentication** (0.5) — a bearer token or OAuth2 client credentials from the
+      environment (never the spec), a token fetched again before it expires, `--warehouse`.
+      Checked against Apache Polaris with OAuth2 client credentials.
 - [x] **Row filter `where`** (0.5) — a subset of SQL's `WHERE` over source paths,
       tested on each record before shaping: one spec takes one kind of record out of a mixed
       stream, and the rest are counted as filtered, not rejected. SQL's three-valued logic;
       cross-kind comparisons are reported. CI holds it to DuckDB's answer for the same text.
-- [ ] **Change-feed deletes** — a spec predicate that marks a row as a delete (`op: d` in a CDC
-      envelope), so one merge applies inserts, updates, and deletes.
+- [x] **Change-feed deletes** (0.6) — a `changes:` block says which field marks an insert, an
+      update or a delete, so one merge applies all three; see
+      [Phase 6](#phase-6--sources-change-feeds-and-streams-06-shipped-07-planned).
 - [x] **Writing into tables other engines created** (0.5) — `deflate` and `snappy`
       manifests and a schema-driven manifest-list reader that keeps other engines' partition
       summaries, so `--append`, `--merge-on`, `compact` and `expire` work on a table PyIceberg or
@@ -369,29 +375,51 @@ between runs (each merge reads what it needs from the table itself).
 
 ---
 
-## Phase 6 — Streams and data quality *(planned, 0.6–0.7)*
+## Phase 6 — Sources, change feeds and streams *(0.6 shipped; 0.7 planned)*
 
-Most JSON that needs shaping arrives on a stream: a Kafka topic, or a change feed that Debezium or
-Flink CDC captured from a database. Today a script drains the topic into a file and shapeshift
-shapes the file ([catalog demo 1](./examples/catalog-demos/01-streaming-to-iceberg-catalog.md)),
-so nothing records which offsets landed, and nothing checks the rows beyond their schema. Phase 6
-closes both gaps, and turns the same checks on the tables Spark and Flink write, so one set of
-rules covers every engine that lands data in the lake.
+Data that needs shaping rarely sits in a file already: it is behind an API, in a database, or on
+a change feed that Debezium or Flink CDC captured. 0.6 reads the first two itself and applies the
+third, deletes included. 0.7 adds a Kafka topic as a source and checks batches against declared
+quality rules, and turns the same checks on the tables Spark and Flink write.
 
-The engine still keeps no state between runs. A stream position is committed **in the table's
+The engine still keeps no state between runs. A source's position is committed **in the table's
 snapshot**, in the same commit as the rows (the way `--run-id` already is), so the table is the
-checkpoint: a re-run resumes from it, and a crashed run lands nothing twice. Continuous
-monitoring, lag history and alerting are stateful, so they stay with a control plane or
-orchestrator that runs these commands and reads their `--summary-json`.
+checkpoint: a re-run resumes from it, and a failed run lands neither rows nor position.
+Continuous monitoring, lag history and alerting are stateful, so they stay with a control plane
+or orchestrator that runs these commands and reads their `--summary-json` and `--metrics-file`.
 
-### 0.6 — change feeds and quality rules
+### 0.6 — sources and change feeds *(shipped)*
 
-- [ ] **CDC envelopes** — `source.envelope: debezium` reads the Debezium JSON envelope (`op`,
-      `before`, `after`, `source.ts_ms`, `source.lsn`), which Debezium, Flink CDC and most Kafka
-      Connect CDC sources emit: `c`/`r`/`u` become upserts, `d` becomes a delete (Phase 5's
-      change-feed deletes), and the source position is ordered by `source.lsn` / `ts_ms` so the
-      last change to a key wins. Checked against a real Debezium and a real Flink CDC feed from
-      Postgres and MySQL, with DuckDB reading back the table each produces.
+- [x] **CSV, TSV and XML input** — `source.format: csv | tsv | xml`, streaming with bounded RAM,
+      and `shapeshift convert` to see the records any format produces. In the lean binary: the
+      readers are pure Rust.
+- [x] **Pulled sources, each behind its own off-by-default feature** — a REST endpoint
+      (`source.http`: five paging styles, a record path, auth from an environment variable), a
+      SOAP service (`source.http.soap`, WS-Security username token), and a MySQL or Postgres query
+      or table (`source.mysql`, `source.postgres`, read in one consistent snapshot over TLS). Each
+      reads incrementally from the position the table recorded (a cursor, a tiebreak, a
+      `lookback`), in bounded runs (`--max-records`, `--max-wait`, and for an endpoint
+      `--max-pages`) that a loop always
+      brings to the end, and only from the hosts `--source-hosts` allows. Checked against an HTTP
+      stand-in (every paging style, rate limits, killed runs), a public REST API, MySQL 8 and
+      Postgres 16, with DuckDB reading the tables back.
+- [x] **Change feeds** — a `changes:` block says which field marks an insert, an update or a
+      delete, where the row is (`row`, `key_from`), and what orders two changes to one key
+      (`order_by`). With `order_by`, a delete is remembered once its row is gone (a **tombstone**),
+      so a late or replayed change cannot bring it back while the tombstone is kept
+      (`changes.tombstone_retention`, 7 days by default). `apply: changelog` appends every change
+      with its `_op` instead.
+- [x] **Presets** — `debezium-postgres`, `debezium-mysql` (the Debezium envelope; a snapshot row
+      is older than every change, so a transaction open across the initial snapshot is not lost)
+      and `flink-cdc` (Flink CDC's changelog JSON). The Debezium presets are checked against real
+      feeds from Postgres 16 and MySQL 8 through Kafka Connect, shuffled and split, with DuckDB
+      comparing the table with the database
+      ([`examples/changes/debezium`](./examples/changes/debezium/README.md)).
+- [x] **Sources and pushes in the console** — a dataset's input may be a source, and Run now
+      pulls; `serve --ingest-addr` takes records pushed to a connector and lands them in batches.
+
+### 0.7 — Kafka, quality rules, and checks on Spark and Flink tables
+
 - [ ] **Quality rules in the spec** — a `quality:` block, evaluated on every row as it streams
       (bounded RAM, like drift): `not_null`, `unique` on the merge key within a batch, `range`,
       `accepted_values`, `matches` (a regex), and **event-time lateness** (`max_lateness:` on a
@@ -408,19 +436,16 @@ orchestrator that runs these commands and reads their `--summary-json`.
       edits a spec.
 - [ ] **Measured** — the cost of a typical rule set on a clean 1M-row run, stated in
       [BENCHMARKS.md](./BENCHMARKS.md) the way drift's ~6% is.
-
-### 0.7 — Kafka, and checks on Spark and Flink tables
-
 - [ ] **A Kafka source** — `shape --from kafka://<brokers>/<topic>`, a pure-Rust client in its own
       crate behind a `kafka` feature (the lean binary stays as it is). A **bounded drain**: read
       from the offsets the table last committed up to `--max-records` / `--max-wait`, shape, and
       commit the rows and the new offsets (`shapeshift.source.kafka.*` in the snapshot summary) as
       one snapshot. No consumer-group state outside the table; run it in a loop or on a schedule
-      for a continuous feed. Debezium and Flink CDC topics combine with the 0.6 envelope.
+      for a continuous feed. Debezium and Flink CDC topics combine with the 0.6 presets.
 - [ ] **Stream position in the report** — each run reports the offsets it read, the topic's
       high-watermark when it stopped, and the lag left behind, in `--summary-json` and `serve`. A
       control plane turns those numbers into lag over time.
-- [ ] **`shapeshift check`** — the 0.6 quality rules, run against an Iceberg table that *another
+- [ ] **`shapeshift check`** — the quality rules, run against an Iceberg table that *another
       engine* wrote (Spark Structured Streaming, Flink, PyIceberg): read only the data files added
       since a given snapshot, evaluate the rules, report as `shape` does, and exit non-zero on a
       breach. It reads the table and never writes it. Needs Phase 5's reading of foreign tables
@@ -447,16 +472,17 @@ and the `--summary-json` document it prints ([ARCHITECTURE §14](./ARCHITECTURE.
 
 - **Scheduling** — run a spec on a cadence or trigger. Compose shapeshift as a step under an
   orchestrator (such as **dagron**) rather than growing a scheduler inside the engine.
-- **Incremental / CDC capture** — reading a database's log (WAL, binlog) to decide *which* rows
-  changed is Debezium's or Flink CDC's job, not the engine's. What the engine does is apply the
-  change feed they produce: `--merge-on` upserts a delta by key
-  ([Phase 5](#phase-5--row-level-writes-in-progress-03)), and from 0.6 it reads their envelope,
-  deletes included ([Phase 6](#phase-6--streams-and-data-quality-planned-0607)). The
+- **CDC log capture** — reading a database's log (WAL, binlog) to decide *which* rows changed is
+  Debezium's or Flink CDC's job, not the engine's. What the engine does is apply the change feed
+  they produce, deletes included ([Phase 6](#phase-6--sources-change-feeds-and-streams-06-shipped-07-planned)),
+  and, from 0.6, query a table by a watermark column (`source.mysql`, `source.postgres`), which
+  sees what a query sees: a hard `DELETE` needs the change feed. The
   [catalog demos](./examples/catalog-demos/README.md) show watermark and CDC patterns built around it.
-- **Connectors** — source/sink connectors (databases, SaaS APIs) feeding the engine stay out of its
-  dependency graph. The one exception is the Kafka source (Phase 6), its own crate behind a
-  feature, because a topic is where change feeds and event streams already arrive; its position
-  lives in the table, not in the engine.
+- **Per-vendor connectors** — a catalogue of SaaS adapters (one for Salesforce, one for
+  HubSpot, …) stays out. The sources the engine has are generic, driven by the spec: a REST or
+  SOAP endpoint, a MySQL or Postgres query or table (0.6), and the Kafka source (0.7). Each is its
+  own crate behind an off-by-default feature, so the lean binary links no network client and no
+  database driver, and each keeps its position in the table, not in the engine.
 - **Continuous stream monitoring** — lag over time, the health of Spark and Flink jobs, quality
   trends and alerts are state and a network surface the engine does not have. The engine's part
   is the numbers each run reports (offsets, lag left, quality results) in `--summary-json`.

@@ -1,6 +1,6 @@
-//! `shapeshift` — infer a dataset spec from sample JSON, shape JSONL/JSON into
-//! Parquet or an Iceberg table, inspect the output, and price a run against
-//! Fivetran-style MAR billing.
+//! `shapeshift` — infer a dataset spec from a sample of the input, shape JSONL, JSON, CSV, TSV or
+//! XML (or a pulled source) into Parquet or an Iceberg table, inspect the output, and price a
+//! run against Fivetran-style MAR billing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,19 +10,21 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use shapeshift_core::{
-    estimate_mar, infer_columns, CatalogSpec, ColumnSpec, Compression, DatasetSpec, DriftPolicy,
-    DriftReport, FilterReport, MarInputs, MergeSummary, OutputFormat, OutputSpec, Predicate,
-    PushOutcome, Record, RecordBatch, SchemaMode, ShapeError, Shaper, Sink, SinkSummary,
-    SourceFormat, SourceSpec,
+    estimate_mar, infer_columns, CatalogSpec, ChangeReport, ColumnSpec, Compression, CsvOptions,
+    CsvTypes, DatasetSpec, DriftPolicy, DriftReport, FilterReport, MarInputs, MergeSummary,
+    OutputFormat, OutputSpec, Predicate, PushOutcome, Record, RecordBatch, SchemaMode, ShapeError,
+    Shaper, Sink, SinkSummary, SourceFormat, SourceSpec, XmlOptions,
 };
 use shapeshift_iceberg::IcebergSink;
 use shapeshift_json::{
-    is_rereadable, is_stdin, open_reader, JsonError, TapeJsonArrayReader, TapeJsonlReader,
-    TapeRecord, TapeSource,
+    is_rereadable, is_stdin, open_source, JsonError, OwnedTape, RecordSource, TapeJsonArrayReader,
+    TapeJsonlReader, TapeRecord, TapeSource,
 };
 use shapeshift_parquet::ParquetSink;
 
-/// shapeshift — a streaming JSON→Parquet/Iceberg shaper.
+mod mcp;
+
+/// shapeshift — a streaming JSON, CSV and XML → Parquet/Iceberg shaper.
 #[derive(Parser)]
 #[command(name = "shapeshift", version, about, long_about = None)]
 struct Cli {
@@ -38,8 +40,8 @@ struct Cli {
 enum Cmd {
     /// Infer a dataset spec from a sample of the input and print it (ready to edit).
     Infer(InferArgs),
-    /// Shape input JSON/JSONL into Parquet or an Iceberg table.
-    Shape(ShapeArgs),
+    /// Shape JSONL, JSON, CSV, TSV or XML (or a pulled source) into Parquet or an Iceberg table.
+    Shape(Box<ShapeArgs>),
     /// Inspect a Parquet file or Iceberg table (schema + row count).
     Inspect(InspectArgs),
     /// Compact an Iceberg table: apply every delete and pack small files, in one
@@ -52,6 +54,12 @@ enum Cmd {
     Relocate(RelocateArgs),
     /// Price a shape against a managed vendor's MAR (Monthly Active Rows) rate.
     Cost(CostArgs),
+    /// Convert CSV, TSV, XML or a JSON array to JSON Lines: one record per line, the
+    /// records shapeshift would read.
+    Convert(ConvertArgs),
+    /// Serve shapeshift's tools to an AI agent over the Model Context Protocol (stdio).
+    /// Read-only: it looks at files under --root, or at a running console (--console).
+    Mcp(McpArgs),
     /// Serve a local web console over the shaper (infer/shape/inspect/cost).
     /// Requires a build with `--features serve`.
     #[cfg(feature = "serve")]
@@ -70,14 +78,118 @@ enum Cmd {
 enum CliSourceFormat {
     Jsonl,
     JsonArray,
+    Csv,
+    Tsv,
+    Xml,
 }
 impl From<CliSourceFormat> for SourceFormat {
     fn from(v: CliSourceFormat) -> Self {
         match v {
             CliSourceFormat::Jsonl => SourceFormat::Jsonl,
             CliSourceFormat::JsonArray => SourceFormat::JsonArray,
+            CliSourceFormat::Csv => SourceFormat::Csv,
+            CliSourceFormat::Tsv => SourceFormat::Tsv,
+            CliSourceFormat::Xml => SourceFormat::Xml,
         }
     }
+}
+
+/// How to read a CSV, TSV or XML input when there is no spec to say (with a spec, its
+/// `source.csv` / `source.xml` say it). The same flags on every command that reads one.
+#[derive(clap::Args, Clone, Default)]
+struct SourceOpts {
+    /// CSV/TSV: the field separator (default `,` for csv, a tab for tsv).
+    #[arg(long, value_name = "CHAR")]
+    delimiter: Option<char>,
+    /// CSV/TSV: the first row is data, not column names.
+    #[arg(long)]
+    no_header: bool,
+    /// CSV/TSV: the column names, comma-separated, in order (instead of the header's).
+    #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+    columns: Vec<String>,
+    /// CSV/TSV: read every field as a string, with no number or boolean detection.
+    #[arg(long)]
+    all_strings: bool,
+    /// XML: the element that is one record: `/Orders/Order` from the root, or `Order` at
+    /// any depth.
+    #[arg(long, value_name = "PATH")]
+    xml_record: Option<String>,
+}
+
+impl SourceOpts {
+    /// Whether any of these flags was given.
+    fn given(&self) -> bool {
+        self.delimiter.is_some()
+            || self.no_header
+            || !self.columns.is_empty()
+            || self.all_strings
+            || self.xml_record.is_some()
+    }
+
+    /// The source these flags describe, for `format`, checked as a spec's would be.
+    fn spec(&self, format: SourceFormat, path: Option<String>) -> Result<SourceSpec> {
+        let mut s = SourceSpec::of(format);
+        s.path = path;
+        if self.delimiter.is_some()
+            || self.no_header
+            || !self.columns.is_empty()
+            || self.all_strings
+        {
+            s.csv = Some(CsvOptions {
+                header: !self.no_header,
+                columns: self.columns.clone(),
+                delimiter: self.delimiter,
+                types: if self.all_strings {
+                    CsvTypes::Strings
+                } else {
+                    CsvTypes::Auto
+                },
+                ..CsvOptions::default()
+            });
+        }
+        if let Some(record) = &self.xml_record {
+            s.xml = Some(XmlOptions {
+                record: record.clone(),
+            });
+        }
+        s.validate().map_err(|e| {
+            anyhow!(
+                "{}",
+                e.to_string()
+                    .replace("source.xml.record", "--xml-record")
+                    .replace("`source.xml`", "--xml-record")
+                    .replace("source.csv.columns", "--columns")
+                    .replace("source.csv.delimiter", "--delimiter")
+                    .replace(
+                        "`source.csv`",
+                        "--delimiter, --no-header, --columns and --all-strings",
+                    )
+            )
+        })?;
+        Ok(s)
+    }
+}
+
+#[derive(Parser)]
+struct ConvertArgs {
+    /// Input file, or `-` for standard input.
+    #[arg(short, long)]
+    input: PathBuf,
+    /// Input format.
+    #[arg(long, value_enum)]
+    format: CliSourceFormat,
+    #[command(flatten)]
+    source: SourceOpts,
+    /// Write here (replaced whole, only once every record is read); default standard output.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Leave out a record that does not parse (reported on standard error, with its line)
+    /// instead of stopping at the first.
+    #[arg(long)]
+    skip_bad: bool,
+    /// Stop after this many records.
+    #[arg(long)]
+    limit: Option<u64>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -138,6 +250,8 @@ struct InferArgs {
     /// Input format.
     #[arg(long, value_enum, default_value_t = CliSourceFormat::Jsonl)]
     format: CliSourceFormat,
+    #[command(flatten)]
+    source: SourceOpts,
     /// Records to sample (0 = whole file).
     #[arg(long, default_value_t = 1000)]
     sample: usize,
@@ -174,6 +288,8 @@ struct ShapeArgs {
     /// Input format when inferring without a spec.
     #[arg(long, value_enum, default_value_t = CliSourceFormat::Jsonl)]
     format: CliSourceFormat,
+    #[command(flatten)]
+    source: SourceOpts,
     /// Compression (overrides the spec).
     #[arg(long, value_enum)]
     compression: Option<CliCompression>,
@@ -254,6 +370,67 @@ struct ShapeArgs {
     /// is unchanged.
     #[arg(long)]
     summary_json: bool,
+    /// On exit, write the run's numbers to this file in the Prometheus text format (for
+    /// node_exporter's textfile collector or any file scraper), replacing it whole. A failed
+    /// run writes it too. Off unless given: nothing is kept or written otherwise.
+    #[arg(long, value_name = "PATH")]
+    metrics_file: Option<PathBuf>,
+    /// Pull the records from this http(s) endpoint, or the rows from this
+    /// `mysql://user@host/db` or `postgres://user@host/db` (`postgresql://`), instead of a
+    /// file (sets the spec's `source.http.url`, `source.mysql.url` or `source.postgres.url`).
+    /// An endpoint's paging, credentials and cursor come from the spec's `source.http`;
+    /// without a spec it is one request whose JSON body is the records (an array, or
+    /// `--records`). A database reads `--query` or `--source-table`. A build with the
+    /// `http`, `mysql` or `postgres` feature.
+    #[arg(long, value_name = "URL", conflicts_with = "input")]
+    from: Option<String>,
+    /// Where a JSON response's records are, as a path (`data.items`), with --from
+    /// (overrides the spec's `source.http.records`).
+    #[arg(long, value_name = "PATH")]
+    records: Option<String>,
+    /// The `SELECT` a database source runs (overrides `source.mysql.query` or
+    /// `source.postgres.query`). With
+    /// --watermark it names `:cursor`: `select … where updated_at >= :cursor order by
+    /// updated_at`.
+    #[arg(long, value_name = "SQL", conflicts_with = "source_table")]
+    query: Option<String>,
+    /// The table a database source reads, by --watermark and its primary key (overrides
+    /// `source.mysql.table` or `source.postgres.table`).
+    #[arg(long, value_name = "TABLE")]
+    source_table: Option<String>,
+    /// The column a database source's position follows (`updated_at`, an id): the run reads
+    /// what is new since the table's position (overrides `source.mysql.cursor` or
+    /// `source.postgres.cursor`).
+    #[arg(long, value_name = "COLUMN")]
+    watermark: Option<String>,
+    /// A database source's first lower bound (`2020-01-01`, `0`), for when the table records
+    /// no position yet (overrides `source.mysql.start` or `source.postgres.start`).
+    #[arg(long, value_name = "VALUE")]
+    start: Option<String>,
+    /// Stop an incremental source's run after this many new records (re-read ones are
+    /// not counted). Without a tiebreak the run reads on to the end of the group of
+    /// records sharing the last value. The next run goes on from there.
+    #[arg(long, value_name = "N")]
+    max_records: Option<u64>,
+    /// Stop an incremental source's run after this many pages, counted from the first
+    /// with a new record.
+    #[arg(long, value_name = "N")]
+    max_pages: Option<u64>,
+    /// Stop an incremental source's run once this long has passed since its first new
+    /// record (`30s`, `10m`).
+    #[arg(long, value_name = "DURATION")]
+    max_wait: Option<String>,
+    /// Insecure mode: let an endpoint's credentials go over plain `http://` to another
+    /// machine, or connect to a database on another machine without TLS. Without it they go
+    /// only over https (TLS), or to this machine.
+    #[arg(long)]
+    insecure_source: bool,
+    /// The only hosts the source may connect to (`host` or `host:port`, comma-separated),
+    /// whatever its spec says: the first URL, each redirect and page, a database's hosts as its
+    /// driver reads them. For a runner that holds runs to a list of its own (a worker's
+    /// `--allow-source`). Unset: no limit.
+    #[arg(long, value_name = "HOSTS", value_delimiter = ',')]
+    source_hosts: Vec<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -321,6 +498,11 @@ struct CompactArgs {
     /// is unchanged.
     #[arg(long)]
     summary_json: bool,
+    /// On exit, write the run's numbers to this file in the Prometheus text format (for
+    /// node_exporter's textfile collector or any file scraper), replacing it whole. A failed
+    /// run writes it too. Off unless given: nothing is kept or written otherwise.
+    #[arg(long, value_name = "PATH")]
+    metrics_file: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -358,6 +540,11 @@ struct ExpireArgs {
     /// is unchanged.
     #[arg(long)]
     summary_json: bool,
+    /// On exit, write the run's numbers to this file in the Prometheus text format (for
+    /// node_exporter's textfile collector or any file scraper), replacing it whole. A failed
+    /// run writes it too. Off unless given: nothing is kept or written otherwise.
+    #[arg(long, value_name = "PATH")]
+    metrics_file: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -399,6 +586,11 @@ struct RelocateArgs {
     /// is unchanged.
     #[arg(long)]
     summary_json: bool,
+    /// On exit, write the run's numbers to this file in the Prometheus text format (for
+    /// node_exporter's textfile collector or any file scraper), replacing it whole. A failed
+    /// run writes it too. Off unless given: nothing is kept or written otherwise.
+    #[arg(long, value_name = "PATH")]
+    metrics_file: Option<PathBuf>,
 }
 
 /// A run id (`--run-id`), checked as the snapshot will record it.
@@ -410,22 +602,7 @@ fn parse_run_id(s: &str) -> std::result::Result<String, String> {
 
 /// A duration in milliseconds: a number and a unit (`s`, `m`, `h`, `d`, `w`).
 fn parse_duration_ms(s: &str) -> std::result::Result<i64, String> {
-    let t = s.trim();
-    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
-    let (num, unit) = t.split_at(split);
-    let n: i64 = num
-        .parse()
-        .map_err(|_| format!("`{s}` is not a duration (try 5d, 12h, 30m or 0s)"))?;
-    let unit_ms: i64 = match unit.trim() {
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
-        "w" => 7 * 86_400_000,
-        _ => return Err(format!("`{s}`: give a unit (s, m, h, d or w)")),
-    };
-    n.checked_mul(unit_ms)
-        .ok_or_else(|| format!("`{s}` is too long"))
+    shapeshift_core::parse_duration_ms(s)
 }
 
 /// A byte size: a number with an optional binary suffix (`K`/`KiB`, `M`/`MiB`,
@@ -465,6 +642,50 @@ struct ServeArgs {
     /// Disable the `Host`-header allow-list entirely (only behind a trusted proxy).
     #[arg(long)]
     allow_any_host: bool,
+    /// Where push connectors take records: a second listener that serves only
+    /// `POST /v1/ingest/<connector>`, each post with its connector's token
+    /// (e.g. `0.0.0.0:8088`). The console stays where --addr puts it.
+    #[arg(long)]
+    ingest_addr: Option<String>,
+    /// A REST catalog for the console's Catalog page to browse, read-only (a build with
+    /// `object_store`). Its credentials come from the environment, as for `shape --catalog`.
+    #[arg(long = "catalog")]
+    catalog: Option<String>,
+    /// Which of the catalog's warehouses to browse (with --catalog).
+    #[arg(long, requires = "catalog")]
+    warehouse: Option<String>,
+    /// Let the catalog's credentials go over plain http to another machine (with --catalog).
+    #[arg(long, requires = "catalog")]
+    insecure_catalog: bool,
+    /// Let datasets pull from the sources their specs name (an endpoint, a database). Off by
+    /// default: a spec names a host and the environment variables whose values it sends
+    /// there, and the console has no login, so start it only where nobody else can reach it.
+    #[arg(long)]
+    allow_sources: bool,
+    /// Serve the console's metrics at `GET /metrics` on this address, in the Prometheus text
+    /// format (e.g. `127.0.0.1:9187`): a listener of its own that serves nothing else and asks
+    /// no login, so keep it on a network you trust. Off unless given: nothing is counted.
+    #[arg(long)]
+    metrics_addr: Option<String>,
+}
+
+#[derive(Parser)]
+struct McpArgs {
+    /// The directory the tools read under. Every path an agent gives is resolved inside it,
+    /// symlinks included; anything outside is refused. Required unless --console is given: an
+    /// agent's client may start the server anywhere, `/` or a home directory among them.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with = "console",
+        required_unless_present = "console"
+    )]
+    root: Option<PathBuf>,
+    /// Front a running console instead (`http://127.0.0.1:8087`): its datasets, runs, alerts,
+    /// connectors and tables, read through its API. An IP address or `localhost`, never a name
+    /// to look up (a lookup could hang past the server's deadline).
+    #[arg(long, value_name = "URL")]
+    console: Option<String>,
 }
 
 #[derive(Parser)]
@@ -476,6 +697,8 @@ struct CostArgs {
     /// Input format for --input.
     #[arg(long, value_enum, default_value_t = CliSourceFormat::Jsonl)]
     format: CliSourceFormat,
+    #[command(flatten)]
+    source: SourceOpts,
     /// Billable row count (alternative to --input).
     #[arg(long)]
     rows: Option<u64>,
@@ -511,14 +734,31 @@ fn main() -> Result<()> {
         Cmd::Relocate(a) if a.summary_json => Some("relocate"),
         _ => None,
     };
+    let metrics = match &cli.cmd {
+        Cmd::Shape(a) => a.metrics_file.clone().map(|p| (p, "shape")),
+        Cmd::Compact(a) => a.metrics_file.clone().map(|p| (p, "compact")),
+        Cmd::Expire(a) => a.metrics_file.clone().map(|p| (p, "expire")),
+        Cmd::Relocate(a) => a.metrics_file.clone().map(|p| (p, "relocate")),
+        _ => None,
+    };
+    // A `shape` run's dataset, as far as its flags and spec file say before the run reads them:
+    // a run that fails before its spec is settled still reports under its dataset.
+    if let (Cmd::Shape(a), Some(_)) = (&cli.cmd, &metrics) {
+        if let Some(d) = early_dataset(a) {
+            report_dataset(&d);
+        }
+    }
+    let started = std::time::Instant::now();
     let result = match cli.cmd {
         Cmd::Infer(a) => cmd_infer(a),
-        Cmd::Shape(a) => cmd_shape(a),
+        Cmd::Shape(a) => cmd_shape(*a),
         Cmd::Inspect(a) => cmd_inspect(a),
         Cmd::Compact(a) => cmd_compact(a),
         Cmd::Expire(a) => cmd_expire(a),
         Cmd::Relocate(a) => cmd_relocate(a),
         Cmd::Cost(a) => cmd_cost(a),
+        Cmd::Convert(a) => cmd_convert(a),
+        Cmd::Mcp(a) => mcp::run(a.root, a.console),
         #[cfg(feature = "serve")]
         Cmd::Serve(a) => cmd_serve(a),
         #[cfg(not(feature = "serve"))]
@@ -527,25 +767,231 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some((path, command)) = &metrics {
+        let status = exit_code(&result);
+        // The run's own outcome stands: a metrics file that cannot be written is said, not
+        // made the run's failure.
+        if let Err(e) = write_run_metrics(path, command, status, started.elapsed()) {
+            eprintln!("warning: --metrics-file {}: {e}", path.display());
+        }
+    }
     let Err(e) = &result else {
         return result;
     };
     // Another writer committed first: nothing of this run was published, and running it
     // again will work. Its own exit status lets an orchestrator retry it and nothing else.
-    let conflict = matches!(
-        e.downcast_ref::<ShapeError>(),
-        Some(ShapeError::Conflict(_))
-    );
+    let code = exit_code(&result);
     if let Some(command) = json_command {
         println!("{}", error_json(command, e));
         eprintln!("Error: {e:?}");
-        std::process::exit(if conflict { EXIT_CONFLICT } else { 1 });
+        std::process::exit(code);
     }
-    if conflict {
+    if code == EXIT_CONFLICT {
         eprintln!("Error: {e}");
         std::process::exit(EXIT_CONFLICT);
     }
     result
+}
+
+/// The exit status a run's result gives: 0, [`EXIT_CONFLICT`] when another writer committed
+/// first, 1 for any other failure. The metrics file and the process exit both read it.
+fn exit_code(result: &Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e)
+            if matches!(
+                e.downcast_ref::<ShapeError>(),
+                Some(ShapeError::Conflict(_))
+            ) =>
+        {
+            EXIT_CONFLICT
+        }
+        Err(_) => 1,
+    }
+}
+
+/// A `shape` run's dataset before its spec is parsed: `--dataset`, the spec file's `dataset`
+/// key (read as plain YAML, so a spec that fails to parse whole still names it), or the input's
+/// name, as the run itself would choose it.
+fn early_dataset(a: &ShapeArgs) -> Option<String> {
+    if let Some(d) = &a.dataset {
+        return Some(d.clone());
+    }
+    if let Some(p) = &a.spec {
+        let text = std::fs::read_to_string(p).ok()?;
+        let v: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+        return v.get("dataset")?.as_str().map(str::to_string);
+    }
+    match (&a.input, &a.from) {
+        (Some(i), _) => Some(stem_of(i)),
+        (None, Some(url)) => Some(stem_of(&PathBuf::from(endpoint_name(url)))),
+        _ => None,
+    }
+}
+
+/// What a run leaves for `--metrics-file`: its dataset, once its spec is read, and its summary
+/// document (`--summary-json`'s), once it finishes. Set only when the flag asks for it.
+static RUN_REPORT: std::sync::Mutex<(Option<String>, Option<Value>)> =
+    std::sync::Mutex::new((None, None));
+
+fn report_dataset(name: &str) {
+    if let Ok(mut r) = RUN_REPORT.lock() {
+        r.0 = Some(name.to_string());
+    }
+}
+
+fn report_summary(doc: &Value) {
+    if let Ok(mut r) = RUN_REPORT.lock() {
+        r.1 = Some(doc.clone());
+    }
+}
+
+/// The run's numbers (the README's "Monitor it" lists them), written whole to `path`. A failed
+/// run writes its status, end time and duration; its last success time is carried from the
+/// file it replaces, so a run failing since Tuesday reads as such.
+fn write_run_metrics(
+    path: &Path,
+    command: &str,
+    status: i32,
+    took: std::time::Duration,
+) -> Result<()> {
+    use shapeshift_core::metrics::{read_labels, read_sample, write_atomic, Registry};
+    let (dataset, doc) = RUN_REPORT.lock().map(|r| r.clone()).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let previous = std::fs::read_to_string(path).ok();
+    // `shape` is labelled by its dataset and command, always the same two, so a failed run
+    // replaces the series a successful one wrote rather than starting others. Its dataset is
+    // the run's, else the one the file it replaces names, else empty. The table commands are
+    // labelled by command alone.
+    let dataset = match (command, dataset) {
+        ("shape", Some(d)) => Some(d),
+        ("shape", None) => Some(
+            previous
+                .as_deref()
+                .and_then(|t| read_labels(t, "shapeshift_run_last_exit_status"))
+                .filter(|l| l.iter().any(|(k, v)| k == "command" && v == "shape"))
+                .and_then(|l| l.into_iter().find(|(k, _)| k == "dataset").map(|(_, v)| v))
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    };
+    let (names, values): (Vec<&str>, Vec<&str>) = match &dataset {
+        Some(d) => (vec!["dataset", "command"], vec![d.as_str(), command]),
+        None => (vec!["command"], vec![command]),
+    };
+    let pairs: Vec<(&str, &str)> = names.iter().copied().zip(values.iter().copied()).collect();
+    let mut r = Registry::new();
+    let gauge = |r: &mut Registry, name: &str, help: &str, v: f64| -> Result<()> {
+        r.gauge(name, help, &names)?;
+        r.set(name, &values, v)?;
+        Ok(())
+    };
+    gauge(
+        &mut r,
+        "shapeshift_run_last_exit_status",
+        "The last run's exit status: 0, 75 (another writer committed first) or 1.",
+        f64::from(status),
+    )?;
+    gauge(
+        &mut r,
+        "shapeshift_run_last_end_timestamp_seconds",
+        "When the last run ended, in Unix seconds.",
+        now,
+    )?;
+    gauge(
+        &mut r,
+        "shapeshift_run_last_duration_seconds",
+        "How long the last run took.",
+        took.as_secs_f64(),
+    )?;
+    // A run that found its `--run-id` already committed read and wrote nothing: it succeeds,
+    // but it is no news of the data, so it neither advances the success time nor counts.
+    let replayed = doc
+        .as_ref()
+        .is_some_and(|d| d["table"]["earlier_attempt"] == Value::Bool(true));
+    let last_success = if status == 0 && !replayed {
+        Some(now)
+    } else {
+        previous.as_deref().and_then(|text| {
+            read_sample(
+                text,
+                "shapeshift_run_last_success_timestamp_seconds",
+                &pairs,
+            )
+        })
+    };
+    if let Some(t) = last_success {
+        gauge(
+            &mut r,
+            "shapeshift_run_last_success_timestamp_seconds",
+            "When a run last succeeded, in Unix seconds.",
+            t,
+        )?;
+    }
+    if let Some(doc) = doc.filter(|_| status == 0 && !replayed) {
+        let n = |v: &Value| v.as_f64().unwrap_or(0.0);
+        if let Some(rows) = doc.get("rows").filter(|v| v.is_object()) {
+            for (key, help) in [
+                ("in", "Records the last run read."),
+                ("out", "Rows the last run wrote."),
+                ("rejected", "Records the last run rejected."),
+                ("filtered", "Records the last run's `where` left out."),
+                ("deleted", "Rows the last run's change feed deleted."),
+                (
+                    "stale",
+                    "Changes the last run found older than the table's.",
+                ),
+            ] {
+                // A count the summary does not give is left out, not written as 0.
+                if let Some(v) = rows.get(key).and_then(Value::as_f64) {
+                    gauge(&mut r, &format!("shapeshift_run_last_rows_{key}"), help, v)?;
+                }
+            }
+        }
+        if let Some(b) = doc.get("bytes").filter(|v| v.is_number()) {
+            gauge(
+                &mut r,
+                "shapeshift_run_last_bytes_written",
+                "Bytes the last run wrote.",
+                n(b),
+            )?;
+        }
+        if let Some(src) = doc.get("source").filter(|v| v.is_object()) {
+            gauge(
+                &mut r,
+                "shapeshift_source_last_records_new",
+                "Records new to the table in the last pull.",
+                n(&src["new"]),
+            )?;
+            gauge(
+                &mut r,
+                "shapeshift_source_last_records_replayed",
+                "Records the last pull read again (its replay).",
+                n(&src["replayed"]),
+            )?;
+            // When the cursor is a time: the lag is now minus this.
+            let at = src["position"]
+                .get("at")
+                .or_else(|| src["position"].get("inside"));
+            if let Some(t) = at
+                .and_then(|v| v.as_str())
+                .and_then(shapeshift_core::metrics::unix_seconds)
+            {
+                gauge(&mut r, "shapeshift_source_last_position_timestamp_seconds", "The source position after the last pull, when its cursor is a time, in Unix seconds.", t)?;
+            }
+        }
+    }
+    r.gauge(
+        "shapeshift_build_info",
+        "The shapeshift build that wrote this file.",
+        &["version"],
+    )?;
+    r.set("shapeshift_build_info", &[env!("CARGO_PKG_VERSION")], 1.0)?;
+    write_atomic(path, &r.render())?;
+    Ok(())
 }
 
 /// What `serve` says in a build without the console (the release binary and image are lean).
@@ -597,6 +1043,12 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
         data_dir: a.data_dir,
         allowed_hosts: a.allow_host,
         allow_any_host: a.allow_any_host,
+        ingest_addr: a.ingest_addr,
+        catalog_uri: a.catalog,
+        catalog_warehouse: a.warehouse,
+        insecure_catalog: a.insecure_catalog,
+        allow_sources: a.allow_sources,
+        metrics_addr: a.metrics_addr,
     };
     shapeshift_serve::serve(cfg).map_err(|e| anyhow!("{e}"))
 }
@@ -616,12 +1068,12 @@ fn stem_of(path: &Path) -> String {
 /// errors are skipped here and surfaced properly during the shaping pass.
 fn sample_records(
     path: &Path,
-    format: SourceFormat,
+    source: &SourceSpec,
     n: usize,
     filter: Option<&Predicate>,
 ) -> Result<Vec<Value>> {
     let reader =
-        open_reader(path, format).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+        open_source(path, source).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
     let mut out = Vec::new();
     // Inference tolerates malformed *lines* — they are surfaced properly in the
     // shaping pass — but a genuine I/O error must not silently yield a partial
@@ -677,21 +1129,38 @@ const MAX_REPLAY_REJECTS: usize = 10_000;
 /// ones (the shaping pass counts them), under the same bound.
 fn infer_and_chain(
     path: &Path,
-    format: SourceFormat,
+    pulled: &mut Option<RecordSource>,
+    source: &SourceSpec,
     n: usize,
     flatten: bool,
     filter: Option<&Predicate>,
+    row: Option<&str>,
 ) -> Result<(Vec<ColumnSpec>, usize, ShapeSource)> {
-    let tape = |what: &str| {
-        open_tape_reader(path, format).map_err(|e| anyhow!("{what} {}: {e}", display_input(path)))
+    // A change feed's columns are its rows', not the envelope's.
+    let row_of = |v: &'_ Value| -> Option<Value> {
+        match row {
+            None => Some(v.clone()),
+            Some(p) => shapeshift_core::select(v, p)
+                .filter(|r| !r.is_null())
+                .cloned(),
+        }
+    };
+    // An endpoint's records are a stream that is already open.
+    let mut pulled = pulled.take();
+    let mut tape = |what: &str| -> Result<Box<dyn TapeSource + Send>> {
+        if let Some(r) = pulled.take() {
+            return Ok(Box::new(OwnedTape::new(r)));
+        }
+        open_tape_reader(path, source).map_err(|e| anyhow!("{what} {}: {e}", display_input(path)))
     };
 
-    if is_rereadable(path) {
+    if !is_pulled(source) && is_rereadable(path) {
         // A file is sampled and then reopened, exactly as before — that is what keeps
         // `infer_sample: 0` bounded and lets inference scan past a malformed head. The
         // shaping pass that follows is the one that gets the tape.
-        let samples = sample_records(path, format, n, filter)?;
-        let columns = infer_columns(samples.iter(), flatten);
+        let samples = sample_records(path, source, n, filter)?;
+        let rows: Vec<Value> = samples.iter().filter_map(row_of).collect();
+        let columns = infer_columns(rows.iter(), flatten);
         return Ok((
             columns,
             samples.len(),
@@ -759,10 +1228,10 @@ fn infer_and_chain(
             ),
             _ => bail!(
                 "the first {malformed} records from {} were all unparseable, so there is \
-                 nothing to infer a schema from — is the input really {:?}? Pass a spec with \
+                 nothing to infer a schema from — is the input really {}? Pass a spec with \
                  `schema: strict` to shape it anyway.",
                 display_input(path),
-                format
+                source.format.name()
             ),
         }
     }
@@ -783,16 +1252,24 @@ fn infer_and_chain(
         .iter()
         .zip(&sampled)
         .filter(|(_, keep)| **keep)
-        .filter_map(|(r, _)| r.as_ref().ok());
-    let columns = infer_columns(kept, flatten);
+        .filter_map(|(r, _)| r.as_ref().ok())
+        .filter_map(row_of)
+        .collect::<Vec<_>>();
+    let columns = infer_columns(kept.iter(), flatten);
     Ok((columns, good, ShapeSource { reader, prefix }))
 }
 
-/// Open the tape-backed reader for `path` (or standard input) in `format`.
+/// Open the tape-backed reader for `path` (or standard input) as `source` says.
 ///
 /// The array reader validates the opening `[` eagerly, so a document that is not an
 /// array fails here — at open time, naming the file — rather than at the first record.
-fn open_tape_reader(path: &Path, format: SourceFormat) -> Result<Box<dyn TapeSource + Send>> {
+fn open_tape_reader(path: &Path, source: &SourceSpec) -> Result<Box<dyn TapeSource + Send>> {
+    // CSV, TSV and XML read into owned values, which are then taped.
+    if !matches!(source.format, SourceFormat::Jsonl | SourceFormat::JsonArray) {
+        let records = open_source(path, source)
+            .map_err(|e| anyhow!("reading {}: {e}", display_input(path)))?;
+        return Ok(Box::new(OwnedTape::new(records)));
+    }
     // Both failures name the input. Strict mode calls this directly, with no wrapper of
     // its own, so a missing file or a `json-array` document that is not an array would
     // otherwise print `No such file or directory` — or the array reader's complaint —
@@ -805,12 +1282,13 @@ fn open_tape_reader(path: &Path, format: SourceFormat) -> Result<Box<dyn TapeSou
                 .with_context(|| format!("opening {}", display_input(path)))?,
         ))
     };
-    Ok(match format {
+    Ok(match source.format {
         SourceFormat::JsonArray => Box::new(
             TapeJsonArrayReader::new(inner)
                 .map_err(|e| anyhow!("reading {}: {e}", display_input(path)))?,
         ),
         SourceFormat::Jsonl => Box::new(TapeJsonlReader::new(inner)),
+        SourceFormat::Csv | SourceFormat::Tsv | SourceFormat::Xml => unreachable!("taped above"),
     })
 }
 
@@ -871,6 +1349,8 @@ impl ShapeLoop<'_> {
             PushOutcome::Appended => self.rows_out += 1,
             // Counted by the shaper's filter report; nothing to keep or replay.
             PushOutcome::Filtered => {}
+            // A change feed's `skip` op: counted by the shaper's change report.
+            PushOutcome::Skipped => {}
             PushOutcome::Rejected(reason) => {
                 self.rows_rejected += 1;
                 tracing::debug!(reason, "row rejected");
@@ -928,6 +1408,7 @@ impl ShapeLoop<'_> {
 /// take the batch by value, so the threaded one can hand ownership across without a copy.
 trait ShapeWriter {
     fn write_batch(&mut self, batch: RecordBatch) -> Result<()>;
+    fn set_source_position(&mut self, kind: &str, position: &Value) -> Result<()>;
     fn finish(&mut self) -> Result<SinkSummary>;
 }
 
@@ -938,6 +1419,11 @@ impl ShapeWriter for DirectSink {
     fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
         self.0.write_batch(&batch).map_err(anyhow::Error::from)
     }
+    fn set_source_position(&mut self, kind: &str, position: &Value) -> Result<()> {
+        self.0
+            .set_source_position(kind, position)
+            .map_err(anyhow::Error::from)
+    }
     fn finish(&mut self) -> Result<SinkSummary> {
         self.0.finish().map_err(anyhow::Error::from)
     }
@@ -946,6 +1432,9 @@ impl ShapeWriter for DirectSink {
 impl ShapeWriter for PipelinedSink {
     fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
         PipelinedSink::write_batch(self, batch)
+    }
+    fn set_source_position(&mut self, kind: &str, position: &Value) -> Result<()> {
+        PipelinedSink::set_source_position(self, kind, position)
     }
     fn finish(&mut self) -> Result<SinkSummary> {
         PipelinedSink::finish(self)
@@ -963,6 +1452,8 @@ const WRITER_QUEUE_DEPTH: usize = 1;
 /// writer that finalized on disconnect would hand back a complete file instead.
 enum WriterMsg {
     Batch(RecordBatch),
+    /// A pulled source's position, for the commit `Finish` makes.
+    Position(String, Value),
     Finish,
 }
 
@@ -1017,6 +1508,9 @@ impl PipelinedSink {
             for msg in &rx {
                 match msg {
                     WriterMsg::Batch(b) => sink.write_batch(&b).map_err(anyhow::Error::from)?,
+                    WriterMsg::Position(kind, p) => sink
+                        .set_source_position(&kind, &p)
+                        .map_err(anyhow::Error::from)?,
                     // Asked to commit: close the footer / write the table metadata.
                     WriterMsg::Finish => {
                         return sink.finish().map(Some).map_err(anyhow::Error::from)
@@ -1062,6 +1556,26 @@ impl PipelinedSink {
                 .collect(None)
                 .err()
                 .unwrap_or_else(|| anyhow!("the writer stopped before the run finished"))),
+        }
+    }
+
+    /// Hand over a pulled source's position, ahead of the commit.
+    fn set_source_position(&mut self, kind: &str, position: &Value) -> Result<()> {
+        match &mut self.state {
+            WriterState::Inline(sink) => sink
+                .set_source_position(kind, position)
+                .map_err(anyhow::Error::from),
+            WriterState::Threaded { tx, .. } => {
+                let tx = tx.as_ref().expect("sender live until finish");
+                match tx.send(WriterMsg::Position(kind.to_string(), position.clone())) {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(self
+                        .collect(None)
+                        .err()
+                        .unwrap_or_else(|| anyhow!("the writer stopped before the run finished"))),
+                }
+            }
+            WriterState::Done => Err(anyhow!("the writer was already collected")),
         }
     }
 
@@ -1122,38 +1636,11 @@ fn cmd_infer(a: InferArgs) -> Result<()> {
         .map(Predicate::parse)
         .transpose()
         .map_err(anyhow::Error::from)?;
-    let samples = sample_records(&a.input, a.format.into(), a.sample, filter.as_ref())?;
-    if samples.is_empty() {
-        match &filter {
-            Some(f) => bail!(
-                "`where {f}` kept none of the records read from {}, so there is nothing to \
-                 infer a schema from",
-                a.input.display()
-            ),
-            None => bail!("no records read from {}", a.input.display()),
-        }
-    }
-    let columns = infer_columns(samples.iter(), !a.no_flatten);
-    let spec = DatasetSpec {
-        dataset: dataset.clone(),
-        filter: filter.map(|f| f.text().to_string()),
-        source: SourceSpec {
-            format: a.format.into(),
-            path: Some(a.input.to_string_lossy().into_owned()),
-        },
-        output: OutputSpec {
-            format: OutputFormat::Parquet,
-            path: format!("{dataset}.parquet"),
-            compression: Compression::Snappy,
-            partition_by: Vec::new(),
-            merge_on: Vec::new(),
-            catalog: None,
-        },
-        schema: SchemaMode::Infer,
-        columns,
-        drift: Default::default(),
-        options: Default::default(),
-    };
+    let source = a.source.spec(
+        a.format.into(),
+        Some(a.input.to_string_lossy().into_owned()),
+    )?;
+    let spec = infer_spec(&a.input, source, a.sample, filter, &dataset, !a.no_flatten)?;
     let yaml = spec.to_yaml().map_err(|e| anyhow!("{e}"))?;
     match a.out {
         Some(p) => {
@@ -1167,6 +1654,49 @@ fn cmd_infer(a: InferArgs) -> Result<()> {
         None => print!("{yaml}"),
     }
     Ok(())
+}
+
+/// A spec inferred from a sample of `input`: what `shapeshift infer` prints, and the MCP
+/// server's `shapeshift_infer` answers.
+fn infer_spec(
+    input: &Path,
+    source: SourceSpec,
+    sample: usize,
+    filter: Option<Predicate>,
+    dataset: &str,
+    flatten: bool,
+) -> Result<DatasetSpec> {
+    let samples = sample_records(input, &source, sample, filter.as_ref())?;
+    if samples.is_empty() {
+        match &filter {
+            Some(f) => bail!(
+                "`where {f}` kept none of the records read from {}, so there is nothing to \
+                 infer a schema from",
+                input.display()
+            ),
+            None => bail!("no records read from {}", input.display()),
+        }
+    }
+    let columns = infer_columns(samples.iter(), flatten);
+    Ok(DatasetSpec {
+        dataset: dataset.to_string(),
+        filter: filter.map(|f| f.text().to_string()),
+        changes: None,
+        source,
+        output: OutputSpec {
+            format: OutputFormat::Parquet,
+            path: format!("{dataset}.parquet"),
+            compression: Compression::Snappy,
+            partition_by: Vec::new(),
+            merge_on: Vec::new(),
+            catalog: None,
+            apply: None,
+        },
+        schema: SchemaMode::Infer,
+        columns,
+        drift: Default::default(),
+        options: Default::default(),
+    })
 }
 
 /// Split one `--partition-by` value on TOP-LEVEL commas only, so `region,tier` still
@@ -1201,6 +1731,13 @@ fn split_partition_entries(s: &str) -> Vec<String> {
 }
 
 fn cmd_shape(a: ShapeArgs) -> Result<()> {
+    if a.spec.is_some() && a.source.given() {
+        bail!(
+            "--delimiter, --no-header, --columns, --all-strings and --xml-record describe an \
+             input when there is no spec; with --spec, set them in its `source.csv` or \
+             `source.xml`"
+        );
+    }
     // 1. Assemble the effective spec (from file, or synthesized from inference).
     let mut spec = match &a.spec {
         Some(p) => {
@@ -1211,10 +1748,11 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             DatasetSpec::decode(&text).map_err(anyhow::Error::from)?
         }
         None => {
-            let input = a
-                .input
-                .clone()
-                .ok_or_else(|| anyhow!("--input is required when no --spec is given"))?;
+            let input = match (&a.input, &a.from) {
+                (Some(i), _) => i.clone(),
+                (None, Some(url)) => PathBuf::from(endpoint_name(url)),
+                (None, None) => bail!("--input (or --from) is required when no --spec is given"),
+            };
             // A catalog names the table's location, so it stands in for --output.
             let output = match (&a.output, &a.catalog) {
                 (Some(o), _) => o.clone(),
@@ -1232,9 +1770,46 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             DatasetSpec {
                 dataset,
                 filter: None,
-                source: SourceSpec {
-                    format: a.format.into(),
-                    path: Some(input.to_string_lossy().into_owned()),
+                changes: None,
+                source: match &a.from {
+                    Some(url) if shapeshift_core::DbKind::of_url(url).is_some() => {
+                        let db = shapeshift_core::DbSourceSpec {
+                            url: url.clone(),
+                            ..Default::default()
+                        };
+                        match shapeshift_core::DbKind::of_url(url) {
+                            Some(shapeshift_core::DbKind::Postgres) => SourceSpec {
+                                postgres: Some(db),
+                                ..SourceSpec::default()
+                            },
+                            _ => SourceSpec {
+                                mysql: Some(db),
+                                ..SourceSpec::default()
+                            },
+                        }
+                    }
+                    // The endpoint's body format and options: --format csv/tsv/xml with
+                    // their flags; otherwise a JSON body.
+                    Some(_) => {
+                        let mut s = a.source.spec(a.format.into(), None)?;
+                        let format = match s.format {
+                            SourceFormat::Csv => shapeshift_core::HttpFormat::Csv,
+                            SourceFormat::Tsv => shapeshift_core::HttpFormat::Tsv,
+                            SourceFormat::Xml => shapeshift_core::HttpFormat::Xml,
+                            SourceFormat::Jsonl | SourceFormat::JsonArray => {
+                                shapeshift_core::HttpFormat::Json
+                            }
+                        };
+                        s.format = SourceFormat::Jsonl;
+                        s.http = Some(shapeshift_core::HttpSourceSpec {
+                            format,
+                            ..Default::default()
+                        });
+                        s
+                    }
+                    None => a
+                        .source
+                        .spec(a.format.into(), Some(input.to_string_lossy().into_owned()))?,
                 },
                 output: OutputSpec {
                     format: a.to.map(Into::into).unwrap_or(default_format),
@@ -1243,6 +1818,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                     partition_by: Vec::new(),
                     merge_on: Vec::new(),
                     catalog: None,
+                    apply: None,
                 },
                 schema: SchemaMode::Infer,
                 columns: Vec::new(),
@@ -1254,7 +1830,69 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
 
     // 2. Apply CLI overrides onto a spec loaded from file.
     if let Some(input) = &a.input {
+        if is_pulled(&spec.source) {
+            bail!("--input names a file, and the spec reads an endpoint or a database: give one");
+        }
         spec.source.path = Some(input.to_string_lossy().into_owned());
+    }
+    if let Some(url) = &a.from {
+        spec.source.path = None;
+        if let Some(kind) = shapeshift_core::DbKind::of_url(url) {
+            // A database's rows have no file format: what the spec said for a file goes.
+            spec.source.http = None;
+            spec.source.format = SourceFormat::Jsonl;
+            spec.source.csv = None;
+            spec.source.xml = None;
+            // The spec's database settings carry over to the URL's kind.
+            let db = spec.source.mysql.take().or(spec.source.postgres.take());
+            let mut db = db.unwrap_or_default();
+            db.url = url.clone();
+            match kind {
+                shapeshift_core::DbKind::Mysql => spec.source.mysql = Some(db),
+                shapeshift_core::DbKind::Postgres => spec.source.postgres = Some(db),
+            }
+        } else {
+            spec.source.mysql = None;
+            spec.source.postgres = None;
+            spec.source.http.get_or_insert_with(Default::default).url = url.clone();
+        }
+    }
+    let database_flags = [
+        ("--query", a.query.is_some()),
+        ("--source-table", a.source_table.is_some()),
+        ("--watermark", a.watermark.is_some()),
+        ("--start", a.start.is_some()),
+    ];
+    match spec.source.mysql.as_mut().or(spec.source.postgres.as_mut()) {
+        Some(m) => {
+            if let Some(q) = &a.query {
+                m.query = Some(q.clone());
+                m.table = None;
+            }
+            if let Some(t) = &a.source_table {
+                m.table = Some(t.clone());
+                m.query = None;
+                // A table's tiebreak is its primary key.
+                m.tiebreak = None;
+            }
+            if let Some(w) = &a.watermark {
+                m.cursor = Some(w.clone());
+            }
+            if let Some(st) = &a.start {
+                m.start = Some(st.clone());
+            }
+        }
+        None => {
+            if let Some((flag, _)) = database_flags.iter().find(|(_, set)| *set) {
+                bail!("{flag} is for a database source: it goes with --from mysql://… or postgres://…");
+            }
+        }
+    }
+    if let Some(r) = &a.records {
+        match spec.source.http.as_mut() {
+            Some(h) => h.records = Some(r.clone()),
+            None => bail!("--records is where an endpoint's records are: it goes with --from"),
+        }
     }
     if let Some(output) = &a.output {
         spec.output.path = output.clone();
@@ -1313,15 +1951,41 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     if let Some(c) = &a.rescue_column {
         spec.drift.rescue_column = c.clone();
     }
+    if a.metrics_file.is_some() {
+        report_dataset(&spec.dataset);
+    }
     spec.validate().map_err(anyhow::Error::from)?;
 
-    // 3. Resolve the input path.
-    let input =
-        spec.source.path.clone().ok_or_else(|| {
-            anyhow!("no input path (set source.path in the spec or pass --input)")
-        })?;
+    // 3. Resolve the input: a path, or an endpoint (named in messages without its query).
+    let database = spec.source.mysql.as_ref().or(spec.source.postgres.as_ref());
+    let input = match (&spec.source.http, database, &spec.source.path) {
+        (Some(h), _, _) => endpoint_name(&h.url),
+        (None, Some(m), _) => endpoint_name(&m.url),
+        (None, None, Some(p)) => p.clone(),
+        (None, None, None) => bail!("no input path (set source.path in the spec or pass --input)"),
+    };
     let input = PathBuf::from(input);
-    let src_format = spec.source.format;
+    let source = spec.source.clone();
+    let bounds = shapeshift_core::Bounds {
+        max_records: a.max_records,
+        max_pages: a.max_pages,
+        max_wait: a
+            .max_wait
+            .as_deref()
+            .map(|w| {
+                shapeshift_core::duration_ms(w)
+                    .map(|ms| std::time::Duration::from_millis(ms.max(0) as u64))
+            })
+            .transpose()
+            .map_err(anyhow::Error::from)?,
+    };
+    if !is_pulled(&spec.source) && (bounds.any() || a.insecure_source || !a.source_hosts.is_empty())
+    {
+        bail!(
+            "--max-records, --max-pages, --max-wait, --insecure-source and --source-hosts apply to an endpoint \
+             or a database (--from, or `source.http` / `source.mysql` / `source.postgres`)"
+        );
+    }
 
     if !spec.output.partition_by.is_empty() && spec.output.format != OutputFormat::Iceberg {
         bail!("`partition_by` applies only to Iceberg tables (--to iceberg)");
@@ -1330,6 +1994,8 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         bail!("--append applies only to Iceberg tables (--to iceberg)");
     }
     let merging = !spec.output.merge_on.is_empty();
+    // A changelog is the table's history: each run adds to it, never replaces it.
+    let append = a.append || spec.output.apply == Some(shapeshift_core::ApplyMode::Changelog);
     let run_id = a.run_id.as_deref();
 
     // A run that an earlier attempt already committed is done: report its snapshot and
@@ -1347,7 +2013,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 Some(c) => &c.table,
                 None => &spec.output.path,
             });
-            if a.summary_json {
+            if a.summary_json || a.metrics_file.is_some() {
                 // Nothing was read, so nothing was filtered; the spec's `where` still shows.
                 let filter = spec.filter.as_ref().map(|expr| FilterReport {
                     expr: expr.trim().to_string(),
@@ -1361,10 +2027,16 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                     None,
                     None,
                     filter.as_ref(),
+                    None,
                     run_id,
                 );
-                println!("{doc}");
-            } else {
+                report_summary(&doc);
+                if a.summary_json {
+                    println!("{doc}");
+                    return Ok(());
+                }
+            }
+            if !a.summary_json {
                 println!(
                     "run `{id}` is already in {}: an earlier attempt committed snapshot {} \
                      (sequence number {}). Nothing was read or written.",
@@ -1376,6 +2048,16 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             return Ok(());
         }
     }
+
+    // An endpoint: the table's recorded position, then the records from it.
+    let access = SourceAccess {
+        insecure: a.insecure_source,
+        hosts: a.source_hosts.clone(),
+    };
+    let mut pulled = open_pulled(&spec, &bounds, &access, a.insecure_catalog)?;
+    let mut records = pulled
+        .as_mut()
+        .map(|p| p.records.take().expect("just opened"));
 
     // 4. Build the shaper (inferring in Infer mode). The source is opened **once**:
     // inference reads the head and hands back a reader that still yields every record,
@@ -1389,10 +2071,12 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             .map_err(anyhow::Error::from)?;
         let (columns, sampled, reader) = infer_and_chain(
             &input,
-            src_format,
+            &mut records,
+            &source,
             spec.options.infer_sample,
             spec.options.flatten,
             filter.as_ref(),
+            spec.changes.as_ref().and_then(|c| c.row.as_deref()),
         )?;
         // Only when it kept nothing (records it kept that carry no field to infer from
         // are the same case they are without a filter), and nothing is declared either.
@@ -1410,7 +2094,15 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         (Vec::new(), None)
     };
     let mut shaper = Shaper::from_spec(&spec, &inferred).map_err(anyhow::Error::from)?;
-    let schema = shaper.schema();
+    // The table's schema: a change feed's batches carry one more column, which marks the
+    // deletes for the merge sink and is never written.
+    let schema = shaper.table_schema();
+    let order_by: &[String] = spec.changes.as_ref().map_or(&[], |c| c.order_by.as_slice());
+    // How long a delete is remembered against `order_by` (`changes.tombstone_retention`).
+    let retention_ms = match &spec.changes {
+        Some(c) => c.retention_ms().map_err(anyhow::Error::from)?,
+        None => shapeshift_iceberg::DEFAULT_TOMBSTONE_RETENTION_MS,
+    };
 
     // 5. Resolve the output + create the sink. A catalog table counts as remote output:
     // its sidecars are named after the dataset in the working directory.
@@ -1425,9 +2117,13 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 },
                 schema.clone(),
                 spec.output.compression,
-                a.append,
+                append,
                 &spec.output.partition_by,
-                &spec.output.merge_on,
+                MergeOn {
+                    keys: &spec.output.merge_on,
+                    order_by,
+                    retention_ms,
+                },
                 run_id,
             )?;
             (s, PathBuf::from(&cat.table))
@@ -1448,9 +2144,13 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                 &spec.output.path,
                 schema.clone(),
                 spec.output.compression,
-                a.append,
+                append,
                 &spec.output.partition_by,
-                &spec.output.merge_on,
+                MergeOn {
+                    keys: &spec.output.merge_on,
+                    order_by,
+                    retention_ms,
+                },
                 run_id,
             )?;
             (s, PathBuf::from(&spec.output.path))
@@ -1470,11 +2170,15 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
                     &dir,
                     schema.clone(),
                     spec.output.compression,
-                    a.append,
+                    append,
                     &spec.output.partition_by,
                 )
             }
             .map_err(anyhow::Error::from)?;
+            if !order_by.is_empty() {
+                s.order_changes_by(order_by, retention_ms)
+                    .map_err(anyhow::Error::from)?;
+            }
             if let Some(id) = run_id {
                 s.set_run_id(id).map_err(anyhow::Error::from)?;
             }
@@ -1489,7 +2193,10 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         // Strict mode: nothing has read the source yet, so it goes straight onto the
         // tape with no prefix to replay.
         None => ShapeSource {
-            reader: open_tape_reader(&input, src_format)?,
+            reader: match records.take() {
+                Some(r) => Box::new(OwnedTape::new(r)),
+                None => open_tape_reader(&input, &source)?,
+            },
             prefix: Vec::new(),
         },
     };
@@ -1573,10 +2280,26 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         w.flush()
             .with_context(|| format!("flushing {}", reject_path.display()))?;
     }
+    // The endpoint's position goes into the same commit as the rows it read.
+    let pull = match &pulled {
+        Some(p) => {
+            let (position, progress) = p
+                .source
+                .outcome()
+                .ok_or_else(|| anyhow!("the endpoint was not read to the end of its run"))?;
+            if let Some(pos) = &position {
+                let recorded = shapeshift_core::recorded_position(pos, p.source.as_ref());
+                sink.set_source_position(p.source.kind(), &recorded)?;
+            }
+            Some((p.source.kind(), p.start.clone(), position, progress))
+        }
+        None => None,
+    };
     let summary: SinkSummary = sink.finish()?;
 
     // 7. Report. The full drift report goes beside the output either way.
     let filter = shaper.filter_report().cloned();
+    let changes = shaper.change_report().cloned();
     let drift = shaper.into_drift_report();
     let drift_report = match &drift {
         Some(report) if !report.is_clean() => {
@@ -1585,7 +2308,7 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
         }
         _ => None,
     };
-    if a.summary_json {
+    if a.summary_json || a.metrics_file.is_some() {
         let rejects = (parse_errors + rows_rejected > 0).then_some(reject_path.as_path());
         let doc = shape_json(
             &spec,
@@ -1595,10 +2318,18 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
             rejects,
             drift.as_ref().map(|r| (r, drift_report)),
             filter.as_ref(),
+            changes.as_ref(),
             run_id,
         );
-        println!("{doc}");
-        return Ok(());
+        let mut doc = doc;
+        if let Some(p) = &pull {
+            doc["source"] = pull_json(p);
+        }
+        report_summary(&doc);
+        if a.summary_json {
+            println!("{doc}");
+            return Ok(());
+        }
     }
     println!(
         "shaped `{}` → {} ({:?})",
@@ -1618,6 +2349,22 @@ fn cmd_shape(a: ShapeArgs) -> Result<()> {
     );
     if let Some(f) = &filter {
         print_filter(f, rows_in);
+    }
+    if let Some(p) = &pull {
+        print_pull(p);
+    }
+    if let Some(c) = &changes {
+        println!(
+            "changes: {} insert(s), {} update(s), {} delete(s){}",
+            c.inserts,
+            c.updates,
+            c.deletes,
+            if c.skipped > 0 {
+                format!(", {} skipped", c.skipped)
+            } else {
+                String::new()
+            }
+        );
     }
     if parse_errors > 0 || rows_rejected > 0 {
         println!(
@@ -1672,6 +2419,7 @@ fn shape_json(
     rejects: Option<&Path>,
     drift: Option<(&DriftReport, Option<&Path>)>,
     filter: Option<&FilterReport>,
+    changes: Option<&ChangeReport>,
     run_id: Option<&str>,
 ) -> Value {
     // A catalog commit has a snapshot but no `vN` of its own (the catalog numbers its
@@ -1711,7 +2459,17 @@ fn shape_json(
             "rejected": rejected,
             "filtered": filter.map_or(0, |f| f.filtered),
             "parse_errors": parse_errors,
+            "skipped": changes.map_or(0, |c| c.skipped),
+            "deleted": summary.merge.as_ref().map_or(0, |m| m.rows_deleted),
+            "stale": summary.merge.as_ref().map_or(0, |m| m.changes_stale),
         },
+        // Present when the spec reads a change feed (`changes:`).
+        "changes": changes.map(|c| serde_json::json!({
+            "inserts": c.inserts,
+            "updates": c.updates,
+            "deletes": c.deletes,
+            "skipped": c.skipped,
+        })),
         // Present when the run had a `where`.
         "where": filter.map(|f| serde_json::json!({
             "expr": f.expr,
@@ -1775,6 +2533,16 @@ fn merge_json(m: &MergeSummary) -> Value {
         "data_files_pruned": m.data_files_pruned,
         "delete_files": m.delete_files,
         "position_deletes": m.position_deletes,
+        "keys_deleted": m.keys_deleted,
+        "rows_deleted": m.rows_deleted,
+        "changes_stale": m.changes_stale,
+        "order_by": m.order_by,
+        "tombstones": {
+            "written": m.tombstones_written,
+            "retired": m.tombstones_retired,
+            "trimmed": m.tombstones_trimmed,
+            "live": m.tombstones_live,
+        },
     })
 }
 
@@ -1788,6 +2556,25 @@ fn print_merge(m: &MergeSummary) {
         m.keys_inserted,
         m.prior_rows_replaced
     );
+    if m.keys_deleted > 0 || m.rows_deleted > 0 {
+        println!(
+            "  {} key(s) deleted; {} live row(s) removed",
+            m.keys_deleted, m.rows_deleted
+        );
+    }
+    if m.changes_stale > 0 {
+        println!(
+            "  {} change(s) were stale (not newer than the row by {}), and the table kept its row",
+            m.changes_stale,
+            m.order_by.join(", ")
+        );
+    }
+    if !m.order_by.is_empty() {
+        println!(
+            "  tombstones: {} written, {} retired, {} trimmed past the retention; {} remembered",
+            m.tombstones_written, m.tombstones_retired, m.tombstones_trimmed, m.tombstones_live
+        );
+    }
     if m.duplicates_in_input > 0 {
         println!(
             "  {} earlier occurrence(s) of a repeated key in the input were dropped (the last one wins)",
@@ -1969,16 +2756,21 @@ fn objstore_iceberg_sink(
     compression: Compression,
     append: bool,
     partition_by: &[String],
-    merge_on: &[String],
+    merge: MergeOn<'_>,
     run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     use shapeshift_objstore::ObjectStoreIcebergSink;
+    let (merge_on, order_by, retention_ms) = (merge.keys, merge.order_by, merge.retention_ms);
     let mut s = if merge_on.is_empty() {
         ObjectStoreIcebergSink::create(url, schema, compression, append, partition_by)
     } else {
         ObjectStoreIcebergSink::create_merge(url, schema, compression, partition_by, merge_on)
     }
     .map_err(anyhow::Error::from)?;
+    if !order_by.is_empty() {
+        s.order_changes_by(order_by, retention_ms)
+            .map_err(anyhow::Error::from)?;
+    }
     if let Some(id) = run_id {
         s.set_run_id(id).map_err(anyhow::Error::from)?;
     }
@@ -1992,7 +2784,7 @@ fn objstore_iceberg_sink(
     _compression: Compression,
     _append: bool,
     _partition_by: &[String],
-    _merge_on: &[String],
+    _merge: MergeOn<'_>,
     _run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     bail!(
@@ -2011,12 +2803,13 @@ fn objstore_catalog_sink(
     compression: Compression,
     append: bool,
     partition_by: &[String],
-    merge_on: &[String],
+    merge: MergeOn<'_>,
     run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     use shapeshift_objstore::ObjectStoreIcebergSink;
     let conn = catalog.connection()?;
     let (conn, table) = (&conn, &catalog.spec.table);
+    let (merge_on, order_by, retention_ms) = (merge.keys, merge.order_by, merge.retention_ms);
     let mut s = if merge_on.is_empty() {
         ObjectStoreIcebergSink::create_in_catalog(
             conn,
@@ -2037,6 +2830,10 @@ fn objstore_catalog_sink(
         )
     }
     .map_err(anyhow::Error::from)?;
+    if !order_by.is_empty() {
+        s.order_changes_by(order_by, retention_ms)
+            .map_err(anyhow::Error::from)?;
+    }
     if let Some(id) = run_id {
         s.set_run_id(id).map_err(anyhow::Error::from)?;
     }
@@ -2050,7 +2847,7 @@ fn objstore_catalog_sink(
     _compression: Compression,
     _append: bool,
     _partition_by: &[String],
-    _merge_on: &[String],
+    _merge: MergeOn<'_>,
     _run_id: Option<&str>,
 ) -> Result<Box<dyn Sink + Send>> {
     // The URI is not repeated: it may carry credentials, which are refused only when used.
@@ -2058,6 +2855,17 @@ fn objstore_catalog_sink(
         "committing {} through a REST catalog needs a build with `--features object_store`",
         catalog.spec.table
     )
+}
+
+/// What a table sink merges on: the key, and how a change feed's changes are ordered
+/// (`changes.order_by`; empty for arrival order, or a plain merge).
+// Read only where an object store can be written: a build with `object_store`.
+#[cfg_attr(not(feature = "object_store"), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct MergeOn<'a> {
+    keys: &'a [String],
+    order_by: &'a [String],
+    retention_ms: i64,
 }
 
 /// A REST catalog as this run reaches it: the spec's `output.catalog` (or --catalog), and
@@ -2079,6 +2887,341 @@ impl CatalogTarget<'_> {
             self.insecure,
         )
     }
+}
+
+/// An endpoint as messages and default dataset names show it: no query, no user info.
+fn endpoint_name(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
+    match no_query.split_once("://") {
+        Some((scheme, rest)) => {
+            // User info is in the authority only; a path may hold an `@` (`/users/@me`).
+            let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            if path.is_empty() && !rest.contains('/') {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}/{path}")
+            }
+        }
+        None => no_query.to_string(),
+    }
+}
+
+/// An endpoint being read: the source, its records until the run takes them, and the
+/// position it started from.
+struct Pulled {
+    source: Box<dyn shapeshift_core::Source>,
+    records: Option<RecordSource>,
+    start: Option<shapeshift_core::Position>,
+}
+
+/// What a pull did: its kind, where it started, what it commits, and its counts.
+type PullReport = (
+    &'static str,
+    Option<shapeshift_core::Position>,
+    Option<shapeshift_core::Position>,
+    shapeshift_core::Progress,
+);
+
+fn pull_json((kind, start, end, p): &PullReport) -> Value {
+    serde_json::json!({
+        "kind": kind,
+        "from": start.as_ref().map(|s| s.to_json()),
+        "position": end.as_ref().map(|e| e.to_json()),
+        "new": p.new,
+        "replayed": p.replayed,
+        "already_read": p.skipped,
+        "bounded": p.bounded,
+    })
+}
+
+fn print_pull((kind, start, end, p): &PullReport) {
+    let at = |x: &Option<shapeshift_core::Position>| {
+        x.as_ref()
+            .map_or("none".to_string(), |x| x.to_json().to_string())
+    };
+    // A source read whole has no position to show.
+    let position = if start.is_none() && end.is_none() {
+        String::new()
+    } else {
+        format!("; position {} → {}", at(start), at(end))
+    };
+    println!(
+        "  source {kind}: {} new, {} re-read, {} already read{position}{}",
+        p.new,
+        p.replayed,
+        p.skipped,
+        if p.bounded {
+            " (stopped at a bound: the next run goes on from there)"
+        } else if start.is_some() && p.new == 0 {
+            " (nothing new)"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Whether a source is pulled (an endpoint, a database) rather than read from a file.
+fn is_pulled(s: &SourceSpec) -> bool {
+    s.http.is_some() || s.mysql.is_some() || s.postgres.is_some()
+}
+
+/// What a run allows its pulled source beyond the spec: credentials over plain http or a
+/// database without TLS (`--insecure-source`), and the only hosts it may reach
+/// (`--source-hosts`; empty: any).
+struct SourceAccess {
+    insecure: bool,
+    // Read by the sources, which a build without them does not have.
+    #[cfg_attr(
+        not(any(feature = "http", feature = "mysql", feature = "postgres")),
+        allow(dead_code)
+    )]
+    hosts: Vec<String>,
+}
+
+/// The pulled source the spec names, if any, opened from the table's recorded position.
+fn open_pulled(
+    spec: &DatasetSpec,
+    bounds: &shapeshift_core::Bounds,
+    access: &SourceAccess,
+    insecure_catalog: bool,
+) -> Result<Option<Pulled>> {
+    if access.insecure {
+        eprintln!(
+            "warning: --insecure-source: the source's credentials may go over the network \
+             unencrypted"
+        );
+    }
+    if let Some(h) = &spec.source.http {
+        return open_endpoint(spec, h, bounds, access, insecure_catalog).map(Some);
+    }
+    if let Some(m) = &spec.source.mysql {
+        return open_database(spec, m, bounds, access, insecure_catalog).map(Some);
+    }
+    if let Some(p) = &spec.source.postgres {
+        return open_postgres(spec, p, bounds, access, insecure_catalog).map(Some);
+    }
+    Ok(None)
+}
+
+/// Read the table's position for `source`, and open it from there.
+#[cfg(any(feature = "http", feature = "mysql", feature = "postgres"))]
+fn open_from_position(
+    spec: &DatasetSpec,
+    mut source: Box<dyn shapeshift_core::Source>,
+    incremental: bool,
+    bounds: &shapeshift_core::Bounds,
+    insecure_catalog: bool,
+) -> Result<Pulled> {
+    let recorded = match incremental {
+        true => source_position(spec, insecure_catalog, source.kind())?,
+        false => None,
+    };
+    // A position is a position in one source: another one's would skip or repeat rows.
+    let start =
+        shapeshift_core::resume_from(recorded, source.as_ref()).map_err(anyhow::Error::from)?;
+    let records = source
+        .open(start.clone(), bounds.clone())
+        .map_err(anyhow::Error::from)?;
+    let records: RecordSource = Box::new(
+        records.map(|r| r.map_err(|e| JsonError::Io(std::io::Error::other(e.to_string())))),
+    );
+    Ok(Pulled {
+        source,
+        records: Some(records),
+        start,
+    })
+}
+
+/// Open the database at the table's position.
+#[cfg(feature = "mysql")]
+fn open_database(
+    spec: &DatasetSpec,
+    mysql: &shapeshift_core::MysqlSourceSpec,
+    bounds: &shapeshift_core::Bounds,
+    access: &SourceAccess,
+    insecure_catalog: bool,
+) -> Result<Pulled> {
+    let source = shapeshift_source_mysql::MysqlSource::new(
+        mysql,
+        shapeshift_source_mysql::MysqlOptions {
+            insecure: access.insecure,
+            hosts: access.hosts.clone(),
+        },
+    )
+    .map_err(anyhow::Error::from)?;
+    open_from_position(
+        spec,
+        Box::new(source),
+        mysql.incremental(),
+        bounds,
+        insecure_catalog,
+    )
+}
+
+/// Open the Postgres database at the table's position.
+#[cfg(feature = "postgres")]
+fn open_postgres(
+    spec: &DatasetSpec,
+    pg: &shapeshift_core::PostgresSourceSpec,
+    bounds: &shapeshift_core::Bounds,
+    access: &SourceAccess,
+    insecure_catalog: bool,
+) -> Result<Pulled> {
+    let source = shapeshift_source_postgres::PostgresSource::new(
+        pg,
+        shapeshift_source_postgres::PostgresOptions {
+            insecure: access.insecure,
+            hosts: access.hosts.clone(),
+        },
+    )
+    .map_err(anyhow::Error::from)?;
+    open_from_position(
+        spec,
+        Box::new(source),
+        pg.incremental(),
+        bounds,
+        insecure_catalog,
+    )
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres(
+    _spec: &DatasetSpec,
+    pg: &shapeshift_core::PostgresSourceSpec,
+    _bounds: &shapeshift_core::Bounds,
+    _access: &SourceAccess,
+    _insecure_catalog: bool,
+) -> Result<Pulled> {
+    bail!(
+        "reading a Postgres database ({}) needs a build with `--features postgres` (kept out \
+         of the default binary so it links no database client)",
+        endpoint_name(&pg.url)
+    )
+}
+
+#[cfg(not(feature = "mysql"))]
+fn open_database(
+    _spec: &DatasetSpec,
+    mysql: &shapeshift_core::MysqlSourceSpec,
+    _bounds: &shapeshift_core::Bounds,
+    _access: &SourceAccess,
+    _insecure_catalog: bool,
+) -> Result<Pulled> {
+    bail!(
+        "reading a database ({}) needs a build with `--features mysql` (kept out of the \
+         default binary so it links no database client)",
+        endpoint_name(&mysql.url)
+    )
+}
+
+/// Open the endpoint at the table's position.
+#[cfg(feature = "http")]
+fn open_endpoint(
+    spec: &DatasetSpec,
+    http: &shapeshift_core::HttpSourceSpec,
+    bounds: &shapeshift_core::Bounds,
+    access: &SourceAccess,
+    insecure_catalog: bool,
+) -> Result<Pulled> {
+    let source = shapeshift_source_http::HttpSource::new(
+        http,
+        spec.source.csv.clone(),
+        spec.source.xml.clone(),
+        shapeshift_source_http::HttpOptions {
+            insecure: access.insecure,
+            backoff: None,
+            hosts: access.hosts.clone(),
+        },
+    )
+    .map_err(anyhow::Error::from)?;
+    open_from_position(
+        spec,
+        Box::new(source),
+        http.incremental.is_some(),
+        bounds,
+        insecure_catalog,
+    )
+}
+
+#[cfg(not(feature = "http"))]
+fn open_endpoint(
+    _spec: &DatasetSpec,
+    http: &shapeshift_core::HttpSourceSpec,
+    _bounds: &shapeshift_core::Bounds,
+    _access: &SourceAccess,
+    _insecure_catalog: bool,
+) -> Result<Pulled> {
+    bail!(
+        "reading an endpoint ({}) needs a build with `--features http` (kept out of the \
+         default binary so it links no HTTP client)",
+        endpoint_name(&http.url)
+    )
+}
+
+/// The position the table records for a `kind` source, wherever the table is.
+#[cfg_attr(
+    not(any(feature = "http", feature = "mysql", feature = "postgres")),
+    allow(dead_code)
+)]
+fn source_position(
+    spec: &DatasetSpec,
+    insecure_catalog: bool,
+    kind: &str,
+) -> Result<Option<Value>> {
+    if let Some(cat) = &spec.output.catalog {
+        let target = CatalogTarget {
+            spec: cat,
+            insecure: insecure_catalog,
+        };
+        return objstore_source_position_in_catalog(target, kind);
+    }
+    if looks_like_url(&spec.output.path) {
+        return objstore_source_position(&spec.output.path, kind);
+    }
+    shapeshift_iceberg::source_position_local(&spec.output.path, kind).map_err(anyhow::Error::from)
+}
+
+#[cfg(feature = "object_store")]
+fn objstore_source_position(url: &str, kind: &str) -> Result<Option<Value>> {
+    shapeshift_objstore::source_position(url, kind).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+#[cfg_attr(
+    not(any(feature = "http", feature = "mysql", feature = "postgres")),
+    allow(dead_code)
+)]
+fn objstore_source_position(url: &str, _kind: &str) -> Result<Option<Value>> {
+    bail!(
+        "object-store Iceberg output ({url}) needs a build with `--features object_store` \
+         (kept out of the default musl-static binary so it never links the cloud SDKs)"
+    )
+}
+
+#[cfg(feature = "object_store")]
+fn objstore_source_position_in_catalog(
+    catalog: CatalogTarget<'_>,
+    kind: &str,
+) -> Result<Option<Value>> {
+    let conn = catalog.connection()?;
+    shapeshift_objstore::source_position_in_catalog(&conn, &catalog.spec.table, kind)
+        .map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "object_store"))]
+#[cfg_attr(
+    not(any(feature = "http", feature = "mysql", feature = "postgres")),
+    allow(dead_code)
+)]
+fn objstore_source_position_in_catalog(
+    catalog: CatalogTarget<'_>,
+    _kind: &str,
+) -> Result<Option<Value>> {
+    bail!(
+        "a REST catalog ({}) needs a build with `--features object_store`",
+        catalog.spec.uri
+    )
 }
 
 /// The snapshot run `run_id` already committed to the spec's Iceberg output, if any: a
@@ -2365,8 +3508,10 @@ fn cmd_compact(a: CompactArgs) -> Result<()> {
         }
         shapeshift_iceberg::compact_table(&dir, &options).map_err(anyhow::Error::from)?
     };
+    let doc = compact_json(&a, &s);
+    report_summary(&doc);
     if a.summary_json {
-        println!("{}", compact_json(&a, &s));
+        println!("{doc}");
     } else {
         print_compact(&a.table, &s);
     }
@@ -2470,8 +3615,10 @@ fn cmd_expire(a: ExpireArgs) -> Result<()> {
         }
         shapeshift_iceberg::expire_table(&dir, &options).map_err(anyhow::Error::from)?
     };
+    let doc = expire_json(&a, &s);
+    report_summary(&doc);
     if a.summary_json {
-        println!("{}", expire_json(&a, &s));
+        println!("{doc}");
     } else {
         print_expire(&a, &s);
     }
@@ -2539,8 +3686,10 @@ fn cmd_relocate(a: RelocateArgs) -> Result<()> {
         ),
         _ => None,
     };
+    let doc = relocate_json(&a, &s, registered);
+    report_summary(&doc);
     if a.summary_json {
-        println!("{}", relocate_json(&a, &s, registered));
+        println!("{doc}");
     } else {
         print_relocate(&a, &s, registered);
     }
@@ -2731,6 +3880,7 @@ fn expire_json(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) -> Value {
             "delete_files": s.delete_files_deleted,
             "manifests": s.manifests_deleted,
             "manifest_lists": s.manifest_lists_deleted,
+            "statistics_files": s.statistics_files_deleted,
             "bytes": s.bytes_deleted,
         },
         "files_outside_table": s.files_outside_table,
@@ -2774,6 +3924,12 @@ fn print_expire(a: &ExpireArgs, s: &shapeshift_iceberg::ExpireSummary) {
         s.manifest_lists_deleted,
         human_bytes(s.bytes_deleted)
     );
+    if s.statistics_files_deleted > 0 {
+        println!(
+            "  {delete} {} tombstone file(s) only expired snapshots named",
+            s.statistics_files_deleted
+        );
+    }
     if s.files_outside_table > 0 {
         println!(
             "  left {} file(s) in place: their paths are outside the table's location",
@@ -2802,11 +3958,109 @@ fn human_duration(ms: i64) -> String {
     format!("{}s", ms / 1000)
 }
 
+/// `shapeshift convert`: the input's records as JSON Lines.
+///
+/// A record that does not parse stops the run, naming its line, unless `--skip-bad`; an
+/// I/O error always does. Written to a file, the output appears only when the whole input
+/// has been read (a temporary file renamed into place), so a failed run leaves nothing
+/// half-written behind.
+fn cmd_convert(a: ConvertArgs) -> Result<()> {
+    let source = a.source.spec(a.format.into(), None)?;
+    // What a parse error's number counts, in this format.
+    let unit = match source.format {
+        SourceFormat::Jsonl | SourceFormat::Csv | SourceFormat::Tsv => "line",
+        SourceFormat::JsonArray => "element",
+        SourceFormat::Xml => "record",
+    };
+    let records = open_source(&a.input, &source)
+        .map_err(|e| anyhow!("opening {}: {e}", display_input(&a.input)))?;
+    let dest = a.output.as_ref().filter(|p| p.as_os_str() != "-");
+    let (mut out, tmp): (Box<dyn Write>, Option<PathBuf>) = match dest {
+        None => (
+            Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+            None,
+        ),
+        Some(p) => {
+            let name = p
+                .file_name()
+                .ok_or_else(|| anyhow!("--output {} names no file", p.display()))?;
+            let mut tmp_name = std::ffi::OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(format!(".{}.tmp", std::process::id()));
+            let tmp = p.with_file_name(tmp_name);
+            // A new file only: never write through something already at that name.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            (Box::new(std::io::BufWriter::new(file)), Some(tmp))
+        }
+    };
+    let result = (|| -> Result<(u64, u64)> {
+        let (mut written, mut skipped) = (0u64, 0u64);
+        for item in records {
+            if a.limit.is_some_and(|l| written >= l) {
+                break;
+            }
+            match item {
+                Ok(v) => {
+                    serde_json::to_writer(&mut out, &v)?;
+                    out.write_all(b"\n")?;
+                    written += 1;
+                }
+                Err(JsonError::Parse { line, message, .. }) if a.skip_bad => {
+                    eprintln!(
+                        "skipped: {}: {unit} {line}: {message}",
+                        display_input(&a.input)
+                    );
+                    skipped += 1;
+                }
+                Err(JsonError::Parse { line, message, .. }) => bail!(
+                    "{}: {unit} {line}: {message} (--skip-bad leaves such records out)",
+                    display_input(&a.input)
+                ),
+                Err(e) => bail!("reading {}: {e}", display_input(&a.input)),
+            }
+        }
+        out.flush()?;
+        Ok((written, skipped))
+    })();
+    drop(out);
+    let (written, skipped) = match result {
+        Ok(counts) => counts,
+        Err(e) => {
+            if let Some(tmp) = tmp {
+                let _ = std::fs::remove_file(tmp);
+            }
+            return Err(e);
+        }
+    };
+    if let (Some(tmp), Some(dest)) = (tmp, dest) {
+        if let Err(e) = std::fs::rename(&tmp, dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("moving the output into {}", dest.display()));
+        }
+    }
+    eprintln!(
+        "converted {written} record{} from {}{}",
+        if written == 1 { "" } else { "s" },
+        display_input(&a.input),
+        if skipped > 0 {
+            format!(", left out {skipped} that did not parse")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
 fn cmd_cost(a: CostArgs) -> Result<()> {
     let rows = match (a.rows, &a.input) {
         (Some(r), _) => r,
         (None, Some(input)) => {
-            let reader = open_reader(input, a.format.into()).map_err(|e| anyhow!("{e}"))?;
+            let source = a.source.spec(a.format.into(), None)?;
+            let reader = open_source(input, &source).map_err(|e| anyhow!("{e}"))?;
             let mut n = 0u64;
             // Skip malformed lines, but never price from a truncated/failed read.
             for item in reader {
@@ -2834,8 +4088,55 @@ fn cmd_cost(a: CostArgs) -> Result<()> {
     );
     println!("self-host:  ${:.2}", report.self_host_cost);
     match report.saved_fraction {
-        Some(frac) => println!("saved:      ${:.2}  ({:.1}%)", report.saved, frac * 100.0),
-        None => println!("saved:      ${:.2}", report.saved),
+        Some(frac) => println!(
+            "saved:      ${}  ({:.1}%)",
+            cents(report.saved),
+            frac * 100.0
+        ),
+        None => println!("saved:      ${}", cents(report.saved)),
     }
     Ok(())
+}
+
+/// Dollars to two places, with no sign on an amount that rounds to zero (`-0.004` is `0.00`,
+/// not `-0.00`); a loss of a cent or more keeps its minus (`-2.00`).
+fn cents(dollars: f64) -> String {
+    let s = format!("{dollars:.2}");
+    if s == "-0.00" {
+        "0.00".into()
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod endpoint_name_tests {
+    #[test]
+    fn user_info_and_query_are_dropped_and_a_path_keeps_its_at() {
+        let n = super::endpoint_name;
+        assert_eq!(
+            n("https://api.example.com/users/@me?key=1"),
+            "https://api.example.com/users/@me"
+        );
+        assert_eq!(
+            n("https://u:p@api.example.com/v1#x"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(n("https://api.example.com"), "https://api.example.com");
+    }
+}
+
+#[cfg(test)]
+mod cents_tests {
+    use super::cents;
+
+    #[test]
+    fn a_loss_under_a_cent_has_no_minus_and_a_real_one_keeps_it() {
+        assert_eq!(cents(-0.004), "0.00");
+        assert_eq!(cents(-0.0), "0.00");
+        assert_eq!(cents(0.0), "0.00");
+        assert_eq!(cents(-2.0), "-2.00");
+        assert_eq!(cents(29998.0), "29998.00");
+        assert_eq!(cents(-0.005001), "-0.01");
+    }
 }

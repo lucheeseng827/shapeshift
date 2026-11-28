@@ -400,3 +400,11 @@ a.lnk { color: var(--eg-brand); cursor: pointer; text-decoration: underline; tex
   .topbar { padding: 12px 16px; flex-wrap: wrap; }
   .content { padding: 16px 16px 48px; }
 }
+
+/* Overview and datasets */
+.ov-stats { grid-template-columns: repeat(6, 1fr); }
+@media (max-width: 1100px) { .ov-stats { grid-template-columns: repeat(3, 1fr); } }
+.t2 { color: var(--eg-muted); font-size: 11px; }
+pre.codeline { white-space: pre; overflow-x: auto; margin: 0; }
+.tb.attn .n { display: flex; gap: 8px; align-items: center; }
+.card-head .hint .btn + .btn { margin-left: 6px; }

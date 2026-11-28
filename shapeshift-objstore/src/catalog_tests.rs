@@ -90,6 +90,10 @@ struct State {
     token_requests: Vec<String>,
     /// The connection the tests' writes use (`StandIn::conn`): no credentials unless set.
     client: Option<CatalogConnection>,
+    /// How a listing with `?parent=` is answered, when not normally.
+    child_status: Option<u16>,
+    /// Table listings hand back the page token they were given, forever.
+    repeat_token: bool,
 }
 
 /// What the stand-in asks of a request's credentials.
@@ -316,6 +320,61 @@ fn serve(conn: TcpStream, state: &Mutex<State>) {
                 (Some(_), Some(_)) => (404, error("NoSuchWarehouseException", 404)),
             }
         }
+        // Listings answer one item a page, so every page is followed.
+        ("GET", ["v1", "p1", "namespaces"]) => {
+            let st = state.lock().unwrap();
+            let param = |k: &str| {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+                    .map(decode)
+            };
+            let parent = param("parent");
+            if let (Some(_), Some(code)) = (&parent, st.child_status) {
+                return respond(conn, code, &error("ServiceFailureException", code));
+            }
+            let mut found: Vec<&String> = st
+                .namespaces
+                .iter()
+                .filter(|n| match &parent {
+                    None => !n.contains('\u{1f}'),
+                    Some(p) => n
+                        .strip_prefix(&format!("{p}\u{1f}"))
+                        .is_some_and(|rest| !rest.contains('\u{1f}')),
+                })
+                .collect();
+            found.sort();
+            page(&found, param("pageToken"), "namespaces", |n| {
+                json!(n.split('\u{1f}').collect::<Vec<_>>())
+            })
+        }
+        ("GET", ["v1", "p1", "namespaces", ns, "tables"]) => {
+            let st = state.lock().unwrap();
+            if st.repeat_token {
+                return respond(
+                    conn,
+                    200,
+                    &json!({ "identifiers": [], "next-page-token": "same" }),
+                );
+            }
+            let mut found: Vec<&String> = st
+                .tables
+                .keys()
+                .filter(|(n, _)| n == ns)
+                .map(|(_, name)| name)
+                .collect();
+            found.sort();
+            let token = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("pageToken="))
+                .map(decode);
+            page(
+                &found,
+                token,
+                "identifiers",
+                |name| json!({ "namespace": ns.split('\u{1f}').collect::<Vec<_>>(), "name": name }),
+            )
+        }
         ("GET", ["v1", "p1", "namespaces", ns, "tables", name]) => {
             let st = state.lock().unwrap();
             let key = (ns.to_string(), name.to_string());
@@ -424,6 +483,21 @@ fn serve(conn: TcpStream, state: &Mutex<State>) {
         _ => (404, error("NotFound", 404)),
     };
     respond(conn, code, &answer)
+}
+
+/// One item of `items` a page: the page `token` names (from 0), and the next page's token.
+fn page<T>(
+    items: &[T],
+    token: Option<String>,
+    key: &str,
+    item: impl Fn(&T) -> Value,
+) -> (u16, Value) {
+    let at: usize = token.and_then(|t| t.parse().ok()).unwrap_or(0);
+    let mut answer = json!({ key: items.get(at).map(&item).into_iter().collect::<Vec<_>>() });
+    if at + 1 < items.len() {
+        answer["next-page-token"] = json!((at + 1).to_string());
+    }
+    (200, answer)
 }
 
 fn respond(conn: TcpStream, code: u16, answer: &Value) {
@@ -634,6 +708,24 @@ fn commit(state: &Mutex<State>, key: &(String, String), body: &Value) -> (u16, V
                     .retain(|_, r| !gone(r));
                 if let Some(log) = next["snapshot-log"].as_array_mut() {
                     log.retain(|e| !gone(e));
+                }
+            }
+            // As the Java catalog applies them: one statistics file per snapshot, replaced by a
+            // newer one for the same snapshot, and removed by snapshot id.
+            "set-statistics" => {
+                let id = u["snapshot-id"].clone();
+                assert_eq!(u["statistics"]["snapshot-id"], id);
+                if !next["statistics"].is_array() {
+                    next["statistics"] = json!([]);
+                }
+                let list = next["statistics"].as_array_mut().unwrap();
+                list.retain(|e| e["snapshot-id"] != id);
+                list.push(u["statistics"].clone());
+            }
+            "remove-statistics" => {
+                let id = u["snapshot-id"].clone();
+                if let Some(list) = next["statistics"].as_array_mut() {
+                    list.retain(|e| e["snapshot-id"] != id);
                 }
             }
             other => panic!("update {other} not expected"),
@@ -1382,6 +1474,46 @@ fn a_write_without_append_that_another_writer_beat_is_not_rebuilt_onto_their_row
         files(&dir),
         before,
         "none of the second write's files were left"
+    );
+    std::fs::remove_dir_all(&wh).ok();
+}
+
+#[test]
+fn a_write_with_a_source_position_is_committed_with_it_and_never_rebased() {
+    let wh = tmp("source-position");
+    let cat = StandIn::start(&wh, &["lake"]);
+    // Committed with the rows, and read back through the catalog.
+    let mut sink = open_with(&cat, "lake.t", false, 0..10, false, None, QUICK).unwrap();
+    sink.set_source_position("http", &serde_json::json!({"at": 7}))
+        .unwrap();
+    sink.finish().unwrap();
+    assert_eq!(
+        crate::source_position_in_catalog(&cat.conn(), "lake.t", "http").unwrap(),
+        Some(serde_json::json!({"at": 7}))
+    );
+    // An append another writer beat is rebuilt onto their head, unless it carries a
+    // position: theirs may be later, and this one would take it back.
+    let dir = table_dir(&cat, "lake", "t");
+    let before = files(&dir);
+    let head = main_snapshot(&cat.table("lake", "t"));
+    cat.fault_next_commit(Fault::Refuse);
+    let mut sink = open_with(&cat, "lake.t", true, 10..15, false, None, QUICK).unwrap();
+    sink.set_source_position("http", &serde_json::json!({"at": 9}))
+        .unwrap();
+    let err = sink.finish().unwrap_err();
+    assert!(matches!(err, ShapeError::Conflict(_)), "{err}");
+    assert!(err.to_string().contains("run it again"), "{err}");
+    let meta = cat.table("lake", "t");
+    assert_eq!(main_snapshot(&meta), head);
+    assert_eq!(live_rows(&meta), 10);
+    assert_eq!(
+        files(&dir),
+        before,
+        "none of the refused write's files were left"
+    );
+    assert_eq!(
+        crate::source_position_in_catalog(&cat.conn(), "lake.t", "http").unwrap(),
+        Some(serde_json::json!({"at": 7}))
     );
     std::fs::remove_dir_all(&wh).ok();
 }
@@ -2435,4 +2567,193 @@ fn a_local_table_registered_by_its_path_takes_writes_through_the_catalog() {
         .to_string();
     assert!(list.starts_with(&format!("{here}/")), "{list}");
     assert!(std::path::Path::new(&list).exists(), "{list}");
+}
+
+#[test]
+fn browsing_a_catalog_lists_every_namespace_and_table_across_pages() {
+    let cat = StandIn::start(&tmp("browse"), &["a", "b", "a.c"]);
+    {
+        let mut st = cat.state.lock().unwrap();
+        for (ns, name) in [
+            ("a", "t2"),
+            ("a", "t1"),
+            ("a\u{1f}c", "deep"),
+            ("b", "only"),
+        ] {
+            st.tables.insert(
+                (ns.to_string(), name.to_string()),
+                json!({ "format-version": 2, "location": format!("file:/x/{name}") }),
+            );
+        }
+    }
+    let listed = browse_catalog(&cat.conn()).unwrap();
+    assert!(!listed.truncated);
+    let got = listed.namespaces;
+    let flat: Vec<(String, Vec<String>)> = got
+        .iter()
+        .map(|n| (n.levels.join("."), n.tables.clone()))
+        .collect();
+    assert_eq!(
+        flat,
+        vec![
+            ("a".to_string(), vec!["t1".to_string(), "t2".to_string()]),
+            ("b".to_string(), vec!["only".to_string()]),
+            ("a.c".to_string(), vec!["deep".to_string()]),
+        ]
+    );
+    assert!(got.iter().all(|n| n.error.is_none()));
+    // Read-only: nothing but GETs went to the catalog.
+    assert!(cat
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|(m, _, _)| m == "GET"));
+
+    let (_, meta) =
+        catalog_table_metadata(&cat.conn(), &["a".to_string(), "c".to_string()], "deep")
+            .unwrap()
+            .unwrap();
+    assert_eq!(meta["location"], "file:/x/deep");
+    assert!(
+        catalog_table_metadata(&cat.conn(), &["a".to_string()], "nope")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_child_listing_is_skipped_only_when_unsupported_and_a_repeating_token_stops() {
+    let cat = StandIn::start(&tmp("browse-faults"), &["a", "b", "a.c"]);
+    // A catalog without nested namespaces refuses `parent` as a bad request: no children.
+    cat.state.lock().unwrap().child_status = Some(400);
+    let got = browse_catalog(&cat.conn()).unwrap();
+    let names: Vec<String> = got.namespaces.iter().map(|n| n.levels.join(".")).collect();
+    assert_eq!(names, vec!["a", "b"]);
+    assert!(!got.truncated);
+    // A server error is not "no children": the browse fails rather than show a shorter tree.
+    cat.state.lock().unwrap().child_status = Some(500);
+    let err = browse_catalog(&cat.conn()).unwrap_err().to_string();
+    assert!(err.contains("refused listing namespaces"), "{err}");
+    // A catalog that hands back the token it was given would never end: that namespace says so.
+    {
+        let mut st = cat.state.lock().unwrap();
+        st.child_status = None;
+        st.repeat_token = true;
+    }
+    let got = browse_catalog(&cat.conn()).unwrap();
+    let e = got.namespaces[0].error.clone().unwrap_or_default();
+    assert!(e.contains("page token it was given"), "{e}");
+}
+
+/// A change feed's batch, as the shaper makes one: `(id, region, v, delete?)`.
+fn change_batch(rows: &[(i64, &str, i64, bool)]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("v", DataType::Int64, true),
+        Field::new(shapeshift_core::CHANGE_COLUMN, DataType::UInt8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            )),
+            Arc::new(arrow_array::UInt8Array::from(
+                rows.iter().map(|r| r.3 as u8).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn apply_changes(cat: &StandIn, table: &str, rows: &[(i64, &str, i64, bool)]) -> SinkSummary {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let mut sink = ObjectStoreIcebergSink::open_in_catalog(
+        &cat.conn(),
+        table,
+        schema,
+        Compression::Snappy,
+        true,
+        &["region".to_string()],
+        &["id".to_string()],
+        QUICK,
+    )
+    .unwrap();
+    sink.order_changes_by(&["v".to_string()], 7 * 86_400_000)
+        .unwrap();
+    sink.write_batch(&change_batch(rows)).unwrap();
+    sink.finish().unwrap()
+}
+
+#[test]
+fn tombstones_commit_through_the_catalog_and_go_with_the_snapshots_that_named_them() {
+    let wh = tmp("tombstones");
+    let cat = StandIn::start(&wh, &["lake"]);
+    apply_changes(&cat, "lake.t", &[(1, "eu", 1, false), (2, "us", 1, false)]);
+    // A delete: remembered, and named by the snapshot and the catalog's statistics.
+    let s = apply_changes(&cat, "lake.t", &[(2, "us", 5, true)]);
+    assert_eq!(s.merge.as_ref().unwrap().tombstones_written, 1);
+    let commit = cat.commits().pop().unwrap();
+    let set = commit["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["action"] == "set-statistics")
+        .count();
+    assert_eq!(set, 1, "{commit}");
+    let meta = cat.table("lake", "t");
+    let head = main_snapshot(&meta).unwrap();
+    let tomb = shapeshift_iceberg::table_tombstones(&meta)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tomb.count, 1);
+    let stats = meta["statistics"].as_array().unwrap();
+    assert!(stats
+        .iter()
+        .any(|e| e["snapshot-id"] == head
+            && e["statistics-path"].as_str().unwrap().ends_with(&tomb.key)));
+    // An update older than the delete, arriving later: stale, and the key stays deleted.
+    let s = apply_changes(&cat, "lake.t", &[(2, "us", 3, false)]);
+    assert_eq!(s.merge.as_ref().unwrap().changes_stale, 1);
+    assert_eq!(table_rows(&cat.table("lake", "t")), rows(&[(1, "eu", 1)]));
+    // Expire all but the newest: the expired snapshots' statistics go with them, and the
+    // newest still names the tombstones, so the file stays.
+    let all = ExpireOptions {
+        older_than_ms: snapshot_timestamp_ms() + 60_000,
+        retain_last: 1,
+        dry_run: false,
+    };
+    expire_through_catalog(&cat.conn(), "lake.t", &all, QUICK).unwrap();
+    let body = cat.commits().pop().unwrap();
+    assert!(
+        body["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["action"] == "remove-statistics"),
+        "{body}"
+    );
+    let meta = cat.table("lake", "t");
+    assert_eq!(meta["statistics"].as_array().unwrap().len(), 1);
+    let dir = table_dir(&cat, "lake", "t");
+    assert!(
+        dir.join(&tomb.key).exists(),
+        "the newest snapshot still names it"
+    );
+    // And the next late change is still stale after the expiry.
+    let s = apply_changes(&cat, "lake.t", &[(2, "us", 4, false)]);
+    assert_eq!(s.merge.as_ref().unwrap().changes_stale, 1);
 }

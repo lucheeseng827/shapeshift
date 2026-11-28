@@ -7,3 +7,9 @@ boto3==1.43.119
 # Only for verify_foreign.py: the other engine whose tables shapeshift writes into.
 pyiceberg[sql-sqlite,pyarrow]==0.12.0
 pyarrow==26.0.1
+# Only for examples/mysql/verify_duckdb.py: sets up and reads back the MySQL tables.
+pymysql==1.1.1
+# What pymysql needs for MySQL 8's caching_sha2_password over a plain (loopback) connection.
+cryptography==50.0.2
+# Only for examples/postgres/verify_duckdb.py.
+psycopg[binary]==3.2.3

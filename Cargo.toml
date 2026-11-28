@@ -7,6 +7,10 @@ members = [
     "shapeshift-iceberg",
     "shapeshift-objstore",
     "shapeshift-serve",
+    "shapeshift-source-http",
+    "shapeshift-source-mysql",
+    "shapeshift-source-postgres",
+    "shapeshift-mcp",
     "shapeshift-cli",
 ]
 
@@ -17,7 +21,7 @@ members = [
 # parquet / simd-json / avro stack resolves independently of the shared workspace.
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0-rc.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/shapeshift"
@@ -31,6 +35,10 @@ shapeshift-parquet = { path = "shapeshift-parquet" }
 shapeshift-iceberg = { path = "shapeshift-iceberg" }
 shapeshift-objstore = { path = "shapeshift-objstore" }
 shapeshift-serve = { path = "shapeshift-serve" }
+shapeshift-mcp = { path = "shapeshift-mcp" }
+shapeshift-source-http = { path = "shapeshift-source-http" }
+shapeshift-source-mysql = { path = "shapeshift-source-mysql" }
+shapeshift-source-postgres = { path = "shapeshift-source-postgres" }
 
 # external — pinned conservatively; this workspace owns its own lock.
 serde = { version = "1", features = ["derive"] }
@@ -48,6 +56,10 @@ simd-json = "0.14"
 # SIMD byte search, already linked through serde_json: the readers count a long record's
 # brackets with it, whatever opt-level the release build uses.
 memchr = "2"
+# CSV/TSV and XML sources (0.6): RFC 4180 quoting from the csv crate, and a streaming XML
+# pull parser with no default features (no encoding tables, no serde).
+csv = "1"
+quick-xml = "0.40"
 # Columnar core. arrow 54 to match the proven musl-static Snappy build
 # (parquet default-features=false + snap avoids the zstd/brotli C codecs). The
 # arrow-array/arrow-schema major MUST match parquet's arrow-rs major.

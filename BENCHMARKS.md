@@ -258,7 +258,15 @@ yours; the harness exists so you never have to extrapolate.
 
 **Machine:** Intel Xeon @ 2.80 GHz (4 cores), 15.7 GiB RAM · rustc 1.94.1 · release build.
 **Binary:** the shipped **musl-static** lean binary (`--target x86_64-unknown-linux-musl`,
-~4.0 MB, stripped).
+~4.0 MB, stripped, when these runs were made).
+
+**Its size since.** Built the same way with rustc 1.100.0 (release profile, stripped,
+`static-pie`, no dynamic library): **0.5.0 is 5,433,992 bytes (5.18 MiB)** and **0.6 is
+6,318,792 bytes (6.03 MiB)** (main on 28 Nov 2026), +16%. 0.6 adds to the lean binary the CSV,
+TSV and XML readers, `convert`, change feeds (`changes:`, tombstones), `--metrics-file` and
+`shapeshift mcp` (stdio JSON-RPC, no new dependency). Its pulled sources (`http`, `mysql`,
+`postgres`), the console (`serve`), object storage and zstd stay behind off-by-default features:
+the lean binary links no network client and no database driver.
 
 | bench | rows | input | wall | rows/s | input MB/s | peak RSS |
 |---|---|---|---|---|---|---|

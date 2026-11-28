@@ -212,6 +212,17 @@ pub fn catalog_commit(art: &MetadataArtifacts, loaded: &Value) -> Result<Catalog
         updates.push(json!({ "action": "set-current-schema", "schema-id": -1 }));
     }
     updates.push(json!({ "action": "add-snapshot", "snapshot": snapshot }));
+    // The statistics files this snapshot names (its tombstones), so the catalog's copy of
+    // the table keeps them reachable as a table directory's does.
+    for entry in built["statistics"].as_array().into_iter().flatten() {
+        if entry["snapshot-id"] == art.snapshot_id {
+            updates.push(json!({
+                "action": "set-statistics",
+                "snapshot-id": art.snapshot_id,
+                "statistics": entry,
+            }));
+        }
+    }
     updates.push(json!({
         "action": "set-snapshot-ref",
         "ref-name": "main",
@@ -262,10 +273,26 @@ pub fn expiry_commit(loaded: &Value, snapshots: &[i64]) -> Result<CatalogCommit>
             }));
         }
     }
+    // A statistics entry names one snapshot: those of the expired snapshots go with them,
+    // as a table directory's expiry drops them.
+    let mut updates = vec![json!({ "action": "remove-snapshots", "snapshot-ids": snapshots })];
+    for (list, action) in [
+        ("statistics", "remove-statistics"),
+        ("partition-statistics", "remove-partition-statistics"),
+    ] {
+        for entry in loaded[list].as_array().into_iter().flatten() {
+            if let Some(id) = entry["snapshot-id"]
+                .as_i64()
+                .filter(|id| snapshots.contains(id))
+            {
+                updates.push(json!({ "action": action, "snapshot-id": id }));
+            }
+        }
+    }
     Ok(CatalogCommit {
         body: json!({
             "requirements": requirements,
-            "updates": [{ "action": "remove-snapshots", "snapshot-ids": snapshots }],
+            "updates": updates,
         }),
         effect: CommitEffect::RemovesSnapshots(snapshots.to_vec()),
         base,

@@ -27,9 +27,14 @@
           <div class="brand-sub">serve · console</div>
         </div>
       </div>
-      <div class="nav-item active" data-view="shape"><span class="dot"></span> Shape</div>
+      <div class="nav-item active" data-view="overview"><span class="dot"></span> Overview <span class="count hidden" id="attention-count"></span></div>
+      <div class="nav-item" data-view="datasets"><span class="dot"></span> Datasets</div>
+      <div class="nav-item" data-view="connectors"><span class="dot"></span> Connectors</div>
+      <div class="nav-item" data-view="alerts"><span class="dot"></span> Alerts <span class="count hidden" id="firing-count"></span></div>
+      <div class="nav-item" data-view="shape"><span class="dot"></span> Shape</div>
       <div class="nav-item" data-view="runs"><span class="dot"></span> Runs <span class="count hidden" id="runs-count"></span></div>
       <div class="nav-item" data-view="tables"><span class="dot"></span> Tables</div>
+      <div class="nav-item" data-view="catalog"><span class="dot"></span> Catalog</div>
       <div class="nav-item" data-view="inspect"><span class="dot"></span> Inspect</div>
       <div class="nav-spacer"></div>
       <div class="nav-foot">
@@ -41,13 +46,97 @@
     <main class="main">
       <div class="topbar">
         <div>
-          <h1 id="view-title">Shape</h1>
-          <div class="sub" id="view-sub">Infer a spec, shape JSON into Parquet or Iceberg, and see what landed.</div>
+          <h1 id="view-title">Overview</h1>
+          <div class="sub" id="view-sub">What needs a look, and what ran.</div>
         </div>
         <span class="badge" id="health-pill"><span class="dot"></span> connecting…</span>
       </div>
 
       <div class="content">
+
+        <!-- ============ OVERVIEW ============ -->
+        <section class="view active" id="view-overview">
+          <div class="stats ov-stats" id="ov-stats"></div>
+          <div class="cols" style="margin-top:18px">
+            <div class="card">
+              <div class="card-head"><h3>Needs a look</h3><span class="hint">your datasets, now</span></div>
+              <div id="ov-attention"></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>Latest runs</h3><span class="hint"><a class="lnk" data-goto="runs">all runs</a></span></div>
+              <div id="ov-recent"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ DATASETS ============ -->
+        <section class="view" id="view-datasets">
+          <div class="tables">
+            <div class="card">
+              <div class="card-head"><h3>Datasets</h3><span class="hint"><button class="btn sm" id="btn-ds-new">New dataset</button></span></div>
+              <div class="tb-list" id="ds-list"></div>
+            </div>
+            <div id="ds-detail">
+              <div class="card"><div class="empty" style="border:0">
+                <div class="et">No dataset open</div>
+                A dataset is a spec with a name: the file it reads, how it lands, and how fresh it should stay.
+                Run it from here whenever you like; the overview says when one needs a look.
+              </div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ CATALOG ============ -->
+        <section class="view" id="view-catalog">
+          <div class="caveat" id="ct-head"></div>
+          <div class="tables" style="margin-top:18px">
+            <div class="card">
+              <div class="card-head"><h3>Namespaces</h3><span class="hint"><button class="btn sm ghost" id="btn-ct-refresh">Refresh</button></span></div>
+              <div class="tb-list" id="ct-list"></div>
+            </div>
+            <div>
+              <div class="card" id="ct-detail"><div class="empty" style="border:0"><div class="et">No table open</div>Pick a table: its history, read from the metadata the catalog loads for it.</div></div>
+              <div class="card hidden" id="ct-engines" style="margin-top:18px"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ CONNECTORS ============ -->
+        <section class="view" id="view-connectors">
+          <div class="caveat" id="cn-listener"></div>
+          <div id="cn-token" class="hidden" style="margin-top:14px"></div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-head"><h3>Connectors</h3><span class="hint"><button class="btn sm" id="btn-cn-new">New connector</button></span></div>
+            <div id="cn-list"></div>
+            <div class="card-body hidden" id="cn-form" style="border-top:1px solid var(--eg-border-soft)"></div>
+          </div>
+        </section>
+
+        <!-- ============ ALERTS ============ -->
+        <section class="view" id="view-alerts">
+          <div class="card">
+            <div class="card-head"><h3>Incidents</h3><span class="hint">firing first; each notifies when it opens and when it resolves</span></div>
+            <div id="al-incidents"></div>
+          </div>
+          <div class="cols" style="margin-top:18px">
+            <div class="card">
+              <div class="card-head"><h3>Rules</h3><span class="hint"><button class="btn sm" id="btn-rule-new">New rule</button></span></div>
+              <div id="al-rules"></div>
+              <div class="card-body hidden" id="al-rule-form" style="border-top:1px solid var(--eg-border-soft)"></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>Targets</h3><span class="hint"><button class="btn sm" id="btn-target-new">New target</button></span></div>
+              <div id="al-targets"></div>
+              <div class="card-body hidden" id="al-target-form" style="border-top:1px solid var(--eg-border-soft)"></div>
+              <div class="card-body t2" style="border-top:1px solid var(--eg-border-soft)"><p style="margin:0">
+                A target is a webhook URL: Slack or Teams incoming webhooks, or a paging service's, take
+                the JSON as is (a <span class="mono">text</span> field; details under <span class="mono">shapeshift</span>).
+                URLs are kept in <span class="mono">alerts.json</span> in the data dir, owner-only on Unix and not
+                encrypted, and are never shown again after you save them.
+              </p></div>
+            </div>
+          </div>
+        </section>
 
         <!-- ============ RUNS ============ -->
         <section class="view" id="view-runs">
@@ -85,7 +174,7 @@
         </section>
 
         <!-- ============ SHAPE ============ -->
-        <section class="view active" id="view-shape">
+        <section class="view" id="view-shape">
           <div class="cols">
             <!-- left: inputs -->
             <div class="stack">

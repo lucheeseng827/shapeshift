@@ -11,12 +11,16 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    TimestampMicrosecondBuilder, UInt8Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde_json::{Map, Value};
 
+use crate::changes::{
+    ApplyMode, ChangeKind, ChangesSpec, SeedVersion, CHANGE_COLUMN, CHANGE_DELETE, CHANGE_UPSERT,
+    OP_COLUMN,
+};
 use crate::drift::{DriftPolicy, DriftReport, DriftSpec, DriftTracker};
 use crate::error::{Result, ShapeError};
 use crate::predicate::Predicate;
@@ -25,7 +29,7 @@ use crate::sink::Sink;
 use crate::spec::{ColumnSpec, DatasetSpec, SchemaMode};
 use crate::transform::Transform;
 use crate::types::ColumnType;
-use crate::value::{compile_path, select_compiled, Segment, MAX_PATH_SEGMENTS};
+use crate::value::{compile_path, segments, select_compiled, Segment, MAX_PATH_SEGMENTS};
 
 /// A column compiled from a [`ColumnSpec`] into the exact work the hot loop does.
 #[derive(Debug, Clone)]
@@ -38,6 +42,9 @@ struct Compiled {
     ty: ColumnType,
     transform: Option<Transform>,
     required: bool,
+    /// Under `changes:`, a path that starts with `$` reads the whole record (the
+    /// envelope); any other reads the change's row.
+    root: bool,
 }
 
 /// One typed cell, produced by coercion, ready to append to the matching builder.
@@ -46,6 +53,7 @@ struct Compiled {
 /// straight out of the record — **borrows** the record's own bytes instead of cloning
 /// them. Only a value the engine had to synthesize (a transform's output, a number
 /// stringified, a nested value serialized) owns its storage.
+#[derive(Debug, Clone)]
 enum Cell<'a> {
     Null,
     Bool(bool),
@@ -149,6 +157,43 @@ pub enum PushOutcome {
     /// The spec's `where` did not keep the record. Not an error: the run is about other
     /// rows. Counted (see [`Shaper::filter_report`]) and otherwise left alone.
     Filtered,
+    /// A change feed's record that carries no change of its own (a `changes.skip` op,
+    /// such as Flink's `-U`). Counted (see [`Shaper::change_report`]).
+    Skipped,
+}
+
+/// What a run's `changes:` saw: how many changes of each kind it shaped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeReport {
+    pub inserts: u64,
+    pub updates: u64,
+    pub deletes: u64,
+    /// Records a `changes.skip` op set aside.
+    pub skipped: u64,
+}
+
+/// `changes:`, compiled for the hot loop.
+#[derive(Debug, Clone)]
+struct Changes {
+    spec: ChangesSpec,
+    mode: ApplyMode,
+    op: Vec<Segment>,
+    row: Option<Vec<Segment>>,
+    key_from: Option<Vec<Segment>>,
+    /// Indices into the columns: the merge key, and the version.
+    key_cols: Vec<usize>,
+    order_cols: Vec<usize>,
+    /// A seed row's version, column by column (see [`ChangesPreset::seed_ops`]): empty when
+    /// the feed has no seed rows, or versions nothing.
+    seed: Vec<(usize, Cell<'static>)>,
+    report: ChangeReport,
+}
+
+/// The column a change feed adds to every batch: [`CHANGE_COLUMN`] (a flag the merge
+/// sink reads and drops) or, for a changelog, [`OP_COLUMN`] (written to the table).
+enum OpBuilder {
+    Flag(UInt8Builder),
+    Word(StringBuilder),
 }
 
 /// What a run's `where` did.
@@ -186,6 +231,12 @@ pub struct Shaper {
     rescue: Option<usize>,
     /// The spec's `where`, when it has one. `None` costs the hot loop nothing.
     filter: Option<Filter>,
+    /// How drift detection was set up, so a change feed with `row` can set it up again in
+    /// the row's coordinates.
+    drift_conf: (DriftSpec, bool),
+    /// The spec's `changes:`, when it has one, and the column it adds to each batch.
+    changes: Option<Changes>,
+    op_builder: Option<OpBuilder>,
 }
 
 impl Shaper {
@@ -231,6 +282,7 @@ impl Shaper {
                 ty: c.ty,
                 transform: c.transform,
                 required: c.required,
+                root: c.source_path().starts_with('$'),
             })
             .collect();
         // Every column enters here (declared, inferred, or a library caller's), and the
@@ -293,7 +345,202 @@ impl Shaper {
             drift: tracker,
             rescue,
             filter: None,
+            drift_conf: (drift.clone(), flatten),
+            changes: None,
+            op_builder: None,
         })
+    }
+
+    /// Read the records as a feed of changes (see [`ChangesSpec`]). `merge_on` names the key a
+    /// change applies to (empty for `apply: changelog`). Every batch then carries one more
+    /// column: for `upsert`, [`CHANGE_COLUMN`], which says which rows are deletes and which
+    /// the merge sink takes off before writing (see [`Shaper::table_schema`]); for
+    /// `changelog`, [`OP_COLUMN`], which is written.
+    pub fn with_changes(
+        mut self,
+        spec: &ChangesSpec,
+        mode: ApplyMode,
+        merge_on: &[String],
+    ) -> Result<Self> {
+        if self.changes.is_some() {
+            return Err(ShapeError::Spec(
+                "this shaper already reads a change feed".into(),
+            ));
+        }
+        if self.pending != 0 {
+            return Err(ShapeError::Spec(
+                "read a change feed from the first record: call `with_changes` before `push`"
+                    .into(),
+            ));
+        }
+        // A spec built in code, not read: expand its preset here (its version columns are
+        // added by `DatasetSpec::apply_preset`, which reading a spec runs).
+        let mut expanded = spec.clone();
+        expanded.apply_preset();
+        let spec = &expanded;
+        spec.validate()?;
+        if mode == ApplyMode::Upsert && merge_on.is_empty() {
+            return Err(ShapeError::Spec(
+                "`apply: upsert` applies each change to a key: name the merge keys".into(),
+            ));
+        }
+        let find = |name: &str, what: &str| -> Result<usize> {
+            self.columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| {
+                    ShapeError::Schema(format!("{what} `{name}` is not an output column"))
+                })
+        };
+        let key_cols = merge_on
+            .iter()
+            .map(|k| find(k, "merge key"))
+            .collect::<Result<Vec<_>>>()?;
+        let mut order_cols = Vec::new();
+        for c in &spec.order_by {
+            let i = find(c, "`changes.order_by` column")?;
+            let ty = self.columns[i].ty;
+            if !matches!(
+                ty,
+                ColumnType::Int64 | ColumnType::Date | ColumnType::Timestamp | ColumnType::String
+            ) {
+                return Err(ShapeError::Schema(format!(
+                    "`changes.order_by` column `{c}` is {}: a version is an int64, a date, a \
+                     timestamp or a string",
+                    ty.as_str()
+                )));
+            }
+            // A delete reads its columns from `key_from`, the row as it was: a version read
+            // from there is the live row's own, so every delete would be stale.
+            if spec.key_from.is_some() && mode == ApplyMode::Upsert && !self.columns[i].root {
+                return Err(ShapeError::Schema(key_from_version(c)));
+            }
+            order_cols.push(i);
+        }
+        let (name, field, builder) = match mode {
+            ApplyMode::Upsert => (
+                CHANGE_COLUMN,
+                Field::new(CHANGE_COLUMN, DataType::UInt8, false),
+                OpBuilder::Flag(UInt8Builder::new()),
+            ),
+            ApplyMode::Changelog => (
+                OP_COLUMN,
+                Field::new(OP_COLUMN, DataType::Utf8, false),
+                OpBuilder::Word(StringBuilder::new()),
+            ),
+        };
+        if self.schema.fields().iter().any(|f| f.name() == name) {
+            return Err(ShapeError::Schema(format!(
+                "the change feed adds the column `{name}`, and the schema already has one: rename it"
+            )));
+        }
+        let mut fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(field);
+        self.schema = Arc::new(Schema::new(fields));
+        // With `row`, drift is looked for in the row: a column covers a row field by its
+        // path in the row, and one that reads only the envelope (`$` outside the row)
+        // covers nothing there.
+        if let (Some(row), true) = (&spec.row, self.drift.is_some()) {
+            let row = segments(row);
+            let paths: Vec<String> = self
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    if !c.root {
+                        return Some(c.path.clone());
+                    }
+                    let segs = segments(&c.path);
+                    segs.starts_with(&row).then(|| segs[row.len()..].join("."))
+                })
+                .collect();
+            let (conf, flatten) = &self.drift_conf;
+            let mut tracker = DriftTracker::new(conf, *flatten, paths.iter().map(String::as_str));
+            // A field the `where` reads is one the spec knows about, here as in `with_where`:
+            // those that lie in the row stay covered, in the row's coordinates.
+            if let Some(f) = &self.filter {
+                for segs in f.predicate.paths() {
+                    let keys: Vec<&str> = segs.iter().map(|s| s.key()).collect();
+                    if keys.len() > row.len() && keys.starts_with(&row) {
+                        tracker.cover(keys[row.len()..].iter().copied());
+                    }
+                }
+            }
+            self.drift = Some(tracker);
+        }
+        // When the record is the row, the fields that describe the change are part of it,
+        // and not drift.
+        if spec.row.is_none() {
+            if let Some(d) = self.drift.as_mut() {
+                d.cover(segments(&spec.op));
+                if let Some(k) = &spec.key_from {
+                    d.cover(segments(k));
+                }
+            }
+        }
+        // A seed row is older than every change: in `upsert`, where the version decides, it
+        // takes the preset's lowest version in each of the preset's columns, and the lowest a
+        // column of its type holds in any other `order_by` column the spec names.
+        let seed: Vec<(usize, Cell<'static>)> = match spec.preset {
+            Some(p) if mode == ApplyMode::Upsert && !p.seed_ops().is_empty() => order_cols
+                .iter()
+                .map(|&i| {
+                    let c = &self.columns[i];
+                    // A preset column the spec re-declared with another type takes that
+                    // type's lowest instead.
+                    let cell = match (p.seed_version(&c.name), c.ty) {
+                        (Some(SeedVersion::Int(v)), ColumnType::Int64) => Cell::I64(v),
+                        (Some(SeedVersion::Str(s)), ColumnType::String) => {
+                            Cell::Str(Cow::Borrowed(s))
+                        }
+                        _ => lowest(c.ty),
+                    };
+                    (i, cell)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.changes = Some(Changes {
+            seed,
+            op: compile_path(&spec.op),
+            row: spec.row.as_deref().map(compile_path),
+            key_from: spec.key_from.as_deref().map(compile_path),
+            spec: spec.clone(),
+            mode,
+            key_cols,
+            order_cols,
+            report: ChangeReport::default(),
+        });
+        self.op_builder = Some(builder);
+        Ok(self)
+    }
+
+    /// What the change feed has seen so far: `None` without `changes:`.
+    pub fn change_report(&self) -> Option<&ChangeReport> {
+        self.changes.as_ref().map(|c| &c.report)
+    }
+
+    /// The schema of the table a run writes: [`Shaper::schema`] without the column that
+    /// marks deletes for the merge sink. Create the sink with this one.
+    pub fn table_schema(&self) -> SchemaRef {
+        match self.schema.index_of(CHANGE_COLUMN) {
+            Ok(i) => {
+                let fields: Vec<Field> = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, f)| f.as_ref().clone())
+                    .collect();
+                Arc::new(Schema::new(fields))
+            }
+            Err(_) => self.schema.clone(),
+        }
     }
 
     /// Take only the records `expr` keeps (see [`Predicate`]); the others come back from
@@ -341,8 +588,19 @@ impl Shaper {
             &spec.drift,
             spec.options.flatten,
         )?;
-        match &spec.filter {
-            Some(expr) => shaper.with_where(expr),
+        let shaper = match &spec.filter {
+            Some(expr) => shaper.with_where(expr)?,
+            None => shaper,
+        };
+        match &spec.changes {
+            Some(c) => {
+                let mode = spec.output.apply.unwrap_or_default();
+                let keys: &[String] = match mode {
+                    ApplyMode::Upsert => &spec.output.merge_on,
+                    ApplyMode::Changelog => &[],
+                };
+                shaper.with_changes(c, mode, keys)
+            }
             None => Ok(shaper),
         }
     }
@@ -388,19 +646,121 @@ impl Shaper {
             }
         }
 
+        // A change feed: what the record says happened, and where its row is. Columns read
+        // the row (`src`), or the whole record when their path starts with `$`.
+        let mut kind: Option<ChangeKind> = None;
+        // A seed row (a read of the table as it stood) takes the lowest version, below.
+        let mut seed = false;
+        let mut src = record;
+        if let Some(ch) = self.changes.as_mut() {
+            let reject = |why: String, strict: bool| -> Result<PushOutcome> {
+                if strict {
+                    Err(ShapeError::Record(why))
+                } else {
+                    Ok(PushOutcome::Rejected(why))
+                }
+            };
+            let op = match select_compiled(record, &ch.op) {
+                Some(v) if v.kind() != Kind::Null => v.to_owned_value(),
+                _ => {
+                    if let Some(d) = self.drift.as_mut() {
+                        d.skip();
+                    }
+                    return reject(
+                        format!(
+                            "the change has no `{}`, which says what happened",
+                            ch.spec.op
+                        ),
+                        self.strict,
+                    );
+                }
+            };
+            let Some(k) = ch.spec.kind_of(&op) else {
+                if let Some(d) = self.drift.as_mut() {
+                    d.skip();
+                }
+                return reject(
+                    format!(
+                        "`{}` is {op}, which is none of the ops the spec names ({})",
+                        ch.spec.op,
+                        ch.spec.known_ops()
+                    ),
+                    self.strict,
+                );
+            };
+            if k == ChangeKind::Skip {
+                ch.report.skipped += 1;
+                if let Some(d) = self.drift.as_mut() {
+                    d.skip();
+                }
+                return Ok(PushOutcome::Skipped);
+            }
+            let present = |r: Option<R>| r.filter(|v| v.kind() != Kind::Null);
+            let row = match &ch.row {
+                Some(segs) => present(select_compiled(record, segs)),
+                None => Some(record),
+            };
+            let from = match (k, &ch.key_from) {
+                (ChangeKind::Delete, Some(segs)) => present(select_compiled(record, segs)).or(row),
+                _ => row,
+            };
+            match from {
+                Some(r) => src = r,
+                None => {
+                    if let Some(d) = self.drift.as_mut() {
+                        d.skip();
+                    }
+                    let at = ch.spec.row.as_deref().unwrap_or("$");
+                    return reject(
+                        format!("the {} has no row at `{at}`", k.word()),
+                        self.strict,
+                    );
+                }
+            }
+            kind = Some(k);
+            seed = !ch.seed.is_empty() && ch.spec.is_seed(&op);
+        }
+        // In `apply: upsert` a delete carries only its key and version: nothing else of it
+        // is written, so nothing else is read, checked or reported as drift.
+        let key_only = kind == Some(ChangeKind::Delete)
+            && self
+                .changes
+                .as_ref()
+                .is_some_and(|c| c.mode == ApplyMode::Upsert);
+
         // Phase 0: find source paths no column reaches. Done before anything is
         // appended, so an `error` policy fails with the builders still aligned.
         let mut rescued: Option<Map<String, Value>> = self.rescue.map(|_| Map::new());
         let mut drift_reason: Option<String> = None;
         if let Some(d) = self.drift.as_mut() {
-            drift_reason = d.scan_record(record, rescued.as_mut());
+            if key_only {
+                d.skip();
+            } else {
+                drift_reason = d.scan_record(src, rescued.as_mut());
+            }
         }
 
         // Phase 1: compute every cell, bailing before any append if a required cell
         // is absent / a strict coercion fails. This keeps the builders aligned.
         let mut cells: Vec<Cell> = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
-            let selected = select_compiled(record, &col.segs);
+        for (i, col) in self.columns.iter().enumerate() {
+            if key_only
+                && !self
+                    .changes
+                    .as_ref()
+                    .is_some_and(|c| c.key_cols.contains(&i) || c.order_cols.contains(&i))
+            {
+                // Never written (the merge sink drops the row), but the batch still needs a
+                // value its field accepts.
+                cells.push(if col.required {
+                    placeholder(col.ty)
+                } else {
+                    Cell::Null
+                });
+                continue;
+            }
+            let base = if col.root { record } else { src };
+            let selected = select_compiled(base, &col.segs);
             let coerced = match selected {
                 None => Coerced::Null,
                 Some(v) if v.kind() == Kind::Null => Coerced::Null,
@@ -472,6 +832,62 @@ impl Shaper {
             }
         }
 
+        // A seed row is older than every change: whatever version it
+        // was read with, it takes the lowest, so a change to its key wins in either order of
+        // arrival, and it only fills a key no change has touched. Debezium reads a table on
+        // Postgres at an LSN above that of a transaction still open across the read, so the
+        // version it carries would make that transaction's changes stale.
+        if seed {
+            if let Some(ch) = self.changes.as_ref() {
+                for (i, c) in &ch.seed {
+                    cells[*i] = c.clone();
+                }
+            }
+        } else if let Some(ch) = self.changes.as_ref().filter(|c| !c.seed.is_empty()) {
+            // A change versioned at exactly a seed row's version would tie with it, and a tie
+            // is stale: it could lose to a snapshot row with nothing said. No preset's change
+            // carries it (an LSN is never 0, a binlog file always has a name), but a spec's own
+            // `order_by` column may: such a change is refused, so it is counted, not lost.
+            if ch.seed.iter().all(|(i, c)| same_version(&cells[*i], c)) {
+                let why = format!(
+                    "the {} is versioned at the lowest value of its `changes.order_by` \
+                     columns, which snapshot rows take: it cannot be told from one",
+                    kind.map_or("change", ChangeKind::word)
+                );
+                if self.strict {
+                    return Err(ShapeError::Record(why));
+                }
+                return Ok(PushOutcome::Rejected(why));
+            }
+        }
+
+        // A change needs its version, and a delete its key: one without cannot be placed.
+        if let (Some(k), Some(ch)) = (kind, self.changes.as_ref()) {
+            let missing = |idx: &[usize]| {
+                idx.iter()
+                    .find(|&&i| matches!(cells[i], Cell::Null))
+                    .copied()
+            };
+            let why = match (k, missing(&ch.order_cols), missing(&ch.key_cols)) {
+                (_, Some(i), _) => Some(format!(
+                    "the {} has no version: `changes.order_by` column `{}` is null",
+                    k.word(),
+                    self.columns[i].name
+                )),
+                (ChangeKind::Delete, None, Some(i)) if ch.mode == ApplyMode::Upsert => Some(format!(
+                    "the delete has no key: `{}` is null (a delete that matches nothing by accident is refused)",
+                    self.columns[i].name
+                )),
+                _ => None,
+            };
+            if let Some(why) = why {
+                if self.strict {
+                    return Err(ShapeError::Record(why));
+                }
+                return Ok(PushOutcome::Rejected(why));
+            }
+        }
+
         // Phase 2: commit.
         for (builder, cell) in self.builders.iter_mut().zip(cells) {
             builder.append(cell);
@@ -489,6 +905,24 @@ impl Shaper {
             };
             self.builders[i].append(cell);
         }
+        if let (Some(k), Some(ch), Some(b)) =
+            (kind, self.changes.as_mut(), self.op_builder.as_mut())
+        {
+            match k {
+                ChangeKind::Insert => ch.report.inserts += 1,
+                ChangeKind::Update => ch.report.updates += 1,
+                ChangeKind::Delete => ch.report.deletes += 1,
+                ChangeKind::Skip => {}
+            }
+            match b {
+                OpBuilder::Flag(b) => b.append_value(if k == ChangeKind::Delete {
+                    CHANGE_DELETE
+                } else {
+                    CHANGE_UPSERT
+                }),
+                OpBuilder::Word(b) => b.append_value(k.word()),
+            }
+        }
         self.pending += 1;
         Ok(PushOutcome::Appended)
     }
@@ -499,7 +933,12 @@ impl Shaper {
         if self.pending == 0 {
             return Ok(None);
         }
-        let arrays: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
+        let mut arrays: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
+        match self.op_builder.as_mut() {
+            Some(OpBuilder::Flag(b)) => arrays.push(Arc::new(b.finish())),
+            Some(OpBuilder::Word(b)) => arrays.push(Arc::new(b.finish())),
+            None => {}
+        }
         self.pending = 0;
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
         Ok(Some(batch))
@@ -538,8 +977,12 @@ pub struct RunReport {
     /// Records the spec's `where` did not keep. `rows_in` is the sum of `rows_out`,
     /// `rows_rejected` and this.
     pub rows_filtered: u64,
+    /// Records a change feed's `skip` op set aside (see [`ChangeReport`]).
+    pub rows_skipped: u64,
     /// What the `where` did — `None` when the spec has none.
     pub filter: Option<FilterReport>,
+    /// What the change feed shaped — `None` without `changes:`.
+    pub changes: Option<ChangeReport>,
     /// RecordBatches (row groups) flushed.
     pub batches: u64,
     /// What the source did that the schema does not cover — `None` under
@@ -569,6 +1012,7 @@ where
             PushOutcome::Appended => report.rows_out += 1,
             PushOutcome::Rejected(_) => report.rows_rejected += 1,
             PushOutcome::Filtered => report.rows_filtered += 1,
+            PushOutcome::Skipped => report.rows_skipped += 1,
         }
         if shaper.pending() >= rg {
             if let Some(batch) = shaper.flush()? {
@@ -583,6 +1027,7 @@ where
     }
     let summary = sink.finish()?;
     report.filter = shaper.filter_report().cloned();
+    report.changes = shaper.change_report().cloned();
     report.drift = shaper.into_drift_report();
     Ok((report, summary))
 }
@@ -590,6 +1035,52 @@ where
 // ---------------------------------------------------------------------------
 // Coercion
 // ---------------------------------------------------------------------------
+
+/// Why a version read from the row cannot order a feed whose deletes read `key_from`.
+pub(crate) fn key_from_version(column: &str) -> String {
+    format!(
+        "`changes.order_by` column `{column}` is read from the row, but a delete reads `key_from` \
+         (the row before it changed), whose version is the live row's own, so every delete \
+         would be stale: read the version from the envelope, with a `from` that starts with \
+         `$` (such as `$.source.ts_ms`)"
+    )
+}
+
+/// A value a required column accepts, for a row that is never written (a delete's other
+/// columns in `apply: upsert`).
+/// The lowest value a version column of `ty` holds: what a seed row takes in an `order_by`
+/// column its preset has no value for. (`order_by` takes only these four types.) A date or
+/// a timestamp takes 0001-01-01, the first a date library can print, not the type's least.
+fn lowest(ty: ColumnType) -> Cell<'static> {
+    const YEAR_ONE_DAYS: i32 = -719_162;
+    match ty {
+        ColumnType::Int64 => Cell::I64(i64::MIN),
+        ColumnType::Date => Cell::Date(YEAR_ONE_DAYS),
+        ColumnType::Timestamp => Cell::Ts(YEAR_ONE_DAYS as i64 * 86_400_000_000),
+        _ => Cell::Str(Cow::Borrowed("")),
+    }
+}
+
+/// Whether two version cells hold the same value (the four `order_by` types).
+fn same_version(a: &Cell<'_>, b: &Cell<'_>) -> bool {
+    match (a, b) {
+        (Cell::I64(x), Cell::I64(y)) | (Cell::Ts(x), Cell::Ts(y)) => x == y,
+        (Cell::Date(x), Cell::Date(y)) => x == y,
+        (Cell::Str(x), Cell::Str(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn placeholder(ty: ColumnType) -> Cell<'static> {
+    match ty {
+        ColumnType::Bool => Cell::Bool(false),
+        ColumnType::Int64 => Cell::I64(0),
+        ColumnType::Float64 => Cell::F64(0.0),
+        ColumnType::String | ColumnType::Json => Cell::Str(Cow::Borrowed("")),
+        ColumnType::Date => Cell::Date(0),
+        ColumnType::Timestamp => Cell::Ts(0),
+    }
+}
 
 /// Coerce one value to a column's logical type, **reading it in place**. A string that
 /// survives as a string (or is only parsed, as for date/timestamp) never leaves the

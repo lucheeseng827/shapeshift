@@ -12,5 +12,7 @@ shapeshift-core = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 memchr = { workspace = true }
+csv = { workspace = true }
+quick-xml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

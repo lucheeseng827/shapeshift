@@ -382,3 +382,373 @@ fn a_where_in_the_spec_filters_records_and_reports_mismatched_comparisons() {
     assert!(v.get("type_mismatches").is_none(), "{body}");
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+#[test]
+fn a_dataset_is_kept_run_now_appends_and_the_overview_says_what_needs_a_look() {
+    use serde_json::{json, Value};
+    let data_dir = std::env::temp_dir().join(format!("ss-serve-ds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        data_dir.join("in.jsonl"),
+        "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"b\"}\nnot-json\n",
+    )
+    .unwrap();
+    let port = start(&data_dir);
+    let post = |path: &str, body: Value| request(port, "POST", path, Some(&body.to_string()));
+    let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+
+    // Kept, and refused when it could not run.
+    let (s, b) = post(
+        "/api/dataset/save",
+        json!({ "name": "events", "input_path": "in.jsonl", "freshness_minutes": 60 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(parse(&b)["output"], "outputs/events");
+    assert!(data_dir.join("datasets/events.json").is_file());
+    let (s, _) = post(
+        "/api/dataset/save",
+        json!({ "name": "../x", "input_path": "in.jsonl" }),
+    );
+    assert_eq!(s, 400);
+    let (s, _) = post(
+        "/api/dataset/save",
+        json!({ "name": "p", "input_path": "in.jsonl", "to": "parquet", "partition_by": ["v"] }),
+    );
+    assert_eq!(s, 400);
+
+    // Run now, twice: an Iceberg dataset appends by default.
+    for _ in 0..2 {
+        let (s, b) = post("/api/dataset/run", json!({ "name": "events" }));
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(parse(&b)["rows_out"], 2);
+    }
+    let (_, b) = post("/api/inspect", json!({ "path": "outputs/events" }));
+    assert_eq!(parse(&b)["total_records"], 4, "{b}");
+    let (_, b) = post("/api/dataset/rejects", json!({ "name": "events" }));
+    assert_eq!(
+        parse(&b)["total"],
+        1,
+        "the bad line, from the latest run's sidecar: {b}"
+    );
+
+    // Its page: the runs are its own, marked as started by Run now.
+    let (_, b) = post("/api/dataset", json!({ "name": "events" }));
+    let page = parse(&b);
+    assert_eq!(page["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(page["runs"][0]["via"], "dataset");
+    assert_eq!(page["freshness"], "fresh");
+    assert_eq!(page["table"], true);
+
+    // A dataset whose run fails needs a look; the healthy one does not.
+    let (s, _) = post(
+        "/api/dataset/save",
+        json!({ "name": "broken", "input_path": "missing.jsonl" }),
+    );
+    assert_eq!(s, 200);
+    let (s, _) = post("/api/dataset/run", json!({ "name": "broken" }));
+    assert_eq!(s, 400);
+    let (_, b) = request(port, "GET", "/api/overview", None);
+    let ov = parse(&b);
+    let att: Vec<(String, String)> = ov["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["kind"].as_str().unwrap().to_string(),
+                c["subject"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(att, vec![("run_failed".to_string(), "broken".to_string())]);
+    assert_eq!(ov["figures"]["datasets"], 2);
+    assert_eq!(ov["figures"]["failed_24h"], 1);
+
+    // Forgetting a dataset keeps its output and runs.
+    let (s, _) = post("/api/dataset/delete", json!({ "name": "events" }));
+    assert_eq!(s, 200);
+    let (s, _) = post("/api/dataset", json!({ "name": "events" }));
+    assert_eq!(s, 404);
+    assert!(data_dir.join("outputs/events/metadata").is_dir());
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// A raw POST with extra headers, for the ingest listener.
+fn post_with(port: u16, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut extra = String::new();
+    for (k, v) in headers {
+        extra.push_str(&format!("{k}: {v}\r\n"));
+    }
+    let raw = format!(
+        "POST {path} HTTP/1.1\r\nHost: producer.example\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(raw.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
+    (status, body)
+}
+
+#[test]
+fn a_connector_takes_pushed_records_with_its_token_and_its_dataset_lands_them() {
+    use serde_json::{json, Value};
+    // Relative, as the default `--data-dir` is: a batch's path must not get it prefixed twice.
+    // A relative path lands in the crate's directory, so it is removed when the test ends,
+    // passed or failed, and is not named `target` (the source mirror refuses to publish one).
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let data_dir = std::path::PathBuf::from(format!(".ss-serve-ingest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _cleanup = RemoveOnDrop(data_dir.clone());
+    let port = free_port();
+    let ingest = free_port();
+    let mut cfg = ServeConfig::new(format!("127.0.0.1:{port}"), &data_dir);
+    cfg.ingest_addr = Some(format!("127.0.0.1:{ingest}"));
+    std::thread::spawn(move || {
+        let _ = serve(cfg);
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && request(port, "GET", "/api/health", None).0 == 200
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let post = |path: &str, body: Value| request(port, "POST", path, Some(&body.to_string()));
+    let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+
+    // A connector needs an Iceberg dataset.
+    let (s, _) = post(
+        "/api/dataset/save",
+        json!({ "name": "pq", "to": "parquet" }),
+    );
+    assert_eq!(s, 200);
+    let (s, b) = post(
+        "/api/connector/save",
+        json!({ "name": "c", "dataset": "pq" }),
+    );
+    assert_eq!(s, 400, "{b}");
+    let (s, _) = post("/api/dataset/save", json!({ "name": "events" }));
+    assert_eq!(s, 200);
+    let (s, b) = post(
+        "/api/connector/save",
+        // Never sealed by time in this test: it flushes by hand, so nothing races the clock.
+        json!({ "name": "logs", "dataset": "events", "flush_seconds": 3600 }),
+    );
+    assert_eq!(s, 200, "{b}");
+    let token = parse(&b)["token"].as_str().unwrap().to_string();
+    let (_, b) = post(
+        "/api/connector/save",
+        json!({ "name": "other", "dataset": "events" }),
+    );
+    let other = parse(&b)["token"].as_str().unwrap().to_string();
+    let (_, b) = request(port, "GET", "/api/connectors", None);
+    assert!(!b.contains(&token), "a token is shown once, never listed");
+
+    let auth = format!("Bearer {token}");
+    let path = "/v1/ingest/logs";
+    // Refused: no token, another connector's token, a half-bad batch, the console's own API.
+    assert_eq!(post_with(ingest, path, &[], "{\"id\":1}").0, 401);
+    let wrong = format!("Bearer {other}");
+    assert_eq!(
+        post_with(ingest, path, &[("Authorization", &wrong)], "{\"id\":1}").0,
+        401
+    );
+    let (s, b) = post_with(
+        ingest,
+        path,
+        &[("Authorization", &auth)],
+        "{\"id\":1}\nnope\n",
+    );
+    assert_eq!(s, 400);
+    assert!(b.contains("line 2"), "{b}");
+    assert_eq!(
+        post_with(ingest, "/api/datasets", &[("Authorization", &auth)], "").0,
+        404
+    );
+    assert_eq!(
+        post_with(ingest, "/v1/ingest/nope", &[("Authorization", &auth)], "{}").0,
+        404
+    );
+
+    // Taken: NDJSON, then an array; a retry of a named post is acknowledged, not added.
+    let (s, b) = post_with(
+        ingest,
+        path,
+        &[("Authorization", &auth), ("Idempotency-Key", "k1")],
+        "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"b\"}\n",
+    );
+    assert_eq!((s, parse(&b)["accepted"].clone()), (202, json!(2)), "{b}");
+    let (s, b) = post_with(
+        ingest,
+        path,
+        &[("Authorization", &auth), ("Idempotency-Key", "k1")],
+        "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"b\"}\n",
+    );
+    assert_eq!(
+        (s, parse(&b)["duplicate"].clone()),
+        (200, json!(true)),
+        "{b}"
+    );
+    let (s, _) = post_with(
+        ingest,
+        path,
+        &[("Authorization", &auth)],
+        "[{\"id\":3,\"v\":\"c\"}]",
+    );
+    assert_eq!(s, 202);
+
+    // Sealed by hand, run by the dataset: three rows land, in one run.
+    let (s, b) = post("/api/connector/flush", json!({ "name": "logs" }));
+    assert_eq!((s, parse(&b)["sealed"].clone()), (200, json!(true)), "{b}");
+    let mut rows = Value::Null;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        let (s, b) = post("/api/inspect", json!({ "path": "outputs/events" }));
+        if s == 200 {
+            rows = parse(&b)["total_records"].clone();
+            if rows == 3 {
+                break;
+            }
+        }
+    }
+    assert_eq!(rows, 3);
+    // The counts follow the run's end: wait for the batch to be done with.
+    let logs_now = || {
+        let (_, b) = request(port, "GET", "/api/connectors", None);
+        let list = parse(&b);
+        let logs = list["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "logs")
+            .unwrap()
+            .clone();
+        (list, logs)
+    };
+    let (mut list, mut logs) = logs_now();
+    for _ in 0..100 {
+        if logs["stats"]["runs_ok"] == 1 && logs["waiting_batches"] == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        (list, logs) = logs_now();
+    }
+    let (_, b) = post("/api/dataset", json!({ "name": "events" }));
+    let page = parse(&b);
+    assert_eq!(page["runs"][0]["via"], "connector");
+    assert_eq!(page["runs"][0]["connector"], "logs");
+    assert_eq!(logs["stats"]["records"], 3);
+    assert_eq!(logs["stats"]["duplicates"], 1);
+    assert_eq!(logs["stats"]["runs_ok"], 1);
+    assert_eq!(logs["waiting_batches"], 0);
+    assert_eq!(list["ingest_addr"], format!("127.0.0.1:{ingest}"));
+
+    // A batch run again after it landed (its file could not be removed, say) is found by its
+    // run id and not appended twice.
+    let batch = data_dir.join("spool/logs/batch-0000000000000001-replay.jsonl");
+    let runs_ok = |n: u64| {
+        for _ in 0..100 {
+            if logs_now().1["stats"]["runs_ok"] == n && logs_now().1["waiting_batches"] == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the batch did not land: {}", logs_now().1);
+    };
+    std::fs::write(
+        &batch,
+        "{\"id\":10,\"v\":\"x\"}
+{\"id\":11,\"v\":\"y\"}
+",
+    )
+    .unwrap();
+    runs_ok(2);
+    let rows = |_: ()| {
+        let (_, b) = post("/api/inspect", json!({ "path": "outputs/events" }));
+        parse(&b)["total_records"].clone()
+    };
+    assert_eq!(rows(()), 5);
+    std::fs::write(
+        &batch,
+        "{\"id\":10,\"v\":\"x\"}
+{\"id\":11,\"v\":\"y\"}
+",
+    )
+    .unwrap();
+    runs_ok(3);
+    assert_eq!(
+        rows(()),
+        5,
+        "the same batch again is the same run: nothing added"
+    );
+
+    // A rotated token replaces the old one.
+    let (_, b) = post("/api/connector/rotate", json!({ "name": "logs" }));
+    let fresh = format!("Bearer {}", parse(&b)["token"].as_str().unwrap());
+    assert_eq!(
+        post_with(ingest, path, &[("Authorization", &auth)], "{\"id\":4}").0,
+        401
+    );
+    assert_eq!(
+        post_with(ingest, path, &[("Authorization", &fresh)], "{\"id\":4}").0,
+        202
+    );
+    // Records waiting: delete is refused unless they are discarded.
+    let (s, _) = post("/api/connector/delete", json!({ "name": "logs" }));
+    assert_eq!(s, 409);
+    let (s, _) = post(
+        "/api/connector/delete",
+        json!({ "name": "logs", "discard": true }),
+    );
+    assert_eq!(s, 200);
+    assert!(!data_dir.join("spool/logs").exists());
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn the_catalog_page_says_when_there_is_no_catalog() {
+    let data_dir = std::env::temp_dir().join(format!("ss-serve-cat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let port = start(&data_dir);
+    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+    let (s, b) = request(port, "GET", "/api/catalog", None);
+    assert_eq!(s, 200);
+    let v = parse(&b);
+    assert_eq!(v["configured"], false);
+    // This crate's tests build without `catalog` unless asked.
+    assert_eq!(v["available"], cfg!(feature = "catalog"));
+    let (s, b) = request(port, "POST", "/api/catalog/refresh", Some("{}"));
+    assert_eq!(
+        (s, parse(&b)["configured"].clone()),
+        (200, serde_json::json!(false))
+    );
+    let (s, _) = request(
+        port,
+        "POST",
+        "/api/catalog/table",
+        Some(r#"{"levels":["a"],"name":"t"}"#),
+    );
+    assert_eq!(s, 404, "no catalog configured");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}

@@ -33,6 +33,8 @@ pub fn now_ms() -> i64 {
 pub struct RunLog {
     path: PathBuf,
     inner: Mutex<Inner>,
+    /// The console's metrics, when `--metrics-addr` asked for them.
+    pub(crate) metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Live>>,
 }
 
 struct Inner {
@@ -89,6 +91,7 @@ impl RunLog {
         let log = RunLog {
             path,
             inner: Mutex::new(inner),
+            metrics: std::sync::OnceLock::new(),
         };
         log.rewrite()?;
         Ok(log)
@@ -274,6 +277,9 @@ impl Run<'_> {
         self.record["summary"] = summary.unwrap_or(Value::Null);
         self.record["error"] = error.unwrap_or(Value::Null);
         self.save();
+        if let Some(m) = self.log.metrics.get() {
+            m.run_ended(&self.record);
+        }
     }
 
     fn save(&self) {

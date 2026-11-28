@@ -1,0 +1,21 @@
+# shapeshift-source-http — pull records from a REST endpoint (`source.http`, `shape --from`):
+# paged, with credentials from the environment, read incrementally from the position the
+# table records. Behind the CLI's `http` feature, so the lean binary links no HTTP client.
+[package]
+name = "shapeshift-source-http"
+description = "shapeshift's HTTP source: a paged REST endpoint read incrementally, its position kept in the Iceberg table it writes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+shapeshift-json = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+# The client the console's alerts already link: rustls with bundled roots, no async runtime.
+ureq = { version = "3", default-features = false, features = ["rustls"] }

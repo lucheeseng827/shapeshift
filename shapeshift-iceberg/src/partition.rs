@@ -658,9 +658,27 @@ impl PartitionedWriter {
     pub fn finish(&mut self) -> Result<Vec<PartitionDataFile>> {
         let mut open: Vec<OpenPartition> = std::mem::take(&mut self.open).into_values().collect();
         open.sort_by_key(|op| op.slot);
-        let mut out = Vec::with_capacity(open.len());
-        for mut op in open {
-            let rows = op.writer.close()?;
+        let mut out: Vec<PartitionDataFile> = Vec::with_capacity(open.len());
+        let mut ops = open.into_iter();
+        while let Some(mut op) = ops.next() {
+            let rows = match op.writer.close() {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // A write whose files cannot all close is never committed: remove every
+                    // file it wrote, the ones already closed, this one and the ones still open.
+                    let mut keys: Vec<String> = out.iter().map(|d| d.data_key.clone()).collect();
+                    keys.push(op.data_key.clone());
+                    drop(op);
+                    for rest in ops {
+                        keys.push(rest.data_key.clone());
+                        drop(rest); // each writer's handle closed before its file goes
+                    }
+                    for k in &keys {
+                        self.remove_data_file(k);
+                    }
+                    return Err(e);
+                }
+            };
             let stats = op.writer.column_stats();
             let size = std::fs::metadata(self.base_dir.join(&op.data_key))
                 .map(|m| m.len())
@@ -674,6 +692,71 @@ impl PartitionedWriter {
             });
         }
         Ok(out)
+    }
+}
+
+/// A writer dropped before [`PartitionedWriter::finish`] belongs to a run that failed (a strict
+/// coercion, `drift.policy: error`, a source error): no snapshot will ever name its files, so
+/// they are removed rather than left in the table directory, with any partition directory they
+/// leave empty. A finished writer has handed its files to the commit, which removes them itself
+/// when the commit is refused, so it removes nothing here.
+impl Drop for PartitionedWriter {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+impl PartitionedWriter {
+    /// Remove the files of every partition still open (see the `Drop` above); after
+    /// [`finish`](Self::finish) there are none, so this removes nothing.
+    pub fn discard(&mut self) {
+        for (_, op) in std::mem::take(&mut self.open) {
+            let key = op.data_key.clone();
+            drop(op.writer); // close the handle first: Windows will not delete an open file
+            self.remove_data_file(&key);
+        }
+    }
+
+    /// Remove one data file this writer wrote, then the partition directories it leaves empty,
+    /// up to (not including) the base dir. Only a key of plain path segments under the base
+    /// dir is touched: one with `..`, a root or a drive prefix (none that `data_key` makes,
+    /// but a partition field is named after a column) is left alone rather than followed out.
+    fn remove_data_file(&self, data_key: &str) {
+        let rel = Path::new(data_key);
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return;
+        }
+        let path = self.base_dir.join(rel);
+        if !path.starts_with(&self.base_dir) {
+            return;
+        }
+        // The check above is lexical; a directory on the way that is now a symlink would be
+        // followed. Every component under the base dir must be what this writer made: a real
+        // directory, and the file itself no link either.
+        let mut at = self.base_dir.clone();
+        for c in rel.components() {
+            at.push(c);
+            match std::fs::symlink_metadata(&at) {
+                Ok(m) if m.file_type().is_symlink() => return,
+                Ok(_) => {}
+                Err(_) => return, // gone already, or unreadable: nothing to remove here
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        // remove_dir refuses a directory that still holds anything.
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == self.base_dir
+                || !d.starts_with(&self.base_dir)
+                || std::fs::remove_dir(d).is_err()
+            {
+                break;
+            }
+            dir = d.parent();
+        }
     }
 }
 
@@ -908,5 +991,38 @@ mod tests {
         assert!(!set.contains(&vec![PartVal::Str("eu".into()), PartVal::Long(1)]));
         // NaN keys are stable (bit-equal), so rows with a NaN partition still group.
         assert_eq!(PartVal::Double(f64::NAN), PartVal::Double(f64::NAN));
+    }
+
+    #[test]
+    fn a_discarded_key_never_reaches_outside_the_table() {
+        let root = std::env::temp_dir().join(format!("ss-part-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("table");
+        std::fs::create_dir_all(dir.join("data/region=eu")).unwrap();
+        std::fs::write(root.join("victim"), "kept").unwrap();
+        std::fs::write(dir.join("data/region=eu/f.parquet"), "x").unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let w = PartitionedWriter::new(
+            &dir,
+            schema,
+            Compression::Snappy,
+            vec![ice("id", "long", 1)],
+            vec![],
+        )
+        .unwrap();
+        for evil in ["../victim", "data/../../victim", "/etc/hostname"] {
+            w.remove_data_file(evil);
+        }
+        assert!(root.join("victim").exists(), "a traversal key was followed");
+        // A plain key goes, and so does the partition directory it leaves empty.
+        w.remove_data_file("data/region=eu/f.parquet");
+        assert!(!dir.join("data/region=eu").exists());
+        assert!(
+            dir.join("data").exists(),
+            "the base dir's own data/ is not this key's to remove"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

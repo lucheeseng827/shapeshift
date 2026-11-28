@@ -1,0 +1,23 @@
+# shapeshift-source-mysql — rows from a MySQL query or table (`source.mysql`,
+# `shape --from mysql://…`), read incrementally from the position the table records. Behind
+# the CLI's `mysql` feature, so the lean binary links no database client.
+[package]
+name = "shapeshift-source-mysql"
+description = "shapeshift's MySQL source: a query or a table read incrementally by a watermark, its position kept in the Iceberg table it writes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shapeshift-core = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# Pure Rust: the deflate backend in Rust, TLS on rustls with ring (as the HTTP source's
+# client), no aws-lc C build, no derive macros.
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+# Only to install ring as the process's TLS provider before a connection (see `connect`): the
+# same rustls the mysql crate already links, no new crate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

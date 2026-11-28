@@ -368,6 +368,7 @@ fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
     DatasetSpec {
         dataset: "t".into(),
         filter: None,
+        changes: None,
         source: Default::default(),
         output: OutputSpec {
             format: OutputFormat::Parquet,
@@ -376,6 +377,7 @@ fn drift_spec(policy: DriftPolicy) -> DatasetSpec {
             partition_by: Vec::new(),
             merge_on: Vec::new(),
             catalog: None,
+            apply: None,
         },
         schema: SchemaMode::Infer,
         columns: vec![
@@ -934,4 +936,687 @@ fn a_spec_names_its_filter_as_where_and_refuses_a_bad_one() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("use `=`, not `==`"), "{err}");
+}
+
+#[test]
+fn source_options_must_fit_the_format() {
+    let spec = |source: &str| {
+        DatasetSpec::parse(&format!(
+            r#"{{"dataset":"t","output":{{"format":"parquet","path":"o"}},"source":{source}}}"#
+        ))
+    };
+    let s =
+        spec(r#"{"format":"tsv","csv":{"header":false,"columns":["a","b"],"types":"strings"}}"#)
+            .unwrap();
+    let csv = s.source.csv.unwrap();
+    assert_eq!(s.source.format, SourceFormat::Tsv);
+    assert_eq!(
+        (csv.header, csv.quote, csv.types),
+        (false, '"', CsvTypes::Strings)
+    );
+    assert_eq!(csv.null_values, vec![String::new()]);
+    let s = spec(r#"{"format":"xml","xml":{"record":"/Orders/Order"}}"#).unwrap();
+    assert_eq!(s.source.xml.unwrap().record, "/Orders/Order");
+
+    for (bad, says) in [
+        (r#"{"format":"jsonl","csv":{}}"#, "applies to csv and tsv"),
+        (r#"{"format":"xml"}"#, "needs `source.xml.record`"),
+        (r#"{"format":"csv","xml":{"record":"a"}}"#, "applies to xml"),
+        (r#"{"format":"xml","xml":{"record":"/a//b"}}"#, "not a path"),
+        (
+            r#"{"format":"csv","csv":{"delimiter":"é"}}"#,
+            "one ASCII character",
+        ),
+        (
+            r#"{"format":"csv","csv":{"delimiter":"\""}}"#,
+            "must differ",
+        ),
+        // The default delimiter counts: csv's comma, tsv's tab.
+        (r#"{"format":"csv","csv":{"quote":","}}"#, "must differ"),
+        (r#"{"format":"tsv","csv":{"quote":"\t"}}"#, "must differ"),
+        (
+            r#"{"format":"csv","csv":{"columns":["a","a"]}}"#,
+            "names `a` twice",
+        ),
+        (r#"{"format":"csv","csv":{"header":"yes","sep":";"}}"#, ""),
+    ] {
+        let e = spec(bad)
+            .err()
+            .unwrap_or_else(|| panic!("{bad} was accepted"))
+            .to_string();
+        assert!(e.contains(says), "{bad}: {e}");
+    }
+}
+
+fn change_cols() -> Vec<ColumnSpec> {
+    let col = |name: &str, ty: ColumnType, from: Option<&str>| ColumnSpec {
+        name: name.into(),
+        from: from.map(str::to_string),
+        ty,
+        transform: None,
+        required: false,
+    };
+    vec![
+        col("id", ColumnType::Int64, None),
+        col("name", ColumnType::String, None),
+        col("ts", ColumnType::Int64, Some("$.source.ts_ms")),
+    ]
+}
+
+fn envelope_feed() -> ChangesSpec {
+    ChangesSpec {
+        preset: None,
+        op: "op".into(),
+        insert: vec![json!("c")],
+        update: vec![json!("u")],
+        delete: vec![json!("d")],
+        skip: vec![json!("-U")],
+        row: Some("after".into()),
+        key_from: Some("before".into()),
+        order_by: vec!["ts".into()],
+        tombstone_retention: None,
+    }
+}
+
+#[test]
+fn a_change_feed_reads_the_row_the_key_and_the_envelope() {
+    let mut sh = Shaper::new(change_cols(), false)
+        .unwrap()
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &["id".to_string()])
+        .unwrap();
+    let ins = json!({"op": "c", "after": {"id": 1, "name": "Ada"}, "source": {"ts_ms": 10}});
+    let del = json!({"op": "d", "before": {"id": 2}, "after": null, "source": {"ts_ms": 11}});
+    // A delete whose `before` is absent reads its key from `after`.
+    let del2 = json!({"op": "d", "after": {"id": 3, "name": "x"}, "source": {"ts_ms": 12}});
+    for r in [&ins, &del, &del2] {
+        assert_eq!(sh.push(r).unwrap(), PushOutcome::Appended, "{r}");
+    }
+    assert_eq!(
+        sh.push(&json!({"op": "-U", "after": {"id": 1}})).unwrap(),
+        PushOutcome::Skipped
+    );
+    let b = sh.flush().unwrap().unwrap();
+    assert_eq!(b.schema().field(3).name(), CHANGE_COLUMN);
+    assert_eq!(
+        sh.table_schema().fields().len(),
+        3,
+        "the flag never reaches the table"
+    );
+    let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let ts = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    let flags = b
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow_array::UInt8Array>()
+        .unwrap();
+    assert_eq!((ids.value(0), ids.value(1), ids.value(2)), (1, 2, 3));
+    assert_eq!(
+        (ts.value(0), ts.value(1), ts.value(2)),
+        (10, 11, 12),
+        "read from the envelope"
+    );
+    assert_eq!(
+        (flags.value(0), flags.value(1), flags.value(2)),
+        (CHANGE_UPSERT, CHANGE_DELETE, CHANGE_DELETE)
+    );
+    // A delete in an upsert carries only its key and version.
+    assert!(b.column(1).is_null(1));
+    let r = sh.change_report().unwrap();
+    assert_eq!((r.inserts, r.updates, r.deletes, r.skipped), (1, 0, 2, 1));
+}
+
+#[test]
+fn a_change_that_cannot_be_placed_is_rejected() {
+    let mut sh = Shaper::new(change_cols(), false)
+        .unwrap()
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &["id".to_string()])
+        .unwrap();
+    let cases = [
+        (
+            json!({"after": {"id": 1}, "source": {"ts_ms": 1}}),
+            "has no `op`",
+        ),
+        (
+            json!({"op": "x", "after": {"id": 1}, "source": {"ts_ms": 1}}),
+            "none of the ops",
+        ),
+        (
+            json!({"op": "c", "after": null, "source": {"ts_ms": 1}}),
+            "no row at `after`",
+        ),
+        (json!({"op": "u", "after": {"id": 1}}), "has no version"),
+        (
+            json!({"op": "d", "before": {"name": "n"}, "source": {"ts_ms": 1}}),
+            "the delete has no key",
+        ),
+    ];
+    for (rec, says) in cases {
+        match sh.push(&rec).unwrap() {
+            PushOutcome::Rejected(why) => assert!(why.contains(says), "{rec}: {why}"),
+            other => panic!("{rec}: {other:?}"),
+        }
+    }
+    assert!(sh.flush().unwrap().is_none());
+}
+
+#[test]
+fn a_changelog_writes_every_change_with_its_op() {
+    let mut feed = envelope_feed();
+    feed.order_by.clear();
+    let mut sh = Shaper::new(change_cols(), false)
+        .unwrap()
+        .with_changes(&feed, ApplyMode::Changelog, &[])
+        .unwrap();
+    sh.push(&json!({"op": "c", "after": {"id": 1, "name": "a"}, "source": {"ts_ms": 1}}))
+        .unwrap();
+    sh.push(&json!({"op": "d", "before": {"id": 1, "name": "a"}, "source": {"ts_ms": 2}}))
+        .unwrap();
+    let b = sh.flush().unwrap().unwrap();
+    assert_eq!(sh.table_schema().field(3).name(), OP_COLUMN);
+    let op = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!((op.value(0), op.value(1)), ("insert", "delete"));
+    let name = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        name.value(1),
+        "a",
+        "a changelog keeps the delete's whole before-image"
+    );
+}
+
+#[test]
+fn changes_specs_are_checked_against_the_output() {
+    let spec = |changes: &str, output: &str| {
+        DatasetSpec::parse(&format!(
+            r#"{{"dataset":"t","changes":{changes},"output":{output}}}"#
+        ))
+    };
+    let ok = r#"{"op":"op","insert":["c"],"delete":["d"]}"#;
+    assert!(spec(ok, r#"{"format":"iceberg","path":"o","merge_on":["id"]}"#).is_ok());
+    assert!(spec(ok, r#"{"format":"iceberg","path":"o","apply":"changelog"}"#).is_ok());
+    for (changes, output, says) in [
+        (
+            ok,
+            r#"{"format":"iceberg","path":"o"}"#,
+            "set `output.merge_on`",
+        ),
+        (
+            ok,
+            r#"{"format":"parquet","path":"o","apply":"changelog"}"#,
+            "Iceberg table",
+        ),
+        (
+            ok,
+            r#"{"format":"iceberg","path":"o","apply":"changelog","merge_on":["id"]}"#,
+            "drop `output.merge_on`",
+        ),
+        (
+            r#"{"op":"op","insert":["c"],"order_by":["v"]}"#,
+            r#"{"format":"iceberg","path":"o","apply":"changelog"}"#,
+            "keeps them all",
+        ),
+        (
+            r#"{"op":"op","insert":["c"],"delete":["c"]}"#,
+            r#"{"format":"iceberg","path":"o","merge_on":["id"]}"#,
+            "in both",
+        ),
+        (
+            r#"{"op":"op","insert":[["c"]]}"#,
+            r#"{"format":"iceberg","path":"o","merge_on":["id"]}"#,
+            "a string, a number or a boolean",
+        ),
+        (
+            r#"{"op":"op"}"#,
+            r#"{"format":"iceberg","path":"o","merge_on":["id"]}"#,
+            "names no op value",
+        ),
+        (
+            r#"{"op":"op","insert":["c"],"preset":"x"}"#,
+            r#"{"format":"iceberg","path":"o","merge_on":["id"]}"#,
+            "unknown variant `x`",
+        ),
+    ] {
+        let e = spec(changes, output)
+            .err()
+            .unwrap_or_else(|| panic!("{changes} {output} was accepted"));
+        assert!(e.to_string().contains(says), "{changes} {output}: {e}");
+    }
+    let e = DatasetSpec::parse(
+        r#"{"dataset":"t","output":{"format":"iceberg","path":"o","apply":"upsert"}}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("needs a `changes:` block"), "{e}");
+}
+
+#[test]
+fn a_feed_with_key_from_takes_its_version_from_the_envelope() {
+    let mut feed = envelope_feed();
+    // `ts` read from the row: a delete's `before` carries the live row's own version.
+    let mut cols = change_cols();
+    cols[2].from = Some("ts_ms".into());
+    let e = Shaper::new(cols.clone(), false)
+        .unwrap()
+        .with_changes(&feed, ApplyMode::Upsert, &["id".to_string()])
+        .err()
+        .unwrap();
+    assert!(
+        e.to_string().contains("every delete") && e.to_string().contains("$.source.ts_ms"),
+        "{e}"
+    );
+    // A changelog keeps every change, so it orders nothing and is not refused.
+    feed.order_by.clear();
+    assert!(Shaper::new(cols, false)
+        .unwrap()
+        .with_changes(&feed, ApplyMode::Changelog, &[])
+        .is_ok());
+    // An upsert needs its keys.
+    let e = Shaper::new(change_cols(), false)
+        .unwrap()
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &[])
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("name the merge keys"), "{e}");
+    // The same, from a spec whose columns declare it.
+    let e = DatasetSpec::parse(
+        r#"{"dataset":"t","changes":{"op":"op","insert":["c"],"delete":["d"],"key_from":"before","order_by":["ts"]},
+            "output":{"format":"iceberg","path":"o","merge_on":["id"]},
+            "columns":[{"name":"id","type":"int64"},{"name":"ts","type":"int64"}]}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("every delete"), "{e}");
+}
+
+#[test]
+fn op_values_compare_exactly_and_a_feed_starts_with_the_first_record() {
+    let mut feed = envelope_feed();
+    feed.delete = vec![json!(9007199254740992u64)];
+    feed.insert = vec![json!(1)];
+    assert_eq!(
+        feed.kind_of(&json!(9007199254740992u64)),
+        Some(ChangeKind::Delete)
+    );
+    assert_eq!(
+        feed.kind_of(&json!(9007199254740993u64)),
+        None,
+        "rounds to the same float"
+    );
+    assert_eq!(feed.kind_of(&json!(1.0)), Some(ChangeKind::Insert));
+    assert_eq!(feed.kind_of(&json!(1.5)), None);
+    // `with_changes` after a record was pushed would leave the columns uneven.
+    let mut sh = Shaper::new(change_cols(), false).unwrap();
+    sh.push(&json!({"id": 1})).unwrap();
+    let e = sh
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &["id".to_string()])
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("before `push`"), "{e}");
+}
+
+#[test]
+fn with_a_row_drift_is_looked_for_in_the_row() {
+    let drift = DriftSpec {
+        policy: DriftPolicy::Error,
+        ..DriftSpec::default()
+    };
+    let mut cols = change_cols();
+    // A `$` path into the row covers that row field; one into the envelope covers nothing.
+    cols[1].from = Some("$.after.name".into());
+    let mut sh = Shaper::with_drift(cols, false, &drift, true)
+        .unwrap()
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &["id".to_string()])
+        .unwrap();
+    let ok = json!({"op": "c", "after": {"id": 1, "name": "a"}, "source": {"ts_ms": 1, "db": "x"}});
+    assert_eq!(sh.push(&ok).unwrap(), PushOutcome::Appended);
+    // A row field named like the envelope path is still new to the schema.
+    let drifted =
+        json!({"op": "c", "after": {"id": 2, "source": {"ts_ms": 5}}, "source": {"ts_ms": 2}});
+    let e = sh.push(&drifted).unwrap_err().to_string();
+    assert!(e.contains("source.ts_ms"), "{e}");
+}
+
+#[test]
+fn a_where_on_the_row_keeps_its_field_from_being_drift() {
+    let drift = DriftSpec {
+        policy: DriftPolicy::Error,
+        ..DriftSpec::default()
+    };
+    let mut sh = Shaper::with_drift(change_cols(), false, &drift, true)
+        .unwrap()
+        .with_where("after.status = 'active'")
+        .unwrap()
+        .with_changes(&envelope_feed(), ApplyMode::Upsert, &["id".to_string()])
+        .unwrap();
+    let rec = json!({"op": "c", "after": {"id": 1, "name": "a", "status": "active"}, "source": {"ts_ms": 1}});
+    assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+}
+
+#[test]
+fn a_preset_fills_in_what_the_spec_leaves_out() {
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-postgres }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+"#,
+    )
+    .unwrap();
+    let c = spec.changes.as_ref().unwrap();
+    assert_eq!(
+        (c.op.as_str(), c.row.as_deref(), c.key_from.as_deref()),
+        ("op", Some("after"), Some("before"))
+    );
+    assert_eq!(c.order_by, vec!["cdc_lsn".to_string()]);
+    assert_eq!(c.kind_of(&json!("r")), Some(ChangeKind::Insert));
+    let names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "cdc_lsn", "cdc_ts_ms"]);
+    assert_eq!(spec.columns[1].from.as_deref(), Some("$.source.lsn"));
+    // Read again (as `infer` writes it out), it says the same.
+    let again = DatasetSpec::parse(&spec.to_yaml().unwrap()).unwrap();
+    assert_eq!(again, spec);
+
+    // What the spec sets wins; a declared column of a preset's name stays as declared.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-mysql, order_by: [cdc_ts_ms, cdc_pos], tombstone_retention: 30d }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: cdc_ts_ms, type: timestamp, from: $.ts_ms }
+"#,
+    )
+    .unwrap();
+    let c = spec.changes.as_ref().unwrap();
+    assert_eq!(
+        c.order_by,
+        vec!["cdc_ts_ms".to_string(), "cdc_pos".to_string()]
+    );
+    let ts = spec.columns.iter().find(|c| c.name == "cdc_ts_ms").unwrap();
+    assert_eq!(
+        (ts.ty, ts.from.as_deref()),
+        (ColumnType::Timestamp, Some("$.ts_ms"))
+    );
+    assert!(spec.columns.iter().any(|c| c.name == "cdc_file"));
+
+    // Flink's changelog: `-U` skipped, the row in `data`, no order of its own.
+    let spec = DatasetSpec::parse(
+        r#"{"dataset":"t","changes":{"preset":"flink-cdc"},"output":{"format":"iceberg","path":"o","merge_on":["id"]}}"#,
+    )
+    .unwrap();
+    let c = spec.changes.as_ref().unwrap();
+    assert_eq!(c.kind_of(&json!("-U")), Some(ChangeKind::Skip));
+    assert_eq!((c.row.as_deref(), c.order_by.len()), (Some("data"), 0));
+}
+
+#[test]
+fn a_debezium_record_shapes_through_the_preset() {
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+schema: strict
+changes: { preset: debezium-postgres }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+  - { name: status, type: string }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let rec = json!({"before": null, "after": {"id": 7, "status": "paid"}, "op": "c",
+                     "source": {"lsn": 3456, "ts_ms": 1700000000000i64}, "ts_ms": 1700000000001i64});
+    assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+    let del =
+        json!({"before": {"id": 7}, "after": null, "op": "d", "source": {"lsn": 3460, "ts_ms": 1}});
+    assert_eq!(sh.push(&del).unwrap(), PushOutcome::Appended);
+    let b = sh.flush().unwrap().unwrap();
+    let lsn = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!((lsn.value(0), lsn.value(1)), (3456, 3460));
+}
+
+#[test]
+fn a_pulled_source_names_the_variables_its_credentials_are_in() {
+    let src = |yaml: &str| DatasetSpec::parse(yaml).unwrap().source;
+    let http = src(r#"
+dataset: orders
+source:
+  http:
+    url: https://api.example.com/orders
+    auth: { header_env: { name: X-Api-Key, env: ORDERS_KEY } }
+output: { format: iceberg, path: o }
+"#);
+    assert!(http.pulls());
+    assert_eq!(http.credential_env(), ["ORDERS_KEY"]);
+    let soap = src(r#"
+dataset: orders
+source:
+  http:
+    url: https://ws.example.com/orders
+    format: xml
+    soap: { body_template: "<Get/>", username_env: WS_USER, password_env: WS_PASS }
+  xml: { record: /Envelope/Body/Order }
+output: { format: iceberg, path: o }
+"#);
+    assert_eq!(soap.credential_env(), ["WS_PASS", "WS_USER"]);
+    let db = src(r#"
+dataset: orders
+source: { postgres: { url: "postgres://reader@db:5432/shop", table: orders } }
+output: { format: iceberg, path: o }
+"#);
+    assert_eq!(db.credential_env(), ["SHAPESHIFT_POSTGRES_PASSWORD"]);
+    // A file holds no credentials.
+    let file =
+        src("dataset: orders\nsource: { path: o.jsonl }\noutput: { format: iceberg, path: o }\n");
+    assert!(!file.pulls());
+    assert!(file.credential_env().is_empty());
+}
+
+#[test]
+fn a_debezium_seed_row_takes_the_lowest_version_and_a_change_keeps_its_own() {
+    // Postgres: a snapshot read (`r`) carries the snapshot's LSN, above that of a transaction
+    // still open across it. It is shaped with `cdc_lsn` 0.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-postgres }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    for (op, lsn) in [("r", 22487464), ("u", 22487064), ("c", 22487216)] {
+        let rec = json!({"before": null, "after": {"id": 1}, "op": op,
+                         "source": {"lsn": lsn, "ts_ms": 5}});
+        assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+    }
+    // A seed row without an LSN at all (an incremental snapshot's read, say) is placed too.
+    let rec = json!({"before": null, "after": {"id": 2}, "op": "r", "source": {"ts_ms": 5}});
+    assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+    let b = sh.flush().unwrap().unwrap();
+    let lsn = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        (0..4).map(|i| lsn.value(i)).collect::<Vec<_>>(),
+        [0, 22487064, 22487216, 0]
+    );
+    // The time it was read is kept: only the version is the seed's.
+    let ts = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ts.value(0), 5);
+
+    // MySQL: an empty file name, position 0, row 0.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-mysql }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    for op in ["r", "u"] {
+        let rec = json!({"before": null, "after": {"id": 1}, "op": op,
+                         "source": {"file": "binlog.000003", "pos": 1554, "row": 2, "ts_ms": 5}});
+        assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+    }
+    let b = sh.flush().unwrap().unwrap();
+    let names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+    let at = |n: &str| names.iter().position(|c| *c == n).unwrap();
+    let file = b
+        .column(at("cdc_file"))
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let pos = b
+        .column(at("cdc_pos"))
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let row = b
+        .column(at("cdc_row"))
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((file.value(0), pos.value(0), row.value(0)), ("", 0, 0));
+    assert_eq!(
+        (file.value(1), pos.value(1), row.value(1)),
+        ("binlog.000003", 1554, 2)
+    );
+
+    // A spec that versions by a column of its own: a seed row takes that type's lowest.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-postgres, order_by: [cdc_ts_ms] }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let rec =
+        json!({"before": null, "after": {"id": 1}, "op": "r", "source": {"lsn": 9, "ts_ms": 5}});
+    assert_eq!(sh.push(&rec).unwrap(), PushOutcome::Appended);
+    let b = sh.flush().unwrap().unwrap();
+    let ts = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ts.value(0), i64::MIN);
+}
+
+#[test]
+fn a_change_versioned_like_a_seed_row_is_refused_not_lost() {
+    // A tie with a snapshot row is stale, so a change at exactly the seed's version would lose
+    // to one with nothing said. A custom string version can be "": refused, and counted.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-postgres, order_by: [ver] }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+  - { name: ver, type: string, from: $.ver }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let rec = |op: &str, ver: &str| {
+        json!({"before": null, "after": {"id": 1}, "op": op, "ver": ver,
+               "source": {"lsn": 9, "ts_ms": 5}})
+    };
+    match sh.push(&rec("u", "")).unwrap() {
+        PushOutcome::Rejected(why) => assert!(why.contains("snapshot rows"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sh.push(&rec("u", "a")).unwrap(), PushOutcome::Appended);
+    // A snapshot row with any version of its own takes "": not refused.
+    assert_eq!(sh.push(&rec("r", "z")).unwrap(), PushOutcome::Appended);
+
+    // The preset's own column: an LSN of 0 never comes from Postgres, and is refused too.
+    let spec = DatasetSpec::parse(
+        r#"
+dataset: orders
+changes: { preset: debezium-postgres }
+output: { format: iceberg, path: o, merge_on: [id] }
+columns:
+  - { name: id, type: int64 }
+"#,
+    )
+    .unwrap();
+    let mut sh = Shaper::from_spec(&spec, &[]).unwrap();
+    let rec =
+        json!({"before": {"id": 1}, "after": null, "op": "d", "source": {"lsn": 0, "ts_ms": 5}});
+    assert!(matches!(
+        sh.push(&rec).unwrap(),
+        PushOutcome::Rejected(why) if why.contains("delete is versioned at the lowest")
+    ));
+}
+
+#[test]
+fn preset_lists_fill_one_by_one_and_flink_refuses_an_order() {
+    // The spec's own delete list stays; the preset fills the lists it left empty.
+    let spec = DatasetSpec::parse(
+        r#"{"dataset":"t","changes":{"preset":"debezium-mysql","delete":["d","t"]},
+            "output":{"format":"iceberg","path":"o","merge_on":["id"]}}"#,
+    )
+    .unwrap();
+    let c = spec.changes.as_ref().unwrap();
+    assert_eq!(c.kind_of(&json!("t")), Some(ChangeKind::Delete));
+    assert_eq!(c.kind_of(&json!("c")), Some(ChangeKind::Insert));
+    assert_eq!(c.kind_of(&json!("u")), Some(ChangeKind::Update));
+    // A version read from a Flink `-D`'s row would be the live row's own: refused.
+    let e = DatasetSpec::parse(
+        r#"{"dataset":"t","changes":{"preset":"flink-cdc","order_by":["v"]},
+            "output":{"format":"iceberg","path":"o","merge_on":["id"]}}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("every delete stale"), "{e}");
+}
+
+#[test]
+fn a_spec_built_in_code_expands_its_preset_too() {
+    let changes = ChangesSpec {
+        preset: Some(ChangesPreset::FlinkCdc),
+        op: String::new(),
+        insert: vec![],
+        update: vec![],
+        delete: vec![],
+        skip: vec![],
+        row: None,
+        key_from: None,
+        order_by: vec![],
+        tombstone_retention: None,
+    };
+    let cols = vec![ColumnSpec {
+        name: "id".into(),
+        from: None,
+        ty: ColumnType::Int64,
+        transform: None,
+        required: false,
+    }];
+    let mut sh = Shaper::new(cols, false)
+        .unwrap()
+        .with_changes(&changes, ApplyMode::Upsert, &["id".to_string()])
+        .unwrap();
+    assert_eq!(
+        sh.push(&json!({"op": "+I", "data": {"id": 1}})).unwrap(),
+        PushOutcome::Appended
+    );
+    assert_eq!(
+        sh.push(&json!({"op": "-U", "data": {"id": 1}})).unwrap(),
+        PushOutcome::Skipped
+    );
+}
+
+#[test]
+fn a_tombstone_retention_under_an_hour_is_refused() {
+    let spec = |r: &str| {
+        DatasetSpec::parse(&format!(
+            r#"{{"dataset":"t","changes":{{"op":"op","insert":["c"],"delete":["d"],"order_by":["v"],"tombstone_retention":"{r}"}},"output":{{"format":"iceberg","path":"o","merge_on":["id"]}}}}"#
+        ))
+    };
+    assert!(spec("1h").is_ok());
+    let e = spec("59m").unwrap_err().to_string();
+    assert!(e.contains("the least is 1h"), "{e}");
 }

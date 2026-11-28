@@ -69,6 +69,8 @@ pub struct ExpireSummary {
     pub delete_files_deleted: u64,
     pub manifests_deleted: u64,
     pub manifest_lists_deleted: u64,
+    /// Statistics files (tombstone files) only expired snapshots named.
+    pub statistics_files_deleted: u64,
     /// Bytes of the files deleted, from the sizes the metadata records (a manifest list's
     /// own size is not recorded anywhere, so it is not counted).
     pub bytes_deleted: u64,
@@ -91,6 +93,8 @@ pub enum FileKind {
     Deletes,
     Manifest,
     ManifestList,
+    /// A statistics file a snapshot names (a change feed's tombstones).
+    Statistics,
 }
 
 /// A file to delete once the commit is published.
@@ -129,6 +133,7 @@ impl ExpireSummary {
             FileKind::Deletes => self.delete_files_deleted += 1,
             FileKind::Manifest => self.manifests_deleted += 1,
             FileKind::ManifestList => self.manifest_lists_deleted += 1,
+            FileKind::Statistics => self.statistics_files_deleted += 1,
         }
         self.bytes_deleted += t.size.unwrap_or(0);
     }
@@ -192,6 +197,39 @@ pub fn plan_expiry<F: TableFiles>(
     if let Some(refs) = meta["refs"].as_object() {
         keep.extend(refs.values().filter_map(|r| r["snapshot-id"].as_i64()));
     }
+    // A change feed's state (its order and tombstones) is found by walking back from the
+    // current snapshot to the nearest that records it. Writes by other engines record
+    // nothing, so every snapshot on that walk is kept: expiring one would cut the walk off,
+    // and the next merge would find no tombstones at all.
+    // The walk starts from every ref too: a tagged snapshot is one `main` can be rolled
+    // back to, and its state must still be found then.
+    let starts: Vec<i64> = meta["current-snapshot-id"]
+        .as_i64()
+        .filter(|c| *c >= 0)
+        .into_iter()
+        .chain(
+            meta["refs"]
+                .as_object()
+                .into_iter()
+                .flat_map(|r| r.values().filter_map(|r| r["snapshot-id"].as_i64())),
+        )
+        .collect();
+    for start in starts {
+        let mut at = Some(start);
+        let mut walk = Vec::new();
+        while let Some(sid) = at {
+            let Some(s) = by_id.get(&sid) else { break };
+            walk.push(sid);
+            if !s["summary"][metadata::CHANGES_FORMAT_KEY].is_null() {
+                keep.extend(walk.iter().copied());
+                break;
+            }
+            at = s["parent-snapshot-id"].as_i64();
+            if walk.len() > snapshots.len() {
+                break;
+            }
+        }
+    }
     for s in snapshots {
         if s["timestamp-ms"].as_i64().unwrap_or(i64::MAX) >= options.older_than_ms {
             keep.extend(id(s));
@@ -250,8 +288,33 @@ pub fn plan_expiry<F: TableFiles>(
     let read = read_each(files, &paths, |m| read_manifest_entries(&files.read(m)?))?;
     let manifests: HashMap<&str, Vec<ManifestEntry>> = paths.iter().copied().zip(read).collect();
 
-    // What the retained snapshots need.
-    let mut needed: HashSet<String> = HashSet::new();
+    // What the retained snapshots need. A statistics file is named per snapshot, in the
+    // table's `statistics` list: one a retained snapshot names stays.
+    let statistics: Vec<(i64, String, Option<u64>)> = ["statistics", "partition-statistics"]
+        .iter()
+        .flat_map(|l| meta[*l].as_array().into_iter().flatten())
+        .filter_map(|e| {
+            Some((
+                e["snapshot-id"].as_i64()?,
+                e["statistics-path"].as_str()?.to_string(),
+                e["file-size-in-bytes"].as_u64(),
+            ))
+        })
+        .collect();
+    let mut needed: HashSet<String> = statistics
+        .iter()
+        .filter(|(id, _, _)| keep.contains(id))
+        .map(|(_, p, _)| p.clone())
+        .collect();
+    // A retained snapshot's summary names its tombstone file too, and is what a merge reads:
+    // that keeps the file even when another engine replaced the snapshot's statistics entry
+    // (an `ANALYZE` writes its own).
+    let location = meta["location"].as_str().unwrap_or(base_location);
+    for s in &retained {
+        if let Some(key) = s["summary"][metadata::TOMBSTONES_KEY].as_str() {
+            needed.insert(metadata::join_location(location, key));
+        }
+    }
     for list in &retained_lists {
         for m in &manifest_lists[list.as_str()] {
             let live = manifests[m.path.as_str()].iter().filter(|e| e.is_live());
@@ -309,6 +372,34 @@ pub fn plan_expiry<F: TableFiles>(
             },
             &mut summary,
         );
+    }
+    // A tombstone file an expired snapshot names only in its summary (another engine replaced
+    // its statistics entry) goes too, unless something retained still names it.
+    for s in &expired_sorted {
+        if let Some(key) = s["summary"][metadata::TOMBSTONES_KEY].as_str() {
+            consider(
+                DeleteTarget {
+                    path: metadata::join_location(location, key),
+                    kind: FileKind::Statistics,
+                    size: s["summary"][metadata::TOMBSTONES_BYTES_KEY]
+                        .as_str()
+                        .and_then(|v| v.parse().ok()),
+                },
+                &mut summary,
+            );
+        }
+    }
+    for (id, path, size) in &statistics {
+        if !keep.contains(id) {
+            consider(
+                DeleteTarget {
+                    path: path.clone(),
+                    kind: FileKind::Statistics,
+                    size: *size,
+                },
+                &mut summary,
+            );
+        }
     }
 
     let version = table.version + 1;

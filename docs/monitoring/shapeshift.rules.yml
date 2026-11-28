@@ -1,0 +1,44 @@
+# shapeshift alert rules for one-shot runs (--metrics-file) and the console
+# (serve --metrics-addr). Thresholds are starting points: tune them to your datasets.
+# Checked with: promtool check rules
+groups:
+  - name: shapeshift-runs
+    rules:
+      - alert: ShapeshiftRunFailing
+        expr: "shapeshift_run_last_exit_status != 0"
+        for: 0m
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "{{ $labels.command }} of {{ $labels.dataset }} last exited {{ $value }}"
+          description: "75: another writer committed first (run it again); 1: the run failed. See its --summary-json or log."
+      - alert: ShapeshiftDatasetStale
+        expr: "time() - shapeshift_run_last_success_timestamp_seconds > 6 * 3600"
+        for: 5m
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "{{ $labels.dataset }}: no successful {{ $labels.command }} for over 6 h"
+          description: "Change 6 * 3600 to the dataset's own window. A run killed before it could write leaves the file stale; the end timestamp shows when it last ran."
+      - alert: ShapeshiftConsoleNeedsALook
+        expr: "shapeshift_attention > 0"
+        for: 5m
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "The console's Overview lists {{ $value }} {{ $labels.kind }}"
+      - alert: ShapeshiftConnectorBackedUp
+        expr: "shapeshift_ingest_waiting_batches > 3 or shapeshift_ingest_oldest_record_age_seconds > 900"
+        for: 10m
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "Connector {{ $labels.connector }}: records are not landing"
+          description: "Sealed batches wait, or the open spool's oldest record is over 15 min old. Is its dataset there, and do its runs succeed?"
+      - alert: ShapeshiftSourceBehind
+        expr: "time() - shapeshift_source_position_timestamp_seconds > 3600"
+        for: 15m
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "{{ $labels.dataset }}: its source position is over an hour behind"

@@ -136,6 +136,232 @@ pub struct SnapshotTags {
     /// committed (see [`snapshot_of_run`]).
     pub run_id: Option<String>,
     pub rebases: u32,
+    /// A change feed's merge: the `order_by` it applied changes in, recorded as
+    /// [`crate::merge::CHANGES_ORDER_KEY`] so a later merge applies them the same way.
+    pub changes_order: Option<Vec<String>>,
+    /// A change feed's merge that rewrote the table's tombstones: the file it wrote
+    /// ([`crate::tombstones`]). Absent, the snapshot names the file the table already had.
+    pub tombstones: Option<TombstoneRef>,
+    /// A pulled source's position after this write: its kind and the position's JSON,
+    /// recorded as `shapeshift.source.<kind>` ([`SOURCE_KEY_PREFIX`]).
+    pub source: Option<(String, String)>,
+}
+
+/// The prefix of the snapshot summary key holding a pulled source's position: the key is
+/// `shapeshift.source.<kind>` (`http`, `mysql`), its value the position's JSON. Every
+/// snapshot written onto the table carries it forward, so expiring the snapshot that wrote
+/// it, or another writer's append, loses nothing.
+pub const SOURCE_KEY_PREFIX: &str = "shapeshift.source.";
+
+/// Refuse a source kind that would not make a plain summary key.
+pub fn validate_source_kind(kind: &str) -> Result<()> {
+    let ok = !kind.is_empty()
+        && kind.len() <= 64
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(ShapeError::Sink(format!(
+            "a source kind is lowercase letters, digits and `-`, at most 64: {kind:?}"
+        )))
+    }
+}
+
+/// The position the table's current state records for a `kind` source: the nearest one in
+/// the current snapshot's ancestry, parsed. `None`: the table has none (or no table).
+pub fn table_source_position(meta: &Value, kind: &str) -> Result<Option<Value>> {
+    let key = format!("{SOURCE_KEY_PREFIX}{kind}");
+    // A table holds one source's rows: another kind's would be resumed from no position, and
+    // its rows mixed with these.
+    if let Some((other, _)) = table_source_positions(meta)
+        .into_iter()
+        .find(|(k, _)| *k != key)
+    {
+        return Err(ShapeError::Sink(format!(
+            "the table records a `{}` source's position ({other}), and this run pulls from a \
+             `{kind}` source: resuming there would skip or repeat rows. Write this source to a \
+             table of its own",
+            other.trim_start_matches(SOURCE_KEY_PREFIX)
+        )));
+    }
+    let Some(s) = nearest_summary(meta, &key) else {
+        return Ok(None);
+    };
+    let raw = &s[&key];
+    raw.as_str()
+        .and_then(|t| serde_json::from_str(t).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            ShapeError::Sink(format!(
+                "the table records its `{kind}` source position ({key}) as {raw}, which is not \
+                 JSON: no incremental run goes on from an unreadable position"
+            ))
+        })
+}
+
+/// Every source position the table's current state records, by summary key, as written.
+fn table_source_positions(meta: &Value) -> Vec<(String, Value)> {
+    let mut out: Vec<(String, Value)> = Vec::new();
+    let Some(snapshots) = meta["snapshots"].as_array() else {
+        return out;
+    };
+    let mut cur = meta["current-snapshot-id"].as_i64().filter(|&id| id != -1);
+    for _ in 0..=snapshots.len() {
+        let Some(s) = cur.and_then(|id| {
+            snapshots
+                .iter()
+                .find(|s| s["snapshot-id"].as_i64() == Some(id))
+        }) else {
+            break;
+        };
+        if let Some(summary) = s["summary"].as_object() {
+            for (k, v) in summary {
+                if k.starts_with(SOURCE_KEY_PREFIX) && !out.iter().any(|(o, _)| o == k) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        cur = s["parent-snapshot-id"].as_i64();
+    }
+    out
+}
+
+/// The snapshot summary keys that name a table's tombstone file, its tombstone count, and
+/// its size and footer size (so a later write can name it again with no lookup).
+pub const TOMBSTONES_KEY: &str = "shapeshift.tombstones";
+pub const TOMBSTONES_COUNT_KEY: &str = "shapeshift.tombstones-count";
+pub const TOMBSTONES_BYTES_KEY: &str = "shapeshift.tombstones-bytes";
+pub const TOMBSTONES_FOOTER_KEY: &str = "shapeshift.tombstones-footer-bytes";
+/// The snapshot (and its sequence number) whose write computed the tombstone file, as its
+/// Puffin blob records them: every later snapshot that names the file says the same.
+pub const TOMBSTONES_SNAPSHOT_KEY: &str = "shapeshift.tombstones-snapshot-id";
+pub const TOMBSTONES_SEQUENCE_KEY: &str = "shapeshift.tombstones-sequence-number";
+
+/// The snapshot summary key naming the format of a table's change-feed state (its order
+/// and tombstones). A build refuses to write a table whose format is newer than
+/// [`CHANGES_FORMAT`], rather than ignore state it does not understand.
+pub const CHANGES_FORMAT_KEY: &str = "shapeshift.changes.format";
+pub const CHANGES_FORMAT: u64 = 1;
+
+/// A tombstone file, as a snapshot names it: its key under the table's location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TombstoneRef {
+    pub key: String,
+    pub count: u64,
+    pub bytes: u64,
+    pub footer_bytes: u64,
+    /// The snapshot whose write computed the file, and its sequence number.
+    pub snapshot_id: i64,
+    pub sequence_number: i64,
+}
+
+/// The nearest snapshot in the current snapshot's ancestry whose summary has `key`.
+pub(crate) fn nearest_summary<'m>(meta: &'m Value, key: &str) -> Option<&'m Value> {
+    let snapshots = meta["snapshots"].as_array()?;
+    let by_id = |id: i64| {
+        snapshots
+            .iter()
+            .find(|s| s["snapshot-id"].as_i64() == Some(id))
+    };
+    let mut cur = meta["current-snapshot-id"].as_i64().filter(|&id| id != -1);
+    for _ in 0..=snapshots.len() {
+        let s = by_id(cur?)?;
+        if !s["summary"][key].is_null() {
+            return Some(&s["summary"]);
+        }
+        cur = s["parent-snapshot-id"].as_i64();
+    }
+    None // a cycle: malformed metadata
+}
+
+/// The tombstone file the table's current state has, if any.
+pub fn table_tombstones(meta: &Value) -> Result<Option<TombstoneRef>> {
+    let Some(s) = nearest_summary(meta, TOMBSTONES_KEY) else {
+        return Ok(None);
+    };
+    let unreadable = |k: &str| {
+        ShapeError::Sink(format!(
+            "the table names tombstones, but its `{k}` ({}) is unreadable: no merge goes on \
+             without them",
+            s[k]
+        ))
+    };
+    let num = |k: &str| -> Result<i64> {
+        s[k].as_str()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| unreadable(k))
+    };
+    let key = s[TOMBSTONES_KEY]
+        .as_str()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| unreadable(TOMBSTONES_KEY))?;
+    let size = |k: &str| num(k).and_then(|v| u64::try_from(v).map_err(|_| unreadable(k)));
+    Ok(Some(TombstoneRef {
+        key: key.to_string(),
+        count: size(TOMBSTONES_COUNT_KEY)?,
+        bytes: size(TOMBSTONES_BYTES_KEY)?,
+        footer_bytes: size(TOMBSTONES_FOOTER_KEY)?,
+        snapshot_id: num(TOMBSTONES_SNAPSHOT_KEY)?,
+        sequence_number: num(TOMBSTONES_SEQUENCE_KEY)?,
+    }))
+}
+
+/// Refuse a table whose change-feed state is in a format newer than this build writes.
+pub(crate) fn ensure_changes_format(meta: &Value) -> Result<()> {
+    let Some(s) = nearest_summary(meta, CHANGES_FORMAT_KEY) else {
+        return Ok(());
+    };
+    match s[CHANGES_FORMAT_KEY]
+        .as_str()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(v) if v <= CHANGES_FORMAT => Ok(()),
+        _ => Err(ShapeError::Sink(format!(
+            "cannot write: the table's change-feed state is format {} ({CHANGES_FORMAT_KEY}), \
+             and this shapeshift knows format {CHANGES_FORMAT} at most: write it with a newer \
+             shapeshift, which keeps its tombstones",
+            s[CHANGES_FORMAT_KEY]
+                .as_str()
+                .map_or_else(|| s[CHANGES_FORMAT_KEY].to_string(), str::to_string)
+        ))),
+    }
+}
+
+/// Record `t` on snapshot `snapshot_id` of `m`: the summary keys, the format, and an entry
+/// in the table's `statistics` list (which keeps the file reachable for other engines'
+/// orphan cleanup and for `relocate`).
+fn record_tombstones(
+    m: &mut Value,
+    summary: &mut Value,
+    t: &TombstoneRef,
+    snapshot_id: i64,
+    base_location: &str,
+) {
+    summary[TOMBSTONES_KEY] = json!(t.key);
+    summary[TOMBSTONES_COUNT_KEY] = json!(t.count.to_string());
+    summary[TOMBSTONES_BYTES_KEY] = json!(t.bytes.to_string());
+    summary[TOMBSTONES_FOOTER_KEY] = json!(t.footer_bytes.to_string());
+    summary[TOMBSTONES_SNAPSHOT_KEY] = json!(t.snapshot_id.to_string());
+    summary[TOMBSTONES_SEQUENCE_KEY] = json!(t.sequence_number.to_string());
+    push_array(
+        m,
+        "statistics",
+        json!({
+            "snapshot-id": snapshot_id,
+            "statistics-path": join_location(base_location, &t.key),
+            "file-size-in-bytes": t.bytes,
+            "file-footer-size-in-bytes": t.footer_bytes,
+            "blob-metadata": [{
+                // As the blob itself records them: the write that computed the file.
+                "type": crate::tombstones::BLOB_TYPE,
+                "snapshot-id": t.snapshot_id,
+                "sequence-number": t.sequence_number,
+                "fields": [],
+            }],
+        }),
+    );
 }
 
 /// The longest run id accepted.
@@ -237,6 +463,14 @@ fn summary_json(c: &SnapshotCounts, tags: &SnapshotTags) -> Value {
     if tags.rebases > 0 {
         summary[REBASES_KEY] = json!(tags.rebases.to_string());
     }
+    if let Some(order) = &tags.changes_order {
+        // A JSON array, so a column whose name has a comma cannot read as two columns.
+        summary[crate::merge::CHANGES_ORDER_KEY] = json!(json!(order).to_string());
+        summary[CHANGES_FORMAT_KEY] = json!(CHANGES_FORMAT.to_string());
+    }
+    if let Some((kind, position)) = &tags.source {
+        summary[format!("{SOURCE_KEY_PREFIX}{kind}")] = json!(position);
+    }
     summary
 }
 
@@ -246,7 +480,17 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
         return Err(ShapeError::Sink("iceberg table has no columns".into()));
     }
     let schema = schema_json(inp.fields);
-    let summary = summary_json(&inp.counts, inp.tags);
+    let mut summary = summary_json(&inp.counts, inp.tags);
+    let mut statistics = json!({});
+    if let Some(t) = &inp.tags.tombstones {
+        record_tombstones(
+            &mut statistics,
+            &mut summary,
+            t,
+            inp.snapshot_id,
+            inp.location,
+        );
+    }
     let snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,
@@ -277,6 +521,7 @@ pub fn table_metadata(inp: &MetadataInput) -> Result<Value> {
         "refs": { "main": { "snapshot-id": inp.snapshot_id, "type": "branch" } },
         "snapshots": [snapshot],
         "snapshot-log": [ { "timestamp-ms": inp.timestamp_ms, "snapshot-id": inp.snapshot_id } ],
+        "statistics": statistics["statistics"].as_array().cloned().unwrap_or_default(),
         "metadata-log": match inp.replaces_metadata_file {
             Some(file) => json!([{ "timestamp-ms": inp.timestamp_ms, "metadata-file": file }]),
             None => json!([]),
@@ -328,7 +573,39 @@ pub fn append_snapshot(inp: &AppendInput) -> Result<Value> {
     let parent = m["current-snapshot-id"].as_i64().filter(|&id| id != -1);
     let schema_id = advance_schema(&mut m, inp.schema_fields)?;
 
-    let summary = summary_json(&inp.counts, inp.tags);
+    // A table whose changes are ordered keeps saying so on every snapshot written onto it
+    // (an append, a compaction), so expiring the snapshot that first said it loses nothing.
+    let mut tags = inp.tags.clone();
+    let mut unreadable = None;
+    if tags.changes_order.is_none() {
+        match crate::merge::table_change_order(inp.prior) {
+            Some(Ok(order)) if !order.is_empty() => tags.changes_order = Some(order),
+            // Carried exactly as it was, so it goes on refusing merges.
+            Some(Err(raw)) => unreadable = Some(raw),
+            _ => {}
+        }
+    }
+    let mut summary = summary_json(&inp.counts, &tags);
+    // Source positions the table records, carried forward as they were (this write's own
+    // kind, if it has one, is already set).
+    for (key, value) in table_source_positions(inp.prior) {
+        if summary[&key].is_null() {
+            summary[key] = value;
+        }
+    }
+    if let Some(raw) = unreadable {
+        summary[crate::merge::CHANGES_ORDER_KEY] = json!(raw);
+        summary[CHANGES_FORMAT_KEY] = json!(CHANGES_FORMAT.to_string());
+    }
+    // The tombstones: this write's, or the ones the table had, named again on this snapshot.
+    let tombstones = match &tags.tombstones {
+        Some(t) => Some(t.clone()),
+        None => table_tombstones(inp.prior)?,
+    };
+    if let Some(t) = &tombstones {
+        record_tombstones(&mut m, &mut summary, t, inp.snapshot_id, inp.base_location);
+        summary[CHANGES_FORMAT_KEY] = json!(CHANGES_FORMAT.to_string());
+    }
     let mut snapshot = json!({
         "sequence-number": inp.sequence_number,
         "snapshot-id": inp.snapshot_id,
@@ -421,6 +698,19 @@ pub fn remove_snapshots(inp: &RemoveInput) -> Result<Value> {
         .collect();
     suffix.reverse();
     m["snapshot-log"] = Value::Array(suffix);
+
+    // A statistics file (a tombstone file, say) is named per snapshot: the entries of
+    // removed snapshots go with them.
+    for list in ["statistics", "partition-statistics"] {
+        if let Some(entries) = m[list].as_array() {
+            let kept_entries: Vec<Value> = entries
+                .iter()
+                .filter(|e| kept(e, "snapshot-id"))
+                .cloned()
+                .collect();
+            m[list] = Value::Array(kept_entries);
+        }
+    }
 
     if let Some(refs) = m["refs"].as_object() {
         let refs: serde_json::Map<String, Value> = refs

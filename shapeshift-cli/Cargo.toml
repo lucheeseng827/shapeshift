@@ -1,6 +1,6 @@
 [package]
 name = "shapeshift-cli"
-description = "shapeshift CLI — the single `shapeshift` binary: infer a spec from sample JSON, shape JSONL/JSON into Parquet or Iceberg, inspect the output, and price a run against Fivetran-style MAR (Monthly Active Rows)."
+description = "shapeshift CLI — the single `shapeshift` binary: infer a spec from a sample of the input, shape JSONL, JSON, CSV, TSV or XML (or a pulled source) into Parquet or Iceberg, inspect the output, and price a run against Fivetran-style MAR (Monthly Active Rows)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,24 +16,41 @@ default = []
 # Object-store output (S3/GCS/Azure) via `--output <url>`. OFF by default so the
 # lean musl-static `shapeshift` binary never links the cloud SDKs; CI asserts their
 # absence from the default build.
-object_store = ["dep:shapeshift-objstore"]
+object_store = ["dep:shapeshift-objstore", "shapeshift-serve?/catalog"]
 # Opt-in "fat build": links the zstd C codec so `--compression zstd` works for both
 # Parquet output and the Iceberg data files. OFF by default — the lean binary stays
 # Snappy-only (pure Rust, musl-static with no C codecs).
 zstd = ["shapeshift-parquet/zstd", "shapeshift-iceberg/zstd"]
 # Opt-in local web console (`shapeshift serve`). Pulls in shapeshift-serve, whose
-# HTTP server is hand-rolled on std::net — NO async runtime, NO web framework, NO C
-# code — so the fat build is still one relocatable static binary. OFF by default so
+# HTTP server is hand-rolled on std::net — NO async runtime, NO web framework. Its one C
+# dependency is ring, under rustls, for delivering alerts to HTTPS webhooks; it links
+# statically, so the fat build is still one relocatable static binary. OFF by default so
 # the lean `shapeshift` binary is byte-for-byte unchanged.
 serve = ["dep:shapeshift-serve"]
+# Opt-in HTTP source (`shape --from <url>`, `source.http`): a paged REST endpoint, read
+# incrementally. OFF by default so the lean binary links no HTTP client; its client is the
+# rustls one the console already uses.
+http = ["dep:shapeshift-source-http", "shapeshift-serve?/http"]
+# Opt-in MySQL source (`shape --from mysql://…`, `source.mysql`): a query or a table read
+# incrementally by a watermark, on a pure-Rust client over rustls. OFF by default so the lean
+# binary links no database client.
+mysql = ["dep:shapeshift-source-mysql", "shapeshift-serve?/mysql"]
+# Opt-in Postgres source (`shape --from postgres://…`, `source.postgres`), on the pure-Rust
+# client over rustls. OFF by default.
+postgres = ["dep:shapeshift-source-postgres", "shapeshift-serve?/postgres"]
 
 [dependencies]
 shapeshift-core = { workspace = true }
 shapeshift-json = { workspace = true }
 shapeshift-parquet = { workspace = true }
 shapeshift-iceberg = { workspace = true }
+# `shapeshift mcp`: in the default binary (it adds no dependency and opens no listener).
+shapeshift-mcp = { workspace = true }
 shapeshift-objstore = { workspace = true, optional = true }
 shapeshift-serve = { workspace = true, optional = true }
+shapeshift-source-http = { workspace = true, optional = true }
+shapeshift-source-mysql = { workspace = true, optional = true }
+shapeshift-source-postgres = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -41,3 +58,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The stand-in server of the http-source tests reads its query with it.
+url = { workspace = true }

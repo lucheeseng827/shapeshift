@@ -67,6 +67,11 @@ not-json-a-bad-line`;
 // ---- navigation -------------------------------------------------------------
 
 const TITLES = {
+  overview: ["Overview", "What needs a look, and what ran."],
+  catalog: ["Catalog", "A REST catalog's namespaces and tables, read-only: each table's history, and how to read it from an engine."],
+  connectors: ["Connectors", "Ingest URLs producers push JSON to, each with its own token; batches land through a dataset."],
+  alerts: ["Alerts", "Rules over what needs a look, and the webhooks they tell: once when an incident opens, once when it resolves."],
+  datasets: ["Datasets", "Specs with a name: what each reads, where it lands, and how fresh it should stay. Run them here."],
   shape: ["Shape", "Infer a spec, shape JSON into Parquet or Iceberg, and see what landed."],
   runs: ["Runs", "Every run this console started: its phases, how it came out, and what it committed."],
   tables: ["Tables", "A table's history, read from its Iceberg metadata: every snapshot as an event."],
@@ -76,7 +81,7 @@ const TITLES = {
 function showView(name) {
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
-  const [t, s] = TITLES[name] || TITLES.shape;
+  const [t, s] = TITLES[name] || TITLES.overview;
   $("view-title").textContent = t;
   $("view-sub").textContent = s;
   // The runs list follows runs as they go while it is on screen.
@@ -87,6 +92,23 @@ function showView(name) {
     runsState.timer = setInterval(loadRuns, 2000);
   }
   if (name === "tables") loadTables();
+  // The overview follows what happens while it is on screen.
+  clearInterval(ovState.timer);
+  ovState.timer = null;
+  if (name === "overview") {
+    loadOverview();
+    ovState.timer = setInterval(loadOverview, 5000);
+  }
+  if (name === "datasets") loadDatasets();
+  if (name === "alerts") { loadDatasetsQuiet(); loadAlerts(); }
+  if (name === "catalog") loadCatalog();
+  clearInterval(cnState.timer);
+  cnState.timer = null;
+  if (name === "connectors") {
+    loadDatasetsQuiet();
+    loadConnectors();
+    cnState.timer = setInterval(loadConnectors, 3000);
+  }
 }
 
 // ---- infer ------------------------------------------------------------------
@@ -539,7 +561,7 @@ function filesChart(events) {
     </div>`;
 }
 
-function renderTable(t) {
+function renderTable(t, target) {
   const events = (t.events || []).slice();
   const rows = events.slice().reverse().map((e) => `
     <div class="ev${e.expired ? " gone" : ""}${tablesState.snap && e.snapshot_id === tablesState.snap ? " hl" : ""}">
@@ -549,7 +571,7 @@ function renderTable(t) {
       <span class="r">${[fmtTime(e.timestamp_ms), eventWriter(e)].filter(Boolean).join(" · ")}</span>
     </div>`).join("");
   const debt = t.delete_files && t.data_files ? Math.round((t.delete_files / t.data_files) * 100) : 0;
-  $("table-detail").innerHTML = `
+  $(target || "table-detail").innerHTML = `
     <div class="card-head"><h3>${esc(baseName(t.path))}</h3><span class="hint">${esc(t.location || t.path)}</span></div>
     <div class="tstats">
       <div class="tstat"><div class="v">${t.rows == null ? "?" : fmtNum(t.rows)}</div><div class="k">rows</div></div>
@@ -564,16 +586,20 @@ function renderTable(t) {
       <dl class="kv" style="margin-top:6px">
         <dt>schema ${esc(String(t.schema_id))}</dt><dd>${(t.schema || []).map((f) => `${esc(f.name)} <span class="t2">${esc(f.type)}</span>`).join(" · ")}</dd>
         <dt>partitioned</dt><dd>${(t.partition || []).length ? t.partition.map(esc).join(", ") : "no"}</dd>
-        <dt>read from</dt><dd>${t.versions_read} metadata version${t.versions_read === 1 ? "" : "s"}</dd>
+        <dt>read from</dt><dd>${t.versions_read == null ? "the catalog's current metadata" : `${t.versions_read} metadata version${t.versions_read === 1 ? "" : "s"}`}</dd>
       </dl>
     </div>`;
 }
 
 // ---- health -----------------------------------------------------------------
 
+// The data dir, absolute, for the snippets that read a dataset's output.
+let dataDir = "";
+
 async function health() {
   try {
     const res = await fetch("/api/health").then((r) => r.json());
+    dataDir = res.data_dir || "";
     const p = $("health-pill");
     p.className = "badge good";
     p.innerHTML = `<span class="dot"></span> v${res.version} · ${esc(baseName(res.data_dir) || res.data_dir)}`;
@@ -583,6 +609,570 @@ async function health() {
     p.className = "badge danger";
     p.innerHTML = `<span class="dot"></span> offline`;
   }
+}
+
+// ---- overview -------------------------------------------------------------------
+
+const ATTN = {
+  run_failed: ["✕", "o-failed", "run failed"],
+  run_conflict: ["75", "o-conflict", "lost a race"],
+  table_stale: ["⏱", "o-interrupted", "stale"],
+  rejects_over: ["!", "o-conflict", "rejects"],
+};
+const ovState = { timer: null };
+
+async function loadOverview() {
+  let data;
+  try { data = await getJson("/api/overview"); } catch (_) { return; }
+  getJson("/api/alerts").then((a) => firingBadge(a.incidents.filter((i) => i.state === "firing").length)).catch(() => {});
+  const f = data.figures || {};
+  const stat = (k, v, tone) => `<div class="stat"><div class="k">${k}</div><div class="v${tone ? " " + tone : ""}">${v}</div></div>`;
+  $("ov-stats").innerHTML =
+    stat("datasets", fmtNum(f.datasets) + `<span class="t2"> · ${fmtNum(f.watched)} watched</span>`)
+    + stat("needs a look", fmtNum((data.attention || []).length), (data.attention || []).length ? "warn" : "good")
+    + stat("runs · 24 h", fmtNum(f.runs_24h))
+    + stat("failed · 24 h", fmtNum(f.failed_24h), f.failed_24h ? "warn" : "")
+    + stat("running", fmtNum(f.running))
+    + stat("tables", fmtNum(f.tables));
+  const att = data.attention || [];
+  const count = $("attention-count");
+  count.classList.toggle("hidden", att.length === 0);
+  count.textContent = att.length;
+  $("ov-attention").innerHTML = att.length
+    ? att.map((c) => {
+      const a = ATTN[c.kind] || ["!", "o-failed", c.kind];
+      return `<div class="tb attn" data-open-dataset="${esc(c.subject)}">
+        <span class="n"><span class="pill ${a[1]}"><span class="g">${a[0]}</span>${esc(a[2])}</span> ${esc(c.subject)}</span>
+        <span class="w">${esc(c.message)}</span>
+        <span class="a">${c.severity === "critical" ? "critical" : "warning"}<br>${fmtAgo(c.since_ms)}</span>
+      </div>`;
+    }).join("")
+    : `<div class="empty" style="border:0"><div class="et">Nothing needs a look</div>
+        Every dataset's latest run committed, and the ones with a freshness window are inside it.
+        ${f.datasets ? "" : `<br><a class="lnk" data-goto="datasets">Make a dataset</a> to have it watched here.`}</div>`;
+  const recent = data.recent || [];
+  $("ov-recent").innerHTML = recent.length
+    ? recent.map((r) => `<div class="tb" data-open-run="${esc(r.id)}">
+        <span class="n">${esc(r.dataset || "")} <span class="t2">${esc(r.id)}</span></span>
+        <span class="w">${esc(r.output || "")}${r.via === "dataset" ? " · run now" : ""}</span>
+        <span class="a">${pill(r)}<br>${fmtAgo(r.started_ms)}</span>
+      </div>`).join("")
+    : `<div class="empty" style="border:0">No runs yet.</div>`;
+}
+
+// ---- datasets -------------------------------------------------------------------
+
+const dsState = { list: [], sel: null, editing: null, detail: null };
+const FRESH = { fresh: ["badge good", "fresh"], stale: ["badge warn", "stale"], unwatched: ["badge", "not watched"] };
+
+async function loadDatasets() {
+  try {
+    const data = await getJson("/api/datasets");
+    dsState.list = data.datasets || [];
+  } catch (_) { return; }
+  renderDatasetList();
+  if (dsState.editing) return;
+  if (dsState.sel && dsState.list.some((d) => d.dataset.name === dsState.sel)) openDataset(dsState.sel);
+}
+
+function renderDatasetList() {
+  const box = $("ds-list");
+  if (!dsState.list.length) {
+    box.innerHTML = `<div class="empty" style="border:0">No datasets yet. <a class="lnk" id="ds-first">Make one</a>.</div>`;
+    return;
+  }
+  box.innerHTML = dsState.list.map((c) => {
+    const d = c.dataset, r = c.latest_run, fr = FRESH[c.freshness] || FRESH.unwatched;
+    return `<div class="tb${d.name === dsState.sel ? " sel" : ""}" data-ds="${esc(d.name)}">
+      <span class="n">${esc(d.name)}</span>
+      <span class="w">${esc(c.output)} · <span class="${fr[0]}" style="padding:0 5px">${fr[1]}</span></span>
+      <span class="a">${c.running ? pill({ outcome: "running" }) : r ? pill(r) : "never run"}<br>${r ? fmtAgo(r.started_ms) : ""}</span>
+    </div>`;
+  }).join("");
+}
+
+async function openDataset(name) {
+  dsState.sel = name;
+  dsState.editing = null;
+  let c;
+  try { c = await api("/api/dataset", { name }); } catch (e) { toast(e.message, "err"); return; }
+  dsState.detail = c;
+  renderDatasetList();
+  renderDataset(c);
+}
+
+function renderDataset(c) {
+  const d = c.dataset, fr = FRESH[c.freshness] || FRESH.unwatched;
+  const kv = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  const src = c.source;
+  const pos = (p) => p ? `<span class="mono">${esc(JSON.stringify(Object.fromEntries(Object.entries(p).filter(([k]) => k !== "of"))))}</span>` : "none yet";
+  const reads = src
+    ? kv("reads", `<span class="mono">${esc(src.from)}</span> <span class="t2">${esc(src.kind)} source</span>`)
+      + kv("position", pos(src.position))
+      + kv("last pull", src.last ? `${fmtNum(src.last.new)} new · ${fmtNum(src.last.replayed)} re-read · ${fmtNum(src.last.already_read)} already read` : "none yet")
+    : kv("reads", `<span class="mono">${esc(d.input_path || "—")}</span> <span class="t2">${esc(d.format)}</span>`);
+  const facts = reads
+    + kv("lands", `<span class="mono">${esc(c.output)}</span> <span class="t2">${esc(d.to)}${d.to === "iceberg" ? (d.append ? " · append" : " · replace") : ""} · ${esc(d.compression)}</span>`)
+    + (d.partition_by && d.partition_by.length ? kv("partition", esc(d.partition_by.join(", "))) : "")
+    + kv("schema", d.spec_yaml.trim() ? "from its spec" : "inferred on every run")
+    + kv("drift", esc(d.on_drift || "the spec's (warn)"))
+    + kv("freshness", d.freshness_minutes ? `within ${fmtNum(d.freshness_minutes)} min · <span class="${fr[0]}" style="padding:0 5px">${fr[1]}</span>` : "not watched")
+    + kv("last success", c.last_ok_ms ? fmtAgo(c.last_ok_ms) : "none yet");
+  const runs = c.runs || [];
+  const runRows = runs.length
+    ? runs.map((r) => `<div class="tb" data-open-run="${esc(r.id)}">
+        <span class="n">${esc(r.id)}</span>
+        <span class="w">${r.summary ? `${r.summary.source ? `${fmtNum(r.summary.source.new)} new · ` : ""}${fmtNum(r.summary.rows_out)} rows out · ${fmtNum((r.summary.rejected || 0) + (r.summary.parse_errors || 0))} rejected` : r.error ? esc(r.error.message).slice(0, 140) : ""}</span>
+        <span class="a">${pill(r)}<br>${fmtAgo(r.started_ms)}</span>
+      </div>`).join("")
+    : `<div class="empty" style="border:0">Not run yet.</div>`;
+  const abs = dataDir ? dataDir.replace(/\\/g, "/").replace(/\/$/, "") + "/" + c.output : c.output;
+  const snippet = d.to === "iceberg"
+    ? `-- DuckDB\nINSTALL iceberg; LOAD iceberg;\nSELECT * FROM iceberg_scan('${abs}') LIMIT 10;\n\n# PyIceberg (a table directory, no catalog)\nfrom pyiceberg.table import StaticTable\nt = StaticTable.from_metadata('${abs}/metadata/v<N>.metadata.json')`
+    : `-- DuckDB\nSELECT * FROM read_parquet('${abs}') LIMIT 10;`;
+  $("ds-detail").innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>${esc(d.name)}</h3>
+        <span class="hint">
+          <button class="btn sm primary" id="btn-ds-run"${c.running ? " disabled" : ""}>${c.running ? "Running…" : "Run now"}</button>
+          <button class="btn sm ghost" id="btn-ds-edit">Edit</button>
+          <button class="btn sm ghost" id="btn-ds-delete">Delete</button>
+        </span></div>
+      <div class="card-body">
+        <dl class="kv">${facts}</dl>
+        ${c.table ? `<div class="btn-row"><a class="lnk" data-open-table="${esc(c.output)}">Open its table history →</a></div>` : ""}
+      </div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><h3>Runs</h3><span class="hint">newest first</span></div>
+      <div class="tb-list">${runRows}</div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><h3>Rejected rows</h3><span class="hint">${esc(c.rejects_file)}</span></div>
+      <div class="card-body" id="ds-rejects"><button class="btn sm ghost" id="btn-ds-rejects">Show the latest run's rejected rows</button></div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><h3>Consume</h3><span class="hint">read what it landed</span></div>
+      <div class="card-body"><pre class="codeline">${esc(snippet)}</pre></div>
+    </div>`;
+}
+
+function datasetForm(d) {
+  const isNew = !d;
+  d = d || { name: "", input_path: "", format: "jsonl", to: "iceberg", compression: "snappy", append: true, partition_by: [], on_drift: null, freshness_minutes: null, spec_yaml: "" };
+  const opt = (v, cur, label) => `<option value="${v}"${v === cur ? " selected" : ""}>${label || v}</option>`;
+  dsState.editing = isNew ? "new" : d.name;
+  $("ds-detail").innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>${isNew ? "New dataset" : "Edit " + esc(d.name)}</h3></div>
+      <div class="card-body stack">
+        <label class="field"><span class="lh">Name <span class="note">letters, digits, _ and -; it is also the output's name</span></span>
+          <input class="ctrl mono-input" id="dsf-name" value="${esc(d.name)}"${isNew ? "" : " disabled"} /></label>
+        <label class="field"><span class="lh">Input file <span class="note">on this machine: relative to the data dir, or absolute; empty when the spec's <span class="mono">source</span> pulls (an endpoint or a database)</span></span>
+          <input class="ctrl mono-input" id="dsf-input" value="${esc(d.input_path)}" placeholder="/data/events.jsonl" /></label>
+        <div class="row">
+          <label class="field"><span class="lh">Source format</span><select class="ctrl" id="dsf-format">${opt("jsonl", d.format)}${opt("json-array", d.format)}</select></label>
+          <label class="field"><span class="lh">Output</span><select class="ctrl" id="dsf-to">${opt("iceberg", d.to, "Iceberg v2 table")}${opt("parquet", d.to, "Parquet file")}</select></label>
+          <label class="field"><span class="lh">Compression</span><select class="ctrl" id="dsf-compression">${opt("snappy", d.compression)}${opt("uncompressed", d.compression)}${opt("zstd", d.compression)}</select></label>
+        </div>
+        <div class="row">
+          <label class="field"><span class="lh">Partition by <span class="note">Iceberg; comma-separated</span></span>
+            <input class="ctrl mono-input" id="dsf-partition" value="${esc((d.partition_by || []).join(", "))}" placeholder="day(event_at), region" /></label>
+          <label class="field"><span class="lh">On drift</span><select class="ctrl" id="dsf-drift">${opt("", d.on_drift || "", "the spec's")}${["warn", "rescue", "quarantine", "error", "ignore"].map((p) => opt(p, d.on_drift || "")).join("")}</select></label>
+          <label class="field"><span class="lh">Freshness <span class="note">minutes; empty = not watched</span></span>
+            <input class="ctrl mono-input" id="dsf-fresh" type="number" min="1" value="${d.freshness_minutes || ""}" /></label>
+        </div>
+        <label class="switch"><input type="checkbox" id="dsf-append"${d.append ? " checked" : ""} /><span class="track"></span> Iceberg: append a snapshot each run (off: replace the table)</label>
+        <label class="field"><span class="lh">Spec <span class="note">YAML; empty = infer the schema on every run. Its merge_on and where apply.</span></span>
+          <textarea class="ctrl mono-input" id="dsf-spec" rows="12">${esc(d.spec_yaml)}</textarea></label>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-dsf-save">Save</button>
+          <button class="btn ghost" id="btn-dsf-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function saveDataset() {
+  const fresh = $("dsf-fresh").value.trim();
+  const body = {
+    name: $("dsf-name").value.trim(),
+    input_path: $("dsf-input").value.trim(),
+    format: $("dsf-format").value,
+    to: $("dsf-to").value,
+    compression: $("dsf-compression").value,
+    append: $("dsf-append").checked,
+    partition_by: $("dsf-partition").value.trim() ? [$("dsf-partition").value.trim()] : [],
+    on_drift: $("dsf-drift").value || null,
+    freshness_minutes: fresh ? Number(fresh) : null,
+    spec_yaml: $("dsf-spec").value,
+  };
+  try {
+    await api("/api/dataset/save", body);
+  } catch (e) { toast(e.message, "err"); return; }
+  toast(`Saved ${body.name}.`, "ok");
+  dsState.editing = null;
+  dsState.sel = body.name;
+  await loadDatasets();
+}
+
+async function runDataset() {
+  const name = dsState.sel;
+  if (!name) return;
+  const btn = $("btn-ds-run");
+  if (btn) { btn.disabled = true; btn.textContent = "Running…"; }
+  try {
+    const res = await api("/api/dataset/run", { name });
+    toast(`${name}: ${fmtNum(res.rows_out)} rows landed${res.rejects_total ? `, ${fmtNum(res.rejects_total)} rejected` : ""}.`, "ok");
+  } catch (e) { toast(`${name}: ${e.message}`, "err"); }
+  await loadDatasets();
+  loadOverview();
+}
+
+async function deleteDataset() {
+  const name = dsState.sel;
+  if (!name || !confirm(`Forget the dataset ${name}? Its output and its runs stay.`)) return;
+  try { await api("/api/dataset/delete", { name }); } catch (e) { toast(e.message, "err"); return; }
+  toast(`Forgot ${name}.`, "ok");
+  dsState.sel = null;
+  $("ds-detail").innerHTML = "";
+  await loadDatasets();
+}
+
+async function showRejects() {
+  let res;
+  try { res = await api("/api/dataset/rejects", { name: dsState.sel }); } catch (e) { toast(e.message, "err"); return; }
+  const box = $("ds-rejects");
+  if (!res.total) { box.innerHTML = `<div class="t2">The latest run rejected nothing.</div>`; return; }
+  box.innerHTML = `<div class="t2" style="margin-bottom:8px">${fmtNum(res.total)} rejected${res.total > res.rows.length ? `, the first ${fmtNum(res.rows.length)} shown` : ""}.</div>
+    <div class="rejects">${res.rows.map((r) => `<div class="reject"><div class="rh">${r.line ? `<span class="rl">line ${r.line}</span>` : ""}<span class="re">${esc(r.error || "")}</span></div><div class="rr">${esc(typeof r.raw === "string" ? r.raw : JSON.stringify(r.raw))}</div></div>`).join("")}</div>`;
+}
+
+// ---- catalog --------------------------------------------------------------------
+
+const ctState = { data: null, sel: null, seq: 0 };
+
+async function loadCatalog(fresh) {
+  $("ct-list").innerHTML = '<div class="empty" style="border:0">Reading the catalog…</div>';
+  try {
+    ctState.data = fresh ? await api("/api/catalog/refresh", {}) : await getJson("/api/catalog");
+  } catch (e) {
+    $("ct-list").innerHTML = `<div class="empty" style="border:0"><div class="et">Could not read the catalog</div>${esc(e.message)}</div>`;
+    return;
+  }
+  renderCatalog();
+}
+
+function renderCatalog() {
+  const d = ctState.data;
+  const head = $("ct-head");
+  if (!d.available) {
+    head.innerHTML = `<b>Not in this build</b>Browsing a REST catalog needs a build with <span class="mono">object_store</span>: <span class="mono">cargo build -p shapeshift-cli --features serve,object_store</span>.`;
+  } else if (!d.configured) {
+    head.innerHTML = `<b>No catalog</b>Start the console with <span class="mono">--catalog &lt;uri&gt;</span> (and <span class="mono">--warehouse</span>) to browse one, read-only. Credentials come from <span class="mono">SHAPESHIFT_CATALOG_TOKEN</span> or <span class="mono">SHAPESHIFT_CATALOG_CREDENTIAL</span>, as for <span class="mono">shape --catalog</span>.`;
+  } else {
+    head.innerHTML = `<b>Read-only</b>${esc(d.uri)}${d.warehouse ? " · warehouse " + esc(d.warehouse) : ""}${d.insecure ? " · insecure: credentials may go over plain http" : ""}. Nothing here creates, commits or registers.`;
+  }
+  const list = $("ct-list");
+  if (!d.configured) { list.innerHTML = ""; return; }
+  if (d.error) { list.innerHTML = `<div class="empty" style="border:0"><div class="et">${d.error_kind === "config" ? "This console's catalog settings are wrong" : "The catalog did not answer"}</div>${esc(d.error)}</div>`; return; }
+  const ns = d.namespaces || [];
+  list.innerHTML = ns.length ? ns.map((n) => `
+    <div class="tb" style="cursor:default"><span class="n">${esc(n.namespace)}</span>
+      <span class="w">${n.error ? `<span style="color:var(--eg-danger)">${esc(n.error)}</span>` : pl(n.tables.length, "table", "tables")}</span><span class="a"></span></div>
+    ${n.tables.map((t) => `<div class="tb${ctState.sel === n.namespace + "." + t ? " sel" : ""}" data-ct-table="${esc(t)}" data-ct-levels="${esc(JSON.stringify(n.levels))}" style="padding-left:28px">
+      <span class="n">${esc(t)}</span><span class="w">${esc(n.namespace)}.${esc(t)}</span><span class="a"></span></div>`).join("")}`).join("")
+    : `<div class="empty" style="border:0">The catalog has no namespaces.</div>`;
+  if (d.truncated) list.innerHTML += `<div class="caveat" style="margin:10px">Showing the first ${fmtNum(ns.length)} namespaces: the catalog holds more.</div>`;
+  if (d.listed_ms) list.innerHTML += `<div class="t2" style="padding:8px 14px">listed ${fmtAgo(d.listed_ms)} · Refresh lists again</div>`;
+}
+
+async function openCatalogTable(levels, name) {
+  ctState.sel = levels.join(".") + "." + name;
+  renderCatalog();
+  const seq = ++ctState.seq;
+  let t;
+  try { t = await api("/api/catalog/table", { levels, name }); } catch (e) { if (seq === ctState.seq) toast(e.message, "err"); return; }
+  if (seq !== ctState.seq) return; // a later click has the screen
+  tablesState.snap = null;
+  renderTable(t, "ct-detail");
+  renderEngines(ctState.data, levels, name);
+}
+
+function renderEngines(d, levels, name) {
+  const ident = levels.join(".") + "." + name;
+  const wh = d.warehouse || "<warehouse>";
+  const snippets = [
+    ["DuckDB", `INSTALL iceberg; LOAD iceberg;
+CREATE SECRET cat_secret (TYPE iceberg, TOKEN '<token>');   -- or CLIENT_ID / CLIENT_SECRET
+ATTACH '${wh}' AS cat (TYPE iceberg, SECRET cat_secret, ENDPOINT '${d.uri}');
+SELECT * FROM cat.${ident} LIMIT 10;`],
+    ["Spark", `--conf spark.sql.catalog.cat=org.apache.iceberg.spark.SparkCatalog
+--conf spark.sql.catalog.cat.type=rest
+--conf spark.sql.catalog.cat.uri=${d.uri}
+--conf spark.sql.catalog.cat.warehouse=${wh}
+--conf spark.sql.catalog.cat.token=<token>
+-- then: SELECT * FROM cat.${ident} LIMIT 10`],
+    ["PyIceberg", `from pyiceberg.catalog import load_catalog
+cat = load_catalog("cat", type="rest", uri="${d.uri}", warehouse="${wh}", token="<token>")
+print(cat.load_table("${ident}").scan(limit=10).to_arrow())`],
+  ];
+  const box = $("ct-engines");
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="card-head"><h3>Read it from an engine</h3><span class="hint">credentials left as placeholders</span></div>
+    <div class="card-body stack">${snippets.map(([k, v]) => `<div><div class="t2" style="margin-bottom:4px">${k}</div><pre class="codeline">${esc(v)}</pre></div>`).join("")}</div>`;
+}
+
+// ---- connectors -----------------------------------------------------------------
+
+const cnState = { data: null };
+
+async function loadConnectors() {
+  try { cnState.data = await getJson("/api/connectors"); } catch (_) { return; }
+  renderConnectors();
+}
+
+function ingestBase() {
+  const a = cnState.data && cnState.data.ingest_addr;
+  if (!a) return null;
+  // A listener on every interface is reached by this machine's name; show the port.
+  return "http://" + a.replace(/^0\.0\.0\.0:/, location.hostname + ":").replace(/^\[::\]:/, location.hostname + ":");
+}
+
+function renderConnectors() {
+  const d = cnState.data;
+  const base = ingestBase();
+  $("cn-listener").innerHTML = base
+    ? `<b>Ingest listener on</b>Producers POST to <span class="mono">${esc(base)}/v1/ingest/&lt;connector&gt;</span> with the connector's token. That listener serves that path only; this console stays where it is.`
+    : `<b>Ingest listener off</b>Connectors keep their settings but take nothing until the console starts with <span class="mono">--ingest-addr</span> (for example <span class="mono">shapeshift serve --ingest-addr 0.0.0.0:8088</span>).`;
+  $("cn-list").innerHTML = d.connectors.length
+    ? d.connectors.map((c) => {
+      const s = c.stats;
+      const waiting = c.spool_bytes + c.waiting_bytes;
+      return `<div class="tb">
+        <span class="n">${esc(c.name)} <span class="t2">→ <a class="lnk" data-open-dataset="${esc(c.dataset)}">${esc(c.dataset)}</a> · token …${esc(c.token_hint)}</span></span>
+        <span class="w">${pl(s.records, "record", "records")} in ${pl(s.posts, "post", "posts")} · ${pl(s.runs_ok, "batch", "batches")} landed${s.runs_failed ? ` · <span style="color:var(--eg-danger)">${fmtNum(s.runs_failed)} failed</span>` : ""} · ${pl(s.duplicates, "retry", "retries")} ignored · ${fmtNum(s.refused)} refused
+          <br>${waiting ? `${fmtBytes(waiting)} waiting${c.waiting_batches ? ` (${c.waiting_batches} sealed)` : ""}` : "nothing waiting"} · seals at ${fmtBytes(c.flush_bytes)} or ${fmtNum(c.flush_seconds)} s${s.last_post_ms ? " · last post " + fmtAgo(s.last_post_ms) : ""}
+          ${s.last_error ? `<br><span style="color:var(--eg-danger)">${esc(s.last_error)}</span>` : ""}</span>
+        <span class="a"><button class="btn sm ghost" data-cn-flush="${esc(c.name)}">Flush now</button> <button class="btn sm ghost" data-cn-rotate="${esc(c.name)}">New token</button> <button class="btn sm ghost" data-cn-edit="${esc(c.name)}">Edit</button></span>
+      </div>`;
+    }).join("")
+    : `<div class="empty" style="border:0"><div class="et">No connectors</div>A connector is an ingest URL a producer POSTs JSON records to, with its own token. Its records are batched and landed by an Iceberg dataset.</div>`;
+}
+
+function showToken(name, token) {
+  const base = ingestBase() || "http://<ingest-addr>";
+  const box = $("cn-token");
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="card"><div class="card-head"><h3>Token for ${esc(name)}</h3><span class="hint">shown once: copy it now</span></div>
+    <div class="card-body"><pre class="codeline">${esc(token)}</pre>
+    <div class="t2" style="margin:10px 0 6px">Send records:</div>
+    <pre class="codeline">${esc(`curl -X POST ${base}/v1/ingest/${name} \\\n  -H "Authorization: Bearer ${token}" \\\n  -H "Content-Type: application/x-ndjson" \\\n  --data-binary @records.jsonl`)}</pre>
+    ${["http://localhost", "http://127.", "http://[::1]"].some((p) => base.startsWith(p)) ? "" : `<div class="caveat bad" style="margin-top:10px"><b>Plain HTTP</b>This URL is not on this machine: the token and the records would cross the network unencrypted. Put a TLS-terminating proxy in front of the ingest listener and give producers its https:// URL, or keep them on a network you trust.</div>`}
+    <div class="btn-row"><button class="btn sm ghost" data-form-close="cn-token">I have copied it</button></div></div></div>`;
+}
+
+function pl(n, one, many) { return `${fmtNum(n)} ${n === 1 ? one : many}`; }
+
+function connectorForm(c) {
+  const isNew = !c;
+  c = c || { name: "", dataset: "", flush_bytes: 1048576, flush_seconds: 60 };
+  const ice = dsState.list.filter((x) => x.dataset.to === "iceberg");
+  const box = $("cn-form");
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="stack">
+    <div class="row">
+      <label class="field"><span class="lh">Name <span class="note">it is in the URL</span></span><input class="ctrl mono-input" id="cf-name" value="${esc(c.name)}"${isNew ? "" : " disabled"} /></label>
+      <label class="field"><span class="lh">Dataset <span class="note">an Iceberg dataset lands each batch</span></span><select class="ctrl" id="cf-dataset">${ice.length ? (ice.some((x) => x.dataset.name === c.dataset) ? "" : `<option value="" selected>${c.dataset ? `choose a dataset (${esc(c.dataset)} is gone)` : "choose a dataset"}</option>`) + ice.map((x) => `<option${x.dataset.name === c.dataset ? " selected" : ""}>${esc(x.dataset.name)}</option>`).join("") : '<option value="">no Iceberg dataset yet</option>'}</select></label>
+    </div>
+    <div class="row">
+      <label class="field"><span class="lh">Seal at bytes</span><input class="ctrl mono-input" id="cf-bytes" type="number" min="1024" value="${c.flush_bytes}" /></label>
+      <label class="field"><span class="lh">or after seconds</span><input class="ctrl mono-input" id="cf-secs" type="number" min="1" value="${c.flush_seconds}" /></label>
+    </div>
+    <div class="btn-row"><button class="btn primary" data-cn-save="${isNew ? "" : esc(c.name)}">${isNew ? "Make it" : "Save"}</button>
+      ${isNew ? "" : `<button class="btn ghost" data-cn-delete="${esc(c.name)}">Delete</button>`}
+      <button class="btn ghost" data-form-close="cn-form">Cancel</button></div>
+  </div>`;
+}
+
+async function connectorsAction(ev) {
+  const el = ev.target.closest("[data-cn-flush],[data-cn-rotate],[data-cn-edit],[data-cn-save],[data-cn-delete],[data-form-close]");
+  if (!el) return;
+  const ds = el.dataset;
+  const call = async (path, body, okMsg) => {
+    try { const r = await api(path, body); if (okMsg) toast(okMsg, "ok"); return r; } catch (e) { toast(e.message, "err"); return null; }
+  };
+  if (ds.formClose) { $(ds.formClose).classList.add("hidden"); return; }
+  if (ds.cnFlush !== undefined) {
+    const r = await call("/api/connector/flush", { name: ds.cnFlush });
+    if (r) toast(r.sealed ? "Sealed: its batch lands in a moment." : "Nothing in the spool; a waiting batch is tried now.", "ok");
+  } else if (ds.cnRotate !== undefined) {
+    if (!confirm("Make a new token? The old one stops working at once.")) return;
+    const r = await call("/api/connector/rotate", { name: ds.cnRotate });
+    if (r) showToken(ds.cnRotate, r.token);
+  } else if (ds.cnEdit !== undefined) {
+    await loadDatasetsQuiet();
+    connectorForm(cnState.data.connectors.find((c) => c.name === ds.cnEdit));
+    return;
+  } else if (ds.cnSave !== undefined) {
+    const body = { name: ds.cnSave || $("cf-name").value.trim(), dataset: $("cf-dataset").value, flush_bytes: Number($("cf-bytes").value), flush_seconds: Number($("cf-secs").value) };
+    const r = await call("/api/connector/save", body, ds.cnSave ? "Saved." : null);
+    if (!r) return;
+    $("cn-form").classList.add("hidden");
+    if (r.token) showToken(body.name, r.token);
+  } else if (ds.cnDelete !== undefined) {
+    let r = await api("/api/connector/delete", { name: ds.cnDelete }).catch((e) => ({ error: e.message }));
+    if (r.error && /waiting/.test(r.error)) {
+      if (!confirm(r.error + "\n\nDelete anyway and discard them?")) return;
+      r = await call("/api/connector/delete", { name: ds.cnDelete, discard: true }, "Deleted; its waiting records were discarded.");
+    } else if (r.error) { toast(r.error, "err"); return; } else toast("Deleted.", "ok");
+    $("cn-form").classList.add("hidden");
+  }
+  await loadConnectors();
+}
+
+// ---- alerts ---------------------------------------------------------------------
+
+const KIND_WORDS = {
+  run_failed: "a dataset's latest run failed",
+  run_conflict: "it lost a race to another writer (exit 75)",
+  table_stale: "no successful run within its freshness window",
+  rejects_over: "its latest run rejected more rows than a threshold",
+};
+const alState = { data: null };
+
+async function loadAlerts() {
+  try { alState.data = await getJson("/api/alerts"); } catch (_) { return; }
+  renderAlerts();
+}
+
+function firingBadge(n) {
+  const c = $("firing-count");
+  c.classList.toggle("hidden", !n);
+  c.textContent = n;
+}
+
+function renderAlerts() {
+  const d = alState.data;
+  const firing = d.incidents.filter((i) => i.state === "firing");
+  firingBadge(firing.length);
+  const tname = (id) => (d.targets.find((t) => t.id === id) || { name: id }).name;
+  $("al-incidents").innerHTML = d.incidents.length
+    ? d.incidents.slice(0, 60).map((i) => {
+      const a = ATTN[i.kind] || ATTN.rejects_over;
+      return `<div class="tb${i.state === "firing" ? "" : " done"}">
+        <span class="n"><span class="pill ${i.state === "firing" ? a[1] : "o-ok"}"><span class="g">${i.state === "firing" ? a[0] : "✓"}</span>${i.state}</span>
+          <a class="lnk" data-open-dataset="${esc(i.subject)}">${esc(i.subject)}</a> <span class="t2">· ${esc(i.rule_name)}</span></span>
+        <span class="w">${esc(i.message)}</span>
+        <span class="a">${i.state === "firing" ? `<button class="btn sm ghost" data-resolve="${esc(i.id)}">Resolve</button><br>opened ${fmtAgo(i.opened_ms)}`
+          : `resolved ${fmtAgo(i.resolved_ms)}<br>${esc(i.resolved_by === "hand" ? "by hand" : i.resolved_by === "rule" ? "rule changed" : "condition cleared")}`}</span>
+      </div>`;
+    }).join("")
+    : `<div class="empty" style="border:0"><div class="et">No incidents</div>When a rule's condition starts to hold for a dataset, an incident opens here and its targets are told.</div>`;
+  $("al-rules").innerHTML = d.rules.length
+    ? d.rules.map((r) => `<div class="tb" data-rule="${esc(r.id)}">
+        <span class="n">${esc(r.name)} ${r.enabled ? "" : '<span class="tag">off</span>'}</span>
+        <span class="w">${esc(r.kind)}${r.kind === "rejects_over" ? " " + fmtNum(r.threshold || 0) : ""} · ${esc(r.dataset || "every dataset")} → ${r.targets.length ? r.targets.map((t) => esc(tname(t))).join(", ") : "no target"}</span>
+        <span class="a"><button class="btn sm ghost" data-edit-rule="${esc(r.id)}">Edit</button></span>
+      </div>`).join("")
+    : `<div class="empty" style="border:0">No rules yet.${d.targets.length ? "" : " Add a target first, then a rule that tells it."}</div>`;
+  $("al-targets").innerHTML = d.targets.length
+    ? d.targets.map((t) => {
+      const l = t.last;
+      const last = l ? `<span class="badge ${l.ok ? "good" : "danger"}" style="padding:0 5px">${l.ok ? "delivered" : "failed"}</span> ${esc(l.event)} · ${fmtAgo(l.at_ms)}${l.ok ? "" : ` · ${esc(l.error || "")}`}` : "nothing sent yet";
+      return `<div class="tb">
+        <span class="n">${esc(t.name)} <span class="tag">${esc(t.kind)}</span></span>
+        <span class="w"><span class="mono">${esc(t.url)}</span><br>${last}</span>
+        <span class="a"><button class="btn sm ghost" data-test-target="${esc(t.id)}">Test</button> <button class="btn sm ghost" data-edit-target="${esc(t.id)}">Edit</button></span>
+      </div>`;
+    }).join("")
+    : `<div class="empty" style="border:0">No targets yet.</div>`;
+}
+
+function ruleForm(r) {
+  const d = alState.data;
+  const isNew = !r;
+  r = r || { name: "", kind: "run_failed", dataset: null, threshold: null, targets: [], enabled: true };
+  const opt = (v, cur, label) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label || v)}</option>`;
+  const box = $("al-rule-form");
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="stack">
+    <label class="field"><span class="lh">Name</span><input class="ctrl" id="rf-name" value="${esc(r.name)}" /></label>
+    <label class="field"><span class="lh">When</span><select class="ctrl" id="rf-kind">${d.kinds.map((k) => opt(k, r.kind, k + " — " + KIND_WORDS[k])).join("")}</select></label>
+    <div class="row">
+      <label class="field"><span class="lh">Dataset</span><select class="ctrl" id="rf-dataset">${opt("", r.dataset || "", "every dataset")}${dsState.list.map((c) => opt(c.dataset.name, r.dataset || "")).join("")}</select></label>
+      <label class="field"><span class="lh">More than <span class="note">rejected rows; rejects_over only</span></span><input class="ctrl mono-input" id="rf-threshold" type="number" min="0" value="${r.threshold == null ? "" : r.threshold}" /></label>
+    </div>
+    <div class="field"><span class="lh">Tell</span>${d.targets.length ? d.targets.map((t) => `<label class="switch"><input type="checkbox" class="rf-target" value="${esc(t.id)}"${r.targets.includes(t.id) ? " checked" : ""} /><span class="track"></span> ${esc(t.name)}</label>`).join("") : '<span class="t2">no targets yet</span>'}</div>
+    <label class="switch"><input type="checkbox" id="rf-enabled"${r.enabled ? " checked" : ""} /><span class="track"></span> On</label>
+    <div class="btn-row"><button class="btn primary" data-rule-save="${isNew ? "" : esc(r.id)}">Save</button>
+      ${isNew ? "" : `<button class="btn ghost" data-rule-delete="${esc(r.id)}">Delete</button>`}
+      <button class="btn ghost" data-form-close="al-rule-form">Cancel</button></div>
+  </div>`;
+}
+
+function targetForm(t) {
+  const isNew = !t;
+  t = t || { name: "", kind: "webhook" };
+  const box = $("al-target-form");
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="stack">
+    <div class="row">
+      <label class="field"><span class="lh">Name</span><input class="ctrl" id="tf-name" value="${esc(t.name)}" /></label>
+      <label class="field"><span class="lh">Kind</span><select class="ctrl" id="tf-kind"><option value="webhook"${t.kind === "webhook" ? " selected" : ""}>webhook</option><option value="slack"${t.kind === "slack" ? " selected" : ""}>slack</option></select></label>
+    </div>
+    <label class="field"><span class="lh">URL ${isNew ? "" : '<span class="note">leave empty to keep the saved one</span>'}</span><input class="ctrl mono-input" id="tf-url" type="password" autocomplete="off" placeholder="https://hooks.slack.com/services/…" /></label>
+    <div class="btn-row"><button class="btn primary" data-target-save="${isNew ? "" : esc(t.id)}">Save</button>
+      ${isNew ? "" : `<button class="btn ghost" data-target-delete="${esc(t.id)}">Delete</button>`}
+      <button class="btn ghost" data-form-close="al-target-form">Cancel</button></div>
+  </div>`;
+}
+
+async function alertsAction(ev) {
+  const el = ev.target.closest("[data-resolve],[data-edit-rule],[data-edit-target],[data-test-target],[data-rule-save],[data-rule-delete],[data-target-save],[data-target-delete],[data-form-close]");
+  if (!el) return;
+  const ds = el.dataset;
+  const call = async (path, body, okMsg) => {
+    try { const r = await api(path, body); if (okMsg) toast(okMsg, "ok"); return r; } catch (e) { toast(e.message, "err"); return null; }
+  };
+  if (ds.formClose) { $(ds.formClose).classList.add("hidden"); return; }
+  if (ds.resolve !== undefined) await call("/api/alerts/incident/resolve", { id: ds.resolve }, "Resolved. It stays quiet until its condition clears.");
+  else if (ds.editRule !== undefined) { if (!dsState.list.length) await loadDatasetsQuiet(); ruleForm(alState.data.rules.find((r) => r.id === ds.editRule)); return; }
+  else if (ds.editTarget !== undefined) { targetForm(alState.data.targets.find((t) => t.id === ds.editTarget)); return; }
+  else if (ds.testTarget !== undefined) {
+    const r = await call("/api/alerts/target/test", { id: ds.testTarget });
+    if (r) toast(r.delivery.ok ? `Delivered (${r.delivery.status}).` : `Not delivered: ${r.delivery.error || r.delivery.status}`, r.delivery.ok ? "ok" : "err");
+  } else if (ds.ruleSave !== undefined) {
+    const th = $("rf-threshold").value.trim();
+    const kind = $("rf-kind").value;
+    const body = {
+      name: $("rf-name").value, kind, dataset: $("rf-dataset").value || null,
+      threshold: kind === "rejects_over" && th !== "" ? Number(th) : null,
+      targets: [...document.querySelectorAll(".rf-target:checked")].map((x) => x.value),
+      enabled: $("rf-enabled").checked,
+    };
+    if (ds.ruleSave) body.id = ds.ruleSave;
+    if (!(await call("/api/alerts/rule/save", body, "Rule saved."))) return;
+    $("al-rule-form").classList.add("hidden");
+  } else if (ds.ruleDelete !== undefined) {
+    if (!confirm("Delete this rule? Its firing incidents resolve without a notice.")) return;
+    if (!(await call("/api/alerts/rule/delete", { id: ds.ruleDelete }, "Rule deleted."))) return;
+    $("al-rule-form").classList.add("hidden");
+  } else if (ds.targetSave !== undefined) {
+    const body = { name: $("tf-name").value, kind: $("tf-kind").value, url: $("tf-url").value || null };
+    if (ds.targetSave) body.id = ds.targetSave;
+    if (!(await call("/api/alerts/target/save", body, "Target saved."))) return;
+    $("al-target-form").classList.add("hidden");
+  } else if (ds.targetDelete !== undefined) {
+    if (!confirm("Delete this target?")) return;
+    if (!(await call("/api/alerts/target/delete", { id: ds.targetDelete }, "Target deleted."))) return;
+    $("al-target-form").classList.add("hidden");
+  }
+  await loadAlerts();
+}
+
+async function loadDatasetsQuiet() {
+  try { dsState.list = (await getJson("/api/datasets")).datasets || []; } catch (_) { /* the form offers "every dataset" */ }
 }
 
 // ---- the spec follows the controls ---------------------------------------------
@@ -657,9 +1247,45 @@ function init() {
     const r = ev.target.closest("[data-open-run]");
     if (r) { runsState.sel = r.dataset.openRun; showView("runs"); }
   });
+  // Catalog.
+  $("btn-ct-refresh").addEventListener("click", () => loadCatalog(true));
+  $("ct-list").addEventListener("click", (ev) => {
+    const row = ev.target.closest("[data-ct-table]");
+    if (row) openCatalogTable(JSON.parse(row.dataset.ctLevels), row.dataset.ctTable);
+  });
+  // Connectors and alerts.
+  $("view-connectors").addEventListener("click", connectorsAction);
+  $("btn-cn-new").addEventListener("click", async () => { await loadDatasetsQuiet(); connectorForm(null); });
+  for (const id of ["view-alerts"]) $(id).addEventListener("click", alertsAction);
+  $("btn-rule-new").addEventListener("click", async () => { if (!dsState.list.length) await loadDatasetsQuiet(); ruleForm(null); });
+  $("btn-target-new").addEventListener("click", () => targetForm(null));
+  // The firing count follows the overview's refresh.
+  // Overview and datasets.
+  $("btn-ds-new").addEventListener("click", () => { dsState.sel = null; renderDatasetList(); datasetForm(null); });
+  $("ds-list").addEventListener("click", (ev) => {
+    if (ev.target.closest("#ds-first")) { datasetForm(null); return; }
+    const row = ev.target.closest("[data-ds]");
+    if (row) openDataset(row.dataset.ds);
+  });
+  $("ds-detail").addEventListener("click", (ev) => {
+    const id = (ev.target.closest("button") || {}).id;
+    if (id === "btn-ds-run") runDataset();
+    else if (id === "btn-ds-edit") { const c = dsState.list.find((x) => x.dataset.name === dsState.sel); if (c) datasetForm(c.dataset); }
+    else if (id === "btn-ds-delete") deleteDataset();
+    else if (id === "btn-ds-rejects") showRejects();
+    else if (id === "btn-dsf-save") saveDataset();
+    else if (id === "btn-dsf-cancel") { dsState.editing = null; if (dsState.sel) openDataset(dsState.sel); else $("ds-detail").innerHTML = ""; }
+  });
+  document.addEventListener("click", (ev) => {
+    const g = ev.target.closest("[data-goto]");
+    if (g) { showView(g.dataset.goto); return; }
+    const d = ev.target.closest("[data-open-dataset]");
+    if (d) { showView("datasets"); openDataset(d.dataset.openDataset); }
+  });
   toggleIcebergOpts();
   health();
   loadRuns();
+  showView("overview");
 }
 
 if (document.readyState === "loading") {
